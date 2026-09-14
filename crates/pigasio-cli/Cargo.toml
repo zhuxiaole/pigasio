@@ -1,0 +1,16 @@
+[package]
+name = "pigasio-cli"
+description = "PigASIO 的命令行工具:设备枚举、自检、配置生成"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pigasio"
+path = "src/main.rs"
+
+[dependencies]
+pigasio-core = { workspace = true }
+pigasio-asio = { path = "../pigasio-asio" }
+log = { workspace = true }

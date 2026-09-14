@@ -1,0 +1,10 @@
+# 回环测试:输出到虚拟声卡的播放端,再从同一根线缆的录制端读回来。
+# 用 --tone 时,如果输入能收到 440 Hz 正弦波,说明整条数据通路是通的。
+sample_rate = 48000
+buffer_size_samples = 512
+
+[[output]]
+device = "Line 2 Music (Virtual Audio Cable)"
+
+[[input]]
+device = "Line 2 Music (Virtual Audio Cable)"

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/pigasio-core", "crates/pigasio-asio", "crates/pigasio-cli", "crates/pigasio-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/local/PigASIO"
+authors = ["PigASIO contributors"]
+
+[workspace.dependencies]
+pigasio-core = { path = "crates/pigasio-core" }
+cpal = "0.15"
+rubato = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+parking_lot = "0.12"
+rtrb = "0.3"
+log = "0.4"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# 驱动 DLL 跑在宿主进程里。保留调试符号,方便在出现爆音或崩溃时定位;
+# 体积代价对本地安装来说可以忽略。
+[profile.release.package.pigasio-asio]
+debug = true

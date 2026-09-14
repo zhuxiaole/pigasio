@@ -1,0 +1,18 @@
+# 多设备同步测试:2 块输出设备 + 1 块输入设备
+sample_rate = 48000
+buffer_size_samples = 1024
+
+[engine]
+resample_quality = "sinc"
+drift_correction = true
+max_drift_ppm = 500.0
+buffer_watermark = 3.0
+
+[[output]]
+device = "扬声器 (Realtek"
+
+[[output]]
+device = "Line 1 Apex Legends (Virtual Audio Cable)"
+
+[[input]]
+device = "Line 1 Apex Legends (Virtual Audio Cable)"

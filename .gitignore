@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+/dist/
+
+# 日志
+*.log
+PigASIO.log
+
+# 本地配置(仓库里只保留示例)
+/PigASIO.toml
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 参考用的 FlexASIO 源码与 ASIO SDK 头文件(不入库)
+/reference/

@@ -1,0 +1,31 @@
+[package]
+name = "pigasio-asio"
+description = "PigASIO 的 ASIO 驱动 DLL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib 是最终产物;rlib 让单元测试和命令行工具也能链接它。
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pigasio-core = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Globalization",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+# 非 Windows 平台上这个 crate 只能编译出桩实现,方便在别的系统上跑
+# `cargo check` 和单元测试。
