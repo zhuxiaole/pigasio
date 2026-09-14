@@ -443,6 +443,7 @@ pigasio channels
   方法,而 Rust 稳定版无法表达这个调用约定。现代 ASIO 宿主基本都是 64 位。
 * **只支持 WASAPI 共享模式。** 独占模式(bit-perfect、更低延迟)尚未实现。
   共享模式的好处是多个程序可以同时使用同一块设备。
+  详见下方"关于独占模式"。
 * **ASIO 侧只暴露 float32。** 它也是 Windows 音频引擎的内部格式,转换
   代价最低。int32/int24/int16 尚未实现。
 * **不支持动态重载配置。** 改完 `PigASIO.toml` 要重启宿主。
@@ -451,6 +452,42 @@ pigasio channels
   不调用 `bufferSwitchTimeInfo`。原因见 `crates/pigasio-asio/src/abi.rs`
   里的说明 —— 那个结构体在 `#pragma pack(4)` 下的内存布局与 Rust 的
   自然对齐规则不同,很容易写出内存错位。
+
+### 关于独占模式
+
+如果你将来想补上 WASAPI 独占模式,这里有调研过的结论,省得再查一遍。
+
+**cpal 没有留扩展点。** 它的 WASAPI 后端把共享模式写死了:
+
+```rust
+// cpal/src/host/wasapi/device.rs 里三处
+let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+```
+
+`Device` 虽然内部持有 `IMMDevice`,但没有公开的访问器,也没有
+`DeviceExt` 之类的扩展 trait。所以**没法在 cpal 之上打补丁**,只能绕过
+它,用 `windows` crate 直接操作 WASAPI。
+
+**要写的东西**大致是:
+
+| 部分 | 内容 |
+|---|---|
+| 后端抽象 | 把 `engine.rs` 对 `cpal::Device`/`cpal::Stream` 的直接依赖抽成 trait |
+| WASAPI 后端 | `IAudioClient` 初始化、格式协商、`IAudioRenderClient`/`IAudioCaptureClient`、事件驱动循环 |
+| 配置与回退 | `exclusive` 开关、打不开时自动退回共享模式 |
+
+**收益在多设备场景下有限。** 这是最值得先想清楚的一点:为了把多块声卡的
+时钟锁在一起,**从设备必须经过重采样**,而重采样意味着数据被改写过,
+bit-perfect 从定义上就不成立。所以独占模式最多只能让**时钟主设备**
+受益:
+
+```text
+时钟主设备        → 独占后可以 bit-perfect ✓
+从设备 1、2、...  → 必须重采样跟随主时钟,bit-perfect 无意义 ✗
+```
+
+独占模式的另一个收益(更低的延迟)对所有设备都有效,但代价是设备被
+独占后其他程序就用不了了 —— 在多程序共用声卡的场景里反而是倒退。
 
 ## 测试情况
 
