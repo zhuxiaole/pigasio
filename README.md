@@ -111,6 +111,10 @@ crates/
 需要 **Rust 1.77+** 和 **MSVC 工具链**。装好 Rust 后如果终端里找不到
 `cargo`,重新开一个终端让 PATH 生效。
 
+> 从零搭建开发环境的完整步骤(含国内镜像加速和常见坑)见
+> [`docs/development.md`](docs/development.md)。架构与设计决策见
+> [`docs/architecture.md`](docs/architecture.md)。
+
 ### 一键打包
 
 ```cmd
