@@ -499,6 +499,12 @@ struct StreamSpec {
     /// 只有时钟主设备才需要它来推进整个引擎。
     master_core: Option<Arc<Mutex<AudioCore>>>,
     err_flag: Arc<AtomicBool>,
+    /// 报给实时优先级提升用的「每块缓冲多少帧」。
+    ///
+    /// MMCSS 拿它和采样率一起推算这条线程该怎么被调度。设备实际的缓冲
+    /// 大小问不出来(`config.buffer_size` 通常是 `Default`),所以拿引擎的
+    /// chunk 当代表 —— 同一个数量级就够它做判断了。
+    frames_per_buffer: u32,
 }
 
 impl StreamSpec {
@@ -526,6 +532,45 @@ impl StreamSpec {
     }
 }
 
+/// 把**当前线程**提升到实时音频优先级。
+///
+/// 只在音频回调的第一次执行时调用。之所以非得在这里做:`audio_thread_priority`
+/// 提的是"当前线程",而音频回调跑在 cpal 自己创建的线程上 —— 别的线程替不了
+/// 它,只有在回调内部才有机会。
+///
+/// 提不上去不影响音频能不能跑,只是这条线程更容易被系统调度器抢走,表现就是
+/// 缓冲再大也照样爆音。所以失败只记一条日志(系统不支持、权限不够等),不往上
+/// 报错。
+///
+/// # 返回的句柄为什么就地泄漏
+///
+/// 提升成功会给一个 `RtPriorityHandle`,但这里**不保存**它,直接
+/// `mem::forget`:
+///
+/// * 它的 `Drop` 会调 MMCSS 的 `AvRevertMmThreadCharacteristics`,而那个
+///   调用必须发生在当初提升的那条线程上。闭包析构时未必还在音频线程(流
+///   销毁可能由别的线程发起),跨线程还回去是错上加错。
+/// * 而且 Windows 上这个句柄内部含裸指针,本身就不是 `Send`,根本塞不进
+///   cpal 要求 `Send` 的回调闭包 —— 想保存也保存不了。
+///
+/// 音频线程的寿命和流绑定:线程一结束,系统会把 MMCSS 特性连同线程一起回收,
+/// 用不着我们显式还。
+fn promote_audio_thread(frames_per_buffer: u32, sample_rate: u32) {
+    // 参数为 0 会被库判为无效,兜一下。
+    let frames = frames_per_buffer.max(1);
+    match audio_thread_priority::promote_current_thread_to_real_time(frames, sample_rate) {
+        Ok(handle) => {
+            log::info!("音频线程已提升到实时优先级({frames} 帧 @ {sample_rate} Hz)");
+            // 句柄**故意不析构**,理由见函数文档。`ManuallyDrop` 比
+            // `mem::forget` 更直白地表达这个意图,而且在 Windows 上句柄
+            // 根本没有 `Drop`(那边忘了等于没忘),只有 Linux/macOS 才需要
+            // 靠这一手把提升状态留住。
+            let _keep_alive = std::mem::ManuallyDrop::new(handle);
+        }
+        Err(e) => log::warn!("音频线程提不上实时优先级,按普通优先级继续:{e}"),
+    }
+}
+
 /// 输入方向:设备回调把采集数据搬进 ring。
 fn build_input<T>(spec: StreamSpec) -> Result<cpal::Stream>
 where
@@ -541,9 +586,11 @@ where
         input_writer,
         master_core,
         err_flag,
+        frames_per_buffer,
         ..
     } = spec;
 
+    let sample_rate = config.sample_rate.0;
     let mut writer =
         input_writer.ok_or_else(|| Error::Internal("输入流缺少 ring 生产者".into()))?;
     let mut scratch: Vec<f32> = Vec::new();
@@ -551,10 +598,20 @@ where
     // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
     use cpal::Sample as _;
 
+    // 音频回调跑在 cpal 建的线程上,实时优先级只能由那个线程自己申请 ——
+    // 参见 `promote_audio_thread`。这里只需要一个"做过了"的开关。
+    let rt_tried = Arc::new(AtomicBool::new(false));
+
     let stream = device
         .build_input_stream::<T, _, _>(
             &config,
             move |data: &[T], _info: &cpal::InputCallbackInfo| {
+                // 快速路径:提过了就直接过去。用原子标志而不是加锁 —— 这是
+                // 音频线程,每块缓冲都要跑一遍,不该为只做一次的活去争锁。
+                if !rt_tried.swap(true, Ordering::Relaxed) {
+                    promote_audio_thread(frames_per_buffer, sample_rate);
+                }
+
                 let device_channels = device_channels.max(1);
                 let frames = data.len() / device_channels;
                 let total = frames * device_channels;
@@ -604,6 +661,7 @@ where
         output_reader,
         master_core,
         err_flag,
+        frames_per_buffer,
         ..
     } = spec;
 
@@ -613,10 +671,18 @@ where
     let err_name = device_name.clone();
     // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
 
+    let sample_rate = config.sample_rate.0;
+    // 同输入侧:音频线程的实时优先级只能在回调内部申请。
+    let rt_tried = Arc::new(AtomicBool::new(false));
+
     let stream = device
         .build_output_stream::<T, _, _>(
             &config,
             move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
+                if !rt_tried.swap(true, Ordering::Relaxed) {
+                    promote_audio_thread(frames_per_buffer, sample_rate);
+                }
+
                 let device_channels = device_channels.max(1);
                 let frames = data.len() / device_channels;
                 if frames == 0 {
@@ -1170,6 +1236,7 @@ impl Engine {
                 output_reader: None,
                 master_core: is_master.then(|| Arc::clone(&self.core)),
                 err_flag: Arc::clone(&self.stream_error),
+                frames_per_buffer: chunk as u32,
             });
             input_offset += ring_channels;
         }
@@ -1230,6 +1297,7 @@ impl Engine {
                 output_reader: Some(reader),
                 master_core: is_master.then(|| Arc::clone(&self.core)),
                 err_flag: Arc::clone(&self.stream_error),
+                frames_per_buffer: chunk as u32,
             });
             output_offset += ring_channels;
         }
