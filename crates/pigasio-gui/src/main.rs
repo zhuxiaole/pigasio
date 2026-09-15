@@ -52,7 +52,9 @@ fn main() -> eframe::Result<()> {
         size: prefs.window_size.map(|[w, h]| egui::vec2(w, h)),
     };
 
-    let mut viewport = egui::ViewportBuilder::default().with_min_inner_size([760.0, 520.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_min_inner_size([760.0, 520.0])
+        .with_icon(window_icon());
     if restore.maximized {
         // 最大化时位置和尺寸都不给。真正的"一出生就是最大化"由
         // `preset_maximized` 在窗口显示之前设好 —— 这里给了反而会被 Windows
@@ -402,6 +404,26 @@ fn apply_titlebar(dark: bool) {
 
 #[cfg(not(windows))]
 fn apply_titlebar(_dark: bool) {}
+
+/// 运行时窗口图标 —— 任务栏和 Alt+Tab 上显示的那个。
+///
+/// exe 里嵌的图标(见 `build.rs`)管的是"文件在资源管理器里什么样",窗口这边
+/// 得单独设,不然任务栏显示的还是默认图标。
+///
+/// 数据是构建前用 ImageMagick 转好的裸 RGBA(`assets/pigasio-64.rgba`),
+/// 这样不必为了解一张 PNG 把图片解码库拉进来。
+fn window_icon() -> egui::IconData {
+    /// 图标边长(像素)。
+    const SIZE: usize = 64;
+    const RGBA: &[u8] = include_bytes!("../../../assets/pigasio-64.rgba");
+    debug_assert_eq!(RGBA.len(), SIZE * SIZE * 4, "图标数据的尺寸对不上");
+
+    egui::IconData {
+        rgba: RGBA.to_vec(),
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
 
 /// 把窗口预设成"下次显示就是最大化"。
 ///

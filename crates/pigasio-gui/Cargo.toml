@@ -19,6 +19,10 @@ toml = { workspace = true }
 # 界面偏好(主题)单独存一份,见 `UiPrefs` 的说明。
 serde = { workspace = true }
 
+[build-dependencies]
+# 把 assets/pigasio.ico 编进 exe 的 Windows 资源(见 build.rs)。
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 # 用来在启动失败时弹一个系统对话框 —— 发布版没有控制台,
 # 否则用户只能看到"双击没反应"。
