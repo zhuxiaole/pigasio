@@ -1690,11 +1690,21 @@ impl App {
                 ui.end_row();
 
                 ui.label("缓冲目标水位");
+                // 水位换算成毫秒得在闭包外先算好 —— 闭包里要可变借用
+                // `self.buffer_watermark`,再读 `self.sample_rate` 就打架了。
+                let chunk_ms = self.buffer_size as f64 / self.sample_rate.max(1) as f64 * 1000.0;
                 theme::slider(
                     ui,
-                    egui::Slider::new(&mut self.buffer_watermark, 1.0..=6.0).suffix(" 个缓冲区"),
+                    egui::Slider::new(&mut self.buffer_watermark, 1.0..=12.0).custom_formatter(
+                        move |v, _| format!("{v:.2} 个缓冲区 ≈ {:.0} ms", v * chunk_ms),
+                    ),
                 )
-                .on_hover_text("每个流的环形缓冲要维持多少数据。调大更抗卡顿,但延迟更高。");
+                .on_hover_text(
+                    "每个流的环形缓冲要维持多少数据。这一项**直接加在延迟上**:\
+                         水位 × 缓冲区大小就是音频路径上多出来的等待时间。\
+                         调小能降延迟;调到实时状态里开始出现「欠载」,就说明\
+                         水位不够厚,该往回调一点了。",
+                );
                 ui.end_row();
             });
     }
@@ -1966,12 +1976,19 @@ impl App {
                     if snap.is_healthy() {
                         ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
                     } else {
+                        // 欠载几乎总是水位不够厚,而水位现在完全由用户说了算,
+                        // 所以直接把调整方向写在这儿 —— 不然只能对着数字猜。
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 160, 60),
                             format!(
                                 "欠载 {} / 溢出 {}",
                                 snap.underflow_frames, snap.overflow_frames
                             ),
+                        )
+                        .on_hover_text(
+                            "欠载是环形缓冲被读空了 —— 水位不够厚。可以试着把\
+                                 「缓冲目标水位」调大;溢出的方向相反,那是水位偏大\
+                                 或设备时钟偏慢。",
                         );
                     }
                     ui.end_row();

@@ -1145,7 +1145,7 @@ impl Engine {
                 reader,
                 resampler,
                 drift: DriftController::new(
-                    target_watermark_frames(chunk, engine_cfg.buffer_watermark, sample_rate),
+                    target_watermark_frames(chunk, engine_cfg.buffer_watermark),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1204,7 +1204,7 @@ impl Engine {
                 writer,
                 resampler,
                 drift: DriftController::new(
-                    target_watermark_frames(chunk, engine_cfg.buffer_watermark, sample_rate),
+                    target_watermark_frames(chunk, engine_cfg.buffer_watermark),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1499,39 +1499,33 @@ fn ring_capacity(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
 
 /// 计算每个流的目标水位,单位帧。
 ///
-/// 配置里给的是「多少个 ASIO 缓冲区」,但那个单位在**小缓冲区**下会失效 ——
-/// 水位的真正意义是「能撑住多久」,而 `chunk × watermark` 是绝对时间:
+/// 就是配置里的「多少个 ASIO 缓冲区」乘上缓冲大小。水位真正要表达的是
+/// **能撑住多久**,所以下面这张换算表才是它的本意 —— 用户填的是倍数,
+/// 而决定抗抖动能力的是绝对时间:
 ///
 /// | buffer_size | watermark | 实际水位 |
 /// |---|---|---|
-/// | 1024 | 3.0 | 3072 帧 = 64 ms(充裕) |
-/// | 256 | 3.0 | 768 帧 = **16 ms**(不足) |
+/// | 1024 | 3.0 | 3072 帧 = 64 ms |
+/// | 256 | 3.0 | 768 帧 = 16 ms |
 ///
-/// 16 ms 为什么不够:采集设备的回调周期可能接近甚至超过 20 ms,而宿主
-/// 每 5.3 ms 就来要一次数据。连续几次读取之间设备一次都没回调,环形缓冲
-/// 就空了,于是欠载。
+/// # 为什么不再兜一个绝对时间下限
 ///
-/// **只有输入方向会这样** —— 输出方向 ASIO 是生产者,总是能填满缓冲区,
-/// 设备来得晚只会让它读到旧数据。输入方向 ASIO 是消费者,设备不送数据
-/// 就只能补静音。这个不对称是多设备驱动里最容易忽略的一点。
+/// 这里原本有个 30 ms 的硬下限。理由是上面那个 16 ms 的格子实测会欠载:
+/// 采集设备的回调周期可能接近甚至超过 20 ms,而宿主每 5.3 ms 就来要一次
+/// 数据,连续几次读取之间设备一次都没回调,环形缓冲就空了。
 ///
-/// 所以这里再兜一个绝对时间的下限。在这台机器上实测(`chunk=256`,
-/// 48 kHz,五块设备)的临界点:
+/// 但那等于把用户的选择悄悄盖掉 —— 用户设 1,实际跑 30 ms,无论界面还是
+/// 日志都看不出来,想压延迟就会撞上一堵看不见的墙。
 ///
-/// | 水位 | 结果 |
-/// |---|---|
-/// | 16 ms(768 帧) | 两个麦克风都欠载 255 帧 |
-/// | 20 ms(960 帧) | 一只麦克风好了,另一只仍欠载 |
-/// | 30 ms(1440 帧) | **全部归零** |
+/// 而"水位不够"这件事本身是有反馈的:实时状态里那两列「欠载 / 溢出」会
+/// 立刻跳出来。既然用户看得见、也能自己调回来,就不该由代码替他拍板。
+/// 于是那个下限降级成了配置里的默认值(见 `EngineConfig::buffer_watermark`
+/// 的 3.0)——想换更低延迟就往下调,代价自己看得见。
 ///
-/// 取下限 30 ms,给回调周期留足余量。
-fn target_watermark_frames(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
-    /// 目标水位不得低于这么多秒的数据。
-    const MIN_WATERMARK_SECONDS: f64 = 0.03;
-
-    let by_ratio = chunk as f64 * watermark;
-    let by_time = sample_rate as f64 * MIN_WATERMARK_SECONDS;
-    by_ratio.max(by_time).round() as usize
+/// 唯一真正绕不开的是设备回调的抖动:抖动越大,水位就得越厚。但那取决于
+/// 用户的声卡和机器,该让他自己试,而不是由代码猜一个数。
+fn target_watermark_frames(chunk: usize, watermark: f64) -> usize {
+    ((chunk as f64 * watermark).round() as usize).max(1)
 }
 
 /// 与设备协商出一个可用的流配置。
@@ -1647,22 +1641,15 @@ mod tests {
 
     #[test]
     fn 小缓冲区下的目标水位由绝对时间兜底() {
-        // 这是"试运行显示欠载"那个问题的回归测试。
-        // 256 帧 @ 48 kHz 配 3.0 只有 16 ms,实测会欠载;应当被抬到 20 ms 以上。
-        let frames = target_watermark_frames(256, 3.0, 48_000);
-        assert!(
-            frames >= 1440,
-            "目标水位只有 {frames} 帧(约 {:.1} ms),不足 30 ms 的下限",
-            frames as f64 / 48_000.0 * 1000.0
-        );
-    }
-
-    #[test]
-    fn 正常缓冲区下目标水位仍按用户给的倍数() {
-        // 1024 帧配 3.0 是 64 ms,远高于下限,不该被改动。
-        assert_eq!(target_watermark_frames(1024, 3.0, 48_000), 3072);
-        // 用户主动调大时也不能被下限"拉低"。
-        assert_eq!(target_watermark_frames(1024, 6.0, 48_000), 6144);
+        // 这个函数以前会兜一个 30 ms 的绝对下限,把用户设的小水位悄悄抬上去
+        // ——256 帧配 3.0 只有 16 ms,会被抬到 1440 帧。现在不兜了:水位就是
+        // 用户给的值,欠载与否交给实时状态里那两列统计去说话。
+        assert_eq!(target_watermark_frames(256, 3.0), 768);
+        assert_eq!(target_watermark_frames(128, 1.0), 128);
+        assert_eq!(target_watermark_frames(1024, 3.0), 3072);
+        assert_eq!(target_watermark_frames(1024, 6.0), 6144);
+        // 极端值兜底:至少留一帧,不能让下游一帧数据都拿不到。
+        assert_eq!(target_watermark_frames(128, 0.0), 1);
     }
 
     #[test]
