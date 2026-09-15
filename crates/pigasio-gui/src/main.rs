@@ -486,6 +486,41 @@ impl Drop for Runner {
     }
 }
 
+/// 引擎正在启动或停止。
+///
+/// 这两件事都要跟 ASIO 驱动打交道 —— 打开设备、销毁缓冲、join 音频线程,
+/// 慢起来好几秒 —— 所以都丢到后台线程上跑,结果从 channel 收回来。
+enum RunnerJob {
+    Starting(std::sync::mpsc::Receiver<CoreResult<Runner>>),
+    Stopping(std::sync::mpsc::Receiver<()>),
+}
+
+impl RunnerJob {
+    /// 工具栏按钮上的文字。
+    fn button_label(&self) -> &'static str {
+        match self {
+            RunnerJob::Starting(_) => "正在启动…",
+            RunnerJob::Stopping(_) => "正在停止…",
+        }
+    }
+
+    /// 实时状态区里的说明。
+    fn hint(&self) -> &'static str {
+        match self {
+            RunnerJob::Starting(_) => "正在打开 ASIO 设备…多设备时这一步要几秒。",
+            RunnerJob::Stopping(_) => "正在关闭 ASIO 设备、释放缓冲。",
+        }
+    }
+}
+
+/// 后台枚举设备的结果。
+///
+/// 两个方向分开报错:一块设备出问题不该让另一边也空着。
+struct DeviceLists {
+    inputs: CoreResult<Vec<String>>,
+    outputs: CoreResult<Vec<String>>,
+}
+
 // ---------------------------------------------------------------------------
 // 应用
 // ---------------------------------------------------------------------------
@@ -512,6 +547,13 @@ struct App {
 
     // ---- 试运行 ----
     runner: Option<Runner>,
+    /// 引擎正在启动或停止。见 [`RunnerJob`]。
+    runner_job: Option<RunnerJob>,
+    /// 正在后台线程里枚举的设备。
+    ///
+    /// 枚举要加载驱动、问它要通道表,同样不能压在 UI 线程上 —— 窗口刚弹
+    /// 出来时那一次也在其中。
+    devices_job: Option<std::sync::mpsc::Receiver<DeviceLists>>,
     /// 当前主题模式。切换时会立即重新应用样式。
     theme_mode: ThemeMode,
 }
@@ -541,6 +583,8 @@ impl App {
             message: String::new(),
             message_is_error: false,
             runner: None,
+            runner_job: None,
+            devices_job: None,
             theme_mode: initial_theme,
         };
 
@@ -560,21 +604,24 @@ impl App {
         app
     }
 
+    /// 刷新设备列表。
+    ///
+    /// 枚举要加载驱动、问它要通道表,压在 UI 线程上的话窗口刚弹出来那一下
+    /// 就会僵住(启动时那次也走这里),所以丢给后台线程,结果由
+    /// [`Self::poll_devices`] 收。
     fn refresh_devices(&mut self) {
-        match pigasio_core::devices::enumerate(StreamKind::Input) {
-            Ok(list) => self.input_devices = list.into_iter().map(|d| d.name).collect(),
-            Err(e) => {
-                self.input_devices.clear();
-                self.set_error(format!("枚举输入设备失败:{e}"));
-            }
-        }
-        match pigasio_core::devices::enumerate(StreamKind::Output) {
-            Ok(list) => self.output_devices = list.into_iter().map(|d| d.name).collect(),
-            Err(e) => {
-                self.output_devices.clear();
-                self.set_error(format!("枚举输出设备失败:{e}"));
-            }
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let names = |kind| {
+                pigasio_core::devices::enumerate(kind)
+                    .map(|list| list.into_iter().map(|d| d.name).collect::<Vec<_>>())
+            };
+            let _ = tx.send(DeviceLists {
+                inputs: names(StreamKind::Input),
+                outputs: names(StreamKind::Output),
+            });
+        });
+        self.devices_job = Some(rx);
     }
 
     fn set_error(&mut self, message: String) {
@@ -645,22 +692,121 @@ impl App {
     }
 
     fn toggle_runner(&mut self) {
-        if self.runner.is_some() {
-            self.runner = None;
-            self.set_info("试运行已停止。".to_string());
+        // 启动/停止还没回来。按钮这时是灰的,这里再兜一道。
+        if self.runner_job.is_some() {
             return;
         }
+
+        if let Some(runner) = self.runner.take() {
+            // 释放也不能占着 UI 线程:Runner 析构会层层落到 `StreamHost`
+            // 的 `join()` 上,而那要等音频线程把每块设备的缓冲都销毁完。
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                drop(runner);
+                let _ = tx.send(());
+            });
+            self.runner_job = Some(RunnerJob::Stopping(rx));
+            self.set_info("正在停止引擎…".into());
+            return;
+        }
+
         let config = self.build_config();
         if let Err(e) = config.validate() {
             self.set_error(format!("无法试运行:{e}"));
             return;
         }
-        match Runner::start(config) {
-            Ok(runner) => {
-                self.runner = Some(runner);
-                self.set_info("试运行中。输出为静音,只统计缓冲状态,不会发出声音。".into());
+
+        // 打开设备、分配缓冲、启动流都要跟 ASIO 驱动打交道,慢起来好几秒。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // 收端没了(比如窗口已经关了)就让 Runner 就地析构 ——
+            // 它的 Drop 会去停引擎。
+            let _ = tx.send(Runner::start(config));
+        });
+        self.runner_job = Some(RunnerJob::Starting(rx));
+        self.set_info("正在启动引擎…".into());
+    }
+
+    /// 收后台线程送回来的启动/停止结果。每帧调一次。
+    fn poll_runner_job(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+
+        // 先把 job 取出来,下面才好改 `self` 的其它字段。
+        let Some(job) = self.runner_job.take() else {
+            return;
+        };
+        let mut pending = true;
+
+        match &job {
+            RunnerJob::Starting(rx) => match rx.try_recv() {
+                Ok(Ok(runner)) => {
+                    pending = false;
+                    self.runner = Some(runner);
+                    self.set_info("试运行中。输出为静音,只统计缓冲状态,不会发出声音。".into());
+                }
+                Ok(Err(e)) => {
+                    pending = false;
+                    self.set_error(format!("试运行失败:{e}"));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    // 线程 panic 了才会走到这里。
+                    pending = false;
+                    self.set_error("启动线程异常退出。".into());
+                }
+            },
+            RunnerJob::Stopping(rx) => match rx.try_recv() {
+                // 线程提前退出也别卡在"正在停止"上:设备已经跟着进程走了。
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    pending = false;
+                    self.set_info("试运行已停止。".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            },
+        }
+
+        if pending {
+            self.runner_job = Some(job);
+            // 这中间没有输入事件,egui 默认不会重绘,不主动要一帧的话界面
+            // 就停在「正在启动…」上了。
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// 收后台线程送回来的设备列表。每帧调一次。
+    fn poll_devices(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(rx) = self.devices_job.as_ref() else {
+            return;
+        };
+        let received = rx.try_recv();
+
+        match received {
+            Ok(lists) => {
+                self.devices_job = None;
+                match lists.inputs {
+                    Ok(names) => self.input_devices = names,
+                    Err(e) => {
+                        self.input_devices.clear();
+                        self.set_error(format!("枚举输入设备失败:{e}"));
+                    }
+                }
+                match lists.outputs {
+                    Ok(names) => self.output_devices = names,
+                    Err(e) => {
+                        self.output_devices.clear();
+                        self.set_error(format!("枚举输出设备失败:{e}"));
+                    }
+                }
             }
-            Err(e) => self.set_error(format!("试运行失败:{e}")),
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.devices_job = None;
+                self.set_error("枚举设备的线程异常退出。".into());
+            }
         }
     }
 }
@@ -767,6 +913,10 @@ fn toml_string(s: &str) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 先收后台线程的结果。
+        self.poll_runner_job(ctx);
+        self.poll_devices(ctx);
+
         // 试运行时周期性重绘以刷新统计;平时按需重绘即可。
         if self.runner.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -778,7 +928,10 @@ impl eframe::App for App {
                 ui.label("多设备 ASIO 驱动");
                 ui.separator();
 
-                if ui.button("刷新设备").clicked() {
+                if ui
+                    .add_enabled(self.devices_job.is_none(), egui::Button::new("刷新设备"))
+                    .clicked()
+                {
                     self.refresh_devices();
                 }
                 if ui.button("重新载入").clicked() {
@@ -819,14 +972,18 @@ impl eframe::App for App {
                 }
 
                 ui.separator();
-                let running = self.runner.is_some();
-                let label = if running {
+                let busy = self.runner_job.is_some();
+                let label = if let Some(job) = self.runner_job.as_ref() {
+                    job.button_label()
+                } else if self.runner.is_some() {
                     "■ 停止试运行"
                 } else {
                     "▶ 试运行"
                 };
+                // 启动/停止途中把按钮禁掉:这时候再点没有意义,而且会让人以为
+                // 界面卡死了 —— 其实它只是在等后台线程。
                 if ui
-                    .button(label)
+                    .add_enabled(!busy, egui::Button::new(label))
                     .on_hover_text("在面板内启动引擎,实时查看各流的缓冲状态;输出是静音的")
                     .clicked()
                 {
@@ -1310,14 +1467,18 @@ impl App {
     fn draw_runner_status(&mut self, ui: &mut egui::Ui) {
         let Some(runner) = self.runner.as_ref() else {
             ui.heading("实时状态");
-            ui.label(
-                egui::RichText::new(
-                    "点上面的「试运行」启动引擎,就能在这里看到各流的缓冲水位和\
-                     漂移补偿量。试运行不会发出声音,适合在打开 DAW 之前先确认\
-                     多设备是否同步。",
-                )
-                .weak(),
-            );
+            if let Some(job) = self.runner_job.as_ref() {
+                ui.label(job.hint());
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "点上面的「试运行」启动引擎,就能在这里看到各流的缓冲水位和\
+                         漂移补偿量。试运行不会发出声音,适合在打开 DAW 之前先确认\
+                         多设备是否同步。",
+                    )
+                    .weak(),
+                );
+            }
             return;
         };
 
