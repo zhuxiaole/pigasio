@@ -31,10 +31,15 @@ use pigasio_core::config::{
 };
 use pigasio_core::{AsioBufferSet, Engine, Result as CoreResult, StreamKind};
 
+mod theme;
+use theme::ThemeMode;
+
 fn main() -> eframe::Result<()> {
     init_logging();
 
     let config_path = parse_config_arg();
+    // 主题默认跟随系统;`--theme light|dark` 可以强制指定,方便截图和排查。
+    let theme_mode = parse_theme_arg();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 780.0])
@@ -47,7 +52,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             install_ui_font(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc, config_path)))
+            theme::apply(&cc.egui_ctx, theme_mode);
+            Ok(Box::new(App::new(cc, config_path, theme_mode)))
         }),
     );
 
@@ -124,6 +130,10 @@ fn report_fatal(message: &str) {
 }
 
 /// 字体表里给中文字体用的键名。
+/// 拉丁字体在字体表里的键名。
+const LATIN_FONT_KEY: &str = "pigasio-latin";
+
+/// 中文字体在字体表里的键名。
 const CJK_FONT_KEY: &str = "pigasio-cjk";
 
 /// 让界面能显示中文。
@@ -139,73 +149,123 @@ const CJK_FONT_KEY: &str = "pigasio-cjk";
 /// 用户可以用环境变量 `PIGASIO_FONT` 指定自己的字体文件(路径后面可以
 /// 跟 `#序号` 来指定 TTC 里的第几个字体面)。
 fn install_ui_font(ctx: &egui::Context) {
-    let Some((bytes, index, source)) = load_font_bytes() else {
-        log::warn!(
-            "系统里找不到可用的中文字体,界面上的中文会显示成方框。\
-             可以用环境变量 PIGASIO_FONT 指定一个字体文件。"
-        );
-        return;
-    };
-
     let mut fonts = egui::FontDefinitions::default();
 
-    let mut data = egui::FontData::from_owned(bytes);
-    data.index = index;
-    fonts.font_data.insert(CJK_FONT_KEY.to_owned(), data);
+    // 字体列表是**按字符逐个**查找的:排在前面的先命中。所以把 Segoe UI
+    // 放前面(拉丁字母、数字、标点),中文字体放后面兜底 —— 这正是
+    // Fluent 的处理方式,英文和数字的观感才和系统一致。
+    let mut installed = Vec::new();
 
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push(CJK_FONT_KEY.to_owned());
+    // 1. Latin:Segoe UI,Windows 11 的界面字体。
+    if let Some((bytes, index, source)) = load_latin_font() {
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = index;
+        fonts.font_data.insert(LATIN_FONT_KEY.to_owned(), data);
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push(LATIN_FONT_KEY.to_owned());
+        }
+        installed.push(source);
+    }
+
+    // 2. CJK:雅黑一类。放在后面,只接管拉丁字体没有的字形。
+    match load_cjk_font() {
+        Some((bytes, index, source)) => {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = index;
+            fonts.font_data.insert(CJK_FONT_KEY.to_owned(), data);
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push(CJK_FONT_KEY.to_owned());
+            }
+            installed.push(source);
+        }
+        None => log::warn!(
+            "系统里找不到可用的中文字体,界面上的中文会显示成方框。\
+             可以用环境变量 PIGASIO_FONT 指定一个字体文件。"
+        ),
     }
 
     ctx.set_fonts(fonts);
-    log::info!("界面字体:{}", source.display());
+    if !installed.is_empty() {
+        let names: Vec<_> = installed.iter().map(|p| p.display().to_string()).collect();
+        log::info!("界面字体:{}", names.join(" + "));
+    }
 }
 
-/// 找一个能显示中文的字体文件。
+/// 拉丁字体的候选,按优先级。
 ///
-/// 优先用环境变量指定的,其次按"适合做界面"的顺序在系统字体目录里挑。
-fn load_font_bytes() -> Option<(Vec<u8>, u32, PathBuf)> {
-    // 1. 用户显式指定的字体。
-    if let Ok(spec) = std::env::var("PIGASIO_FONT") {
-        let spec = spec.trim();
-        if !spec.is_empty() {
-            let (path, index) = match spec.rsplit_once('#') {
-                Some((p, n)) => (p, n.parse().unwrap_or(0)),
-                None => (spec, 0),
-            };
-            let path = PathBuf::from(path);
-            match std::fs::read(&path) {
-                Ok(bytes) => return Some((bytes, index, path)),
-                Err(e) => log::warn!("PIGASIO_FONT 指向的 {} 读不出来:{e}", path.display()),
-            }
+/// 用静态的 `segoeui.ttf` 而不是 `SegUIVar.ttf`(Segoe UI Variable):
+/// epaint 加载字体失败时会直接 **panic**,而可变字体能否被 ab_glyph
+/// 正常解析并不确定。静态版观感几乎一致,没有这个风险。
+fn load_latin_font() -> Option<(Vec<u8>, u32, PathBuf)> {
+    if let Some(spec) = std::env::var_os("PIGASIO_LATIN_FONT") {
+        let spec = spec.to_string_lossy().to_string();
+        if let Some(found) = read_font_spec(&spec) {
+            return Some(found);
         }
     }
 
-    // 2. 系统字体。顺序是按"做界面好不好看"排的:
-    //    微软雅黑是屏显无衬线体,最合适;等线偏细,黑体偏重,
-    //    宋体是衬线体,在屏幕上都不如雅黑耐看。
     let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let candidates = [
-        ("Fonts/msyh.ttc", 0u32),    // 微软雅黑
-        ("Fonts/msyhl.ttc", 0),      // 微软雅黑 Light
-        ("Fonts/Deng.ttf", 0),       // 等线
-        ("Fonts/simhei.ttf", 0),     // 黑体
-        ("Fonts/msjh.ttc", 0),       // 微软正黑(繁体系统)
-        ("Fonts/simsun.ttc", 0),     // 宋体
-    ];
+    for name in ["Fonts/segoeui.ttf", "Fonts/SegoeUI.ttf"] {
+        let path = PathBuf::from(&windir).join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Some((bytes, 0, path));
+        }
+    }
+    None
+}
 
-    for (relative, index) in candidates {
+/// 中文字体的候选,按"做界面好不好看"排序。
+fn load_cjk_font() -> Option<(Vec<u8>, u32, PathBuf)> {
+    if let Some(spec) = std::env::var_os("PIGASIO_FONT") {
+        let spec = spec.to_string_lossy().to_string();
+        if let Some(found) = read_font_spec(&spec) {
+            return Some(found);
+        }
+    }
+
+    let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    for (relative, index) in [
+        ("Fonts/msyh.ttc", 0u32), // 微软雅黑
+        ("Fonts/msyhl.ttc", 0),   // 微软雅黑 Light
+        ("Fonts/Deng.ttf", 0),    // 等线
+        ("Fonts/simhei.ttf", 0),  // 黑体
+        ("Fonts/msjh.ttc", 0),    // 微软正黑(繁体系统)
+        ("Fonts/simsun.ttc", 0),  // 宋体
+    ] {
         let path = PathBuf::from(&windir).join(relative);
         if let Ok(bytes) = std::fs::read(&path) {
             return Some((bytes, index, path));
         }
     }
-
     None
+}
+
+/// 解析 `路径` 或 `路径#序号` 形式的字体指定,并读出字节。
+fn read_font_spec(spec: &str) -> Option<(Vec<u8>, u32, PathBuf)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (path, index) = match spec.rsplit_once('#') {
+        Some((p, n)) => (p, n.parse().unwrap_or(0)),
+        None => (spec, 0),
+    };
+    let path = PathBuf::from(path);
+    match std::fs::read(&path) {
+        Ok(bytes) => Some((bytes, index, path)),
+        Err(e) => {
+            log::warn!("字体 {} 读不出来:{e}", path.display());
+            None
+        }
+    }
 }
 
 /// 驱动通过 `--config <路径>` 把当前生效的配置文件告诉控制面板。
@@ -221,6 +281,27 @@ fn parse_config_arg() -> Option<PathBuf> {
         i += 1;
     }
     None
+}
+
+/// 解析 `--theme light|dark|system`。
+///
+/// 默认跟随系统。强制指定主要用于截图和对比排查 —— 界面里也有切换按钮。
+fn parse_theme_arg() -> ThemeMode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--theme" {
+            match args.get(i + 1).map(String::as_str) {
+                Some("light") => return ThemeMode::Light,
+                Some("dark") => return ThemeMode::Dark,
+                Some("system") => return ThemeMode::System,
+                Some(other) => log::warn!("--theme 的值 “{other}” 无法识别,改用跟随系统"),
+                None => log::warn!("--theme 后面缺少参数"),
+            }
+        }
+        i += 1;
+    }
+    ThemeMode::System
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +512,18 @@ struct App {
 
     // ---- 试运行 ----
     runner: Option<Runner>,
+    /// 当前主题模式。切换时会立即重新应用样式。
+    theme_mode: ThemeMode,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>, config_path: Option<PathBuf>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        config_path: Option<PathBuf>,
+        initial_theme: ThemeMode,
+    ) -> Self {
+        // 主题在进入这里之前已经应用过了,这里只把模式记下来供界面切换用。
+        let _ = cc;
         let mut app = App {
             sample_rate: 48_000,
             buffer_size: 1024,
@@ -452,6 +541,7 @@ impl App {
             message: String::new(),
             message_is_error: false,
             runner: None,
+            theme_mode: initial_theme,
         };
 
         app.refresh_devices();
@@ -696,16 +786,31 @@ impl eframe::App for App {
                         self.load_from(&p);
                     }
                 }
+
+                // 主题切换。三个并排的可选项而不是下拉框 —— 当前用的是
+                // 哪个一眼就能看出来,而主题这种"随时想换一下"的东西
+                // 不值得为它多一次点击。
+                ui.separator();
+                for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+                    if ui
+                        .selectable_label(self.theme_mode == mode, mode.label())
+                        .clicked()
+                        && self.theme_mode != mode
+                    {
+                        self.theme_mode = mode;
+                        theme::apply(ctx, mode);
+                    }
+                }
                 if ui.button("保存").clicked() {
                     if let Some(p) = self.config_path.clone() {
                         self.save_to(&p);
                     } else {
                         // 没有路径就落到用户目录,这是驱动默认会查找的位置。
-                        if let Some(home) = std::env::var_os("USERPROFILE")
-                            .or_else(|| std::env::var_os("HOME"))
+                        if let Some(home) =
+                            std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
                         {
-                            let p = PathBuf::from(home)
-                                .join(pigasio_core::config::CONFIG_FILE_NAME);
+                            let p =
+                                PathBuf::from(home).join(pigasio_core::config::CONFIG_FILE_NAME);
                             self.save_to(&p);
                         } else {
                             self.set_error("无法确定用户目录,请先用「另存为」指定路径".into());
@@ -715,7 +820,11 @@ impl eframe::App for App {
 
                 ui.separator();
                 let running = self.runner.is_some();
-                let label = if running { "■ 停止试运行" } else { "▶ 试运行" };
+                let label = if running {
+                    "■ 停止试运行"
+                } else {
+                    "▶ 试运行"
+                };
                 if ui
                     .button(label)
                     .on_hover_text("在面板内启动引擎,实时查看各流的缓冲状态;输出是静音的")
@@ -754,17 +863,123 @@ impl eframe::App for App {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.draw_engine_settings(ui);
-                ui.separator();
-                self.draw_streams(ui, StreamKind::Output);
-                ui.separator();
-                self.draw_streams(ui, StreamKind::Input);
-                ui.separator();
-                self.draw_runner_status(ui);
+        // 布局分四层,每一层都有自己独立的滚动区,整个窗口不再整页滚动:
+        //
+        //   ┌ 工具栏 ────────────────────────────────┐
+        //   ├ 引擎设置(固定高度)─────────────────────┤
+        //   ├ 输入设备 │ 输出设备(左右两列,各自滚动)──┤
+        //   ├ 实时状态(固定高度,可拖拽调整)──────────┤
+        //   └ 状态栏 ────────────────────────────────┘
+        //
+        // 这么分是因为这是个工具面板:设备列表可能很长,但引擎参数和实时
+        // 状态是随时要瞄一眼的,不该被列表顶出视野。
+
+        // 引擎设置钉在顶部。
+        egui::TopBottomPanel::top("engine_settings_panel")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(theme::panel_frame(ctx))
+            .show(ctx, |ui| {
+                // 用 panel_card 而不是 content_frame:卡片宽度必须由面板
+                // 决定。里面的两栏 Grid 一旦比列宽宽一点点,`Frame::show`
+                // 就会跟着内容把卡片撑到窗口右缘,右边距随即消失。
+                theme::panel_card(ui, |ui| {
+                    self.draw_engine_settings(ui);
+                });
             });
-        });
+
+        // 实时状态钉在底部,高度可以拖 —— 试运行时信息量大,值得给它
+        // 更多空间;平时又可以压扁让设备列表占满。
+        egui::TopBottomPanel::bottom("runner_panel")
+            .resizable(true)
+            .default_height(180.0)
+            .min_height(90.0)
+            .max_height(400.0)
+            .show_separator_line(false)
+            .frame(theme::panel_frame(ctx))
+            .show(ctx, |ui| {
+                theme::panel_card(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("runner_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.draw_runner_status(ui);
+                        });
+                });
+            });
+
+        // 中间留给设备,左右各占一半。两边各有自己的滚动条,
+        // 所以加设备加到几十个也不会把别的区域挤走。
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    // 铺上窗口底色。
+                    //
+                    // 千万别写 `Color32::TRANSPARENT` —— 这层窗口底色本来
+                    // 就是这个 CentralPanel 画的,置成透明等于"不画",底下
+                    // 没有任何层接手,glow 就用黑色 clear 那块区域,于是
+                    // 内边距变成一圈纯黑的框。这正是之前"黑边框"的真凶:
+                    // 它不是描边,是**没有背景色的空隙**。
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                let total = ui.available_width();
+                let gap = ui.spacing().item_spacing.x;
+                let column = ((total - gap) / 2.0).max(220.0);
+
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(column, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            theme::content_frame(ui).show(ui, |ui| {
+                                // 撑满这一栏并限住上界。
+                                //
+                                // `Frame::show` 的宽度**由内容决定**:不撑的话
+                                // 卡片会比这一栏窄,和上下的引擎设置区对不齐;
+                                // 不封顶的话,某个控件比这栏还宽时会把整栏反过
+                                // 来撑宽 —— egui 的容器都是"内容决定尺寸"。
+                                // 这一栏的内容都做了 wrap,不会溢出。
+                                let w = ui.available_width();
+                                ui.set_min_width(w);
+                                ui.set_max_width(w);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("inputs_scroll")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        self.draw_streams(ui, StreamKind::Input);
+                                    });
+                            });
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(column, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            theme::content_frame(ui).show(ui, |ui| {
+                                // 撑满这一栏并限住上界。
+                                //
+                                // `Frame::show` 的宽度**由内容决定**:不撑的话
+                                // 卡片会比这一栏窄,和上下的引擎设置区对不齐;
+                                // 不封顶的话,某个控件比这栏还宽时会把整栏反过
+                                // 来撑宽 —— egui 的容器都是"内容决定尺寸"。
+                                // 这一栏的内容都做了 wrap,不会溢出。
+                                let w = ui.available_width();
+                                ui.set_min_width(w);
+                                ui.set_max_width(w);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("outputs_scroll")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        self.draw_streams(ui, StreamKind::Output);
+                                    });
+                            });
+                        },
+                    );
+                });
+            });
     }
 }
 
@@ -772,83 +987,23 @@ impl App {
     fn draw_engine_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("引擎设置");
         let sample_rate = self.sample_rate;
-        // 两列(标签 + 控件),每组参数独占一行。
+
+        // 两栏并排。
         //
-        // 不用四列挤两组的布局:中文字体(微软雅黑)的字符宽度明显大于
-        // egui 自带的拉丁字体,四列时"缓冲区"那一排按钮会被压得很难点。
-        egui::Grid::new("engine_settings")
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("采样率");
-                ui.horizontal(|ui| {
-                    for rate in [44_100u32, 48_000, 88_200, 96_000] {
-                        ui.selectable_value(&mut self.sample_rate, rate, rate.to_string());
-                    }
-                });
-                ui.end_row();
+        // 这些参数是"设一次就不动"的东西,竖着堆 7 行要把 160px 的垂直
+        // 空间吃掉 —— 而那正是下面设备列表最需要的。分两栏后压到 4 行。
+        //
+        // 这里敢用 `ui.columns`:它收尾时会按「**最宽**的那一列 × 列数」
+        // 重算总宽 —— 子控件溢出多少,它就把父 `Ui` 撑宽多少,卡片会被
+        // 一路顶到窗口右缘。早先左栏那 5 个带毫秒的按钮就踩过这个坑。
+        // 现在两栏用的都是宽度可控的下拉框,而且卡片宽度已经由
+        // `theme::panel_card` 锁死,真溢出了也撑不大。
+        ui.columns(2, |cols| {
+            self.engine_settings_left(&mut cols[0], sample_rate);
+            self.engine_settings_right(&mut cols[1]);
+        });
 
-                ui.label("缓冲区");
-                ui.horizontal(|ui| {
-                    for size in [128u32, 256, 512, 1024, 2048] {
-                        let latency = size as f32 / sample_rate as f32 * 1000.0;
-                        let text = format!("{size} ({latency:.0}ms)");
-                        ui.selectable_value(&mut self.buffer_size, size, text);
-                    }
-                });
-                ui.end_row();
-
-                ui.label("重采样质量");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.resample_quality,
-                        ResampleQuality::Sinc,
-                        "sinc(最好)",
-                    );
-                    ui.selectable_value(
-                        &mut self.resample_quality,
-                        ResampleQuality::Fast,
-                        "fast(省 CPU)",
-                    );
-                    ui.selectable_value(&mut self.resample_quality, ResampleQuality::None, "none");
-                });
-                ui.end_row();
-
-                ui.label("时钟漂移补偿");
-                ui.checkbox(&mut self.drift_correction, "启用");
-                ui.end_row();
-
-                ui.label("通道名带设备名");
-                ui.checkbox(&mut self.use_non_ascii_channel_names, "允许中文")
-                    .on_hover_text(
-                        "ASIO 的通道名是 char[32],协议没规定编码。默认按系统代码页\
-                         写入,中文 Windows 上能显示中文设备名。少数宿主解释方式不同,\
-                         如果通道名显示成乱码,取消勾选就会退化成 OUT 1 (dev2) 这样的\
-                         纯 ASCII 形式。",
-                    );
-                ui.end_row();
-
-                ui.label("最大漂移补偿");
-                ui.add(
-                    egui::Slider::new(&mut self.max_drift_ppm, 10.0..=5000.0)
-                        .suffix(" ppm")
-                        .logarithmic(true),
-                )
-                .on_hover_text(
-                    "稳态下允许的重采样比率偏移。设得太小可能压不住两块声卡之间的\
-                     晶振差异。",
-                );
-                ui.end_row();
-
-                ui.label("缓冲目标水位");
-                ui.add(
-                    egui::Slider::new(&mut self.buffer_watermark, 1.0..=6.0).suffix(" 个缓冲区"),
-                )
-                .on_hover_text("每个流的环形缓冲要维持多少数据。调大更抗卡顿,但延迟更高。");
-                ui.end_row();
-            });
-
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
                 "采样率和缓冲区大小由所有设备共用。设备不支持该采样率时,引擎会自动\
@@ -858,6 +1013,118 @@ impl App {
             .weak(),
         );
         let _ = self.asio_sample_type;
+    }
+
+    /// 引擎设置左栏:采样率、缓冲区、重采样质量。
+    fn engine_settings_left(&mut self, ui: &mut egui::Ui, sample_rate: u32) {
+        /// 下拉框宽度。三行取同一个值才对齐。
+        ///
+        /// `ComboBox::width` 是**最小**宽度:文字比它窄就按这个值,所以只要
+        /// 它不小于最长的那项("none(不重采样)"、"2048 (43ms)"),三个框就
+        /// 一样宽。
+        const COMBO: f32 = 190.0;
+
+        egui::Grid::new("engine_settings_left")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("采样率");
+                egui::ComboBox::from_id_salt("sample_rate")
+                    .selected_text(self.sample_rate.to_string())
+                    .width(COMBO)
+                    .show_ui(ui, |ui| {
+                        for rate in [44_100u32, 48_000, 88_200, 96_000] {
+                            ui.selectable_value(&mut self.sample_rate, rate, rate.to_string());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("缓冲区");
+                egui::ComboBox::from_id_salt("buffer_size")
+                    .selected_text(buffer_label(self.buffer_size, sample_rate))
+                    .width(COMBO)
+                    .show_ui(ui, |ui| {
+                        for size in [128u32, 256, 512, 1024, 2048] {
+                            ui.selectable_value(
+                                &mut self.buffer_size,
+                                size,
+                                buffer_label(size, sample_rate),
+                            );
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("重采样质量");
+                egui::ComboBox::from_id_salt("resample_quality")
+                    .selected_text(resample_label(self.resample_quality))
+                    .width(COMBO)
+                    .show_ui(ui, |ui| {
+                        for quality in [
+                            ResampleQuality::Sinc,
+                            ResampleQuality::Fast,
+                            ResampleQuality::None,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.resample_quality,
+                                quality,
+                                resample_label(quality),
+                            )
+                            .on_hover_text(match quality {
+                                ResampleQuality::Sinc => "窗化 sinc 插值,音质和开销平衡得最好。",
+                                ResampleQuality::Fast => "多项式插值,省 CPU,音质一般。",
+                                ResampleQuality::None => {
+                                    "要求每块设备都直接支持引擎采样率,并且关掉时钟\
+                                     漂移补偿;否则两块声卡的晶振差会周期性地爆音。\
+                                     换来的是最低延迟。"
+                                }
+                            });
+                        }
+                    });
+                ui.end_row();
+            });
+    }
+
+    /// 引擎设置右栏:时钟、通道名、漂移补偿。
+    fn engine_settings_right(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("engine_settings_right")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("时钟漂移补偿");
+                ui.checkbox(&mut self.drift_correction, "启用");
+                ui.end_row();
+
+                ui.label("通道名带设备名");
+                ui.checkbox(&mut self.use_non_ascii_channel_names, "允许中文")
+                    .on_hover_text(
+                        "ASIO 的通道名是 char[32],协议没规定编码。默认按系统代码页\
+                             写入,中文 Windows 上能显示中文设备名。少数宿主解释方式不同,\
+                             如果通道名显示成乱码,取消勾选就会退化成 OUT 1 (dev2) 这样的\
+                             纯 ASCII 形式。",
+                    );
+                ui.end_row();
+
+                ui.label("最大漂移补偿");
+                theme::slider(
+                    ui,
+                    egui::Slider::new(&mut self.max_drift_ppm, 10.0..=5000.0)
+                        .suffix(" ppm")
+                        .logarithmic(true),
+                )
+                .on_hover_text(
+                    "稳态下允许的重采样比率偏移。设得太小可能压不住两块声卡之间的\
+                         晶振差异。",
+                );
+                ui.end_row();
+
+                ui.label("缓冲目标水位");
+                theme::slider(
+                    ui,
+                    egui::Slider::new(&mut self.buffer_watermark, 1.0..=6.0).suffix(" 个缓冲区"),
+                )
+                .on_hover_text("每个流的环形缓冲要维持多少数据。调大更抗卡顿,但延迟更高。");
+                ui.end_row();
+            });
     }
 
     fn draw_streams(&mut self, ui: &mut egui::Ui, kind: StreamKind) {
@@ -876,10 +1143,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.heading(format!("{}设备", kind.as_str()));
-            ui.label(
-                egui::RichText::new(format!("共 {} 路", streams.len()))
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(format!("共 {} 路", streams.len())).weak());
             if ui.button("+ 添加").clicked() {
                 streams.push(StreamEdit {
                     clock_master: false,
@@ -916,7 +1180,7 @@ impl App {
             };
             asio_offset += channel_count;
 
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            theme::card_frame(ui, true).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong(format!("#{}", i + 1));
 
@@ -925,10 +1189,19 @@ impl App {
                     } else {
                         stream.device.clone()
                     };
-                    egui::ComboBox::from_id_salt((is_input, i))
-                        .selected_text(elide(&current, 40))
-                        .width(360.0)
+                    // 先把"删除"按钮从右边占掉,剩下的宽度才归下拉框 ——
+                    // 反过来的话,下拉框会吃掉整行,把按钮挤到重叠。
+                    let button_w = 46.0;
+                    let combo_width = (ui.available_width() - button_w - 12.0).max(110.0);
+                    let combo = egui::ComboBox::from_id_salt((is_input, i))
+                        // 交给 egui 按**实际宽度**截断。早先这里是自己按字符数
+                        // 截的(`elide(&current, 22)`),而一个汉字顶两个字符宽,
+                        // 设备名于是老早被切掉、右边却还空着一大截。
+                        .selected_text(current.as_str())
+                        .truncate()
+                        .width(combo_width)
                         .show_ui(ui, |ui| {
+                            ui.set_min_width(combo_width);
                             if ui
                                 .selectable_label(stream.use_default_device, "(系统默认设备)")
                                 .clicked()
@@ -936,28 +1209,33 @@ impl App {
                                 stream.use_default_device = true;
                             }
                             for name in &device_names {
-                                let selected =
-                                    !stream.use_default_device && &stream.device == name;
+                                let selected = !stream.use_default_device && &stream.device == name;
                                 if ui.selectable_label(selected, name).clicked() {
                                     stream.device = name.clone();
                                     stream.use_default_device = false;
                                 }
                             }
                         });
+                    let _ = combo;
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("删除").clicked() {
                             remove = Some(i);
                         }
-                        ui.label(
-                            egui::RichText::new(format!("→ ASIO {} 通道 {range_text}", kind.as_str()))
-                                .small()
-                                .weak(),
-                        );
                     });
                 });
 
-                ui.horizontal(|ui| {
+                // ASIO 通道映射单独占一行。放在下拉框右边时会被挤成
+                // 一两个字,不如让它自己一行说清楚。
+                ui.label(
+                    egui::RichText::new(format!("→ ASIO {} 通道 {range_text}", kind.as_str()))
+                        .small()
+                        .weak(),
+                );
+
+                // 用 horizontal_wrapped:分栏之后每列只有半屏宽,
+                // 通道/增益/时钟主设备这一行放不下时会自动折到下一行。
+                ui.horizontal_wrapped(|ui| {
                     ui.label("通道");
                     ui.selectable_value(&mut stream.channel_mode, ChannelMode::Count, "前 N 个");
                     ui.selectable_value(&mut stream.channel_mode, ChannelMode::List, "指定");
@@ -1060,11 +1338,17 @@ impl App {
         });
 
         if status.input_channels > 0 {
-            ui.add(
-                egui::ProgressBar::new(peak.clamp(0.0, 1.0))
-                    .desired_width(260.0)
-                    .text(format!("输入峰值 {peak:.3}")),
-            );
+            // 数值放在条**外面**。
+            //
+            // egui 给条内文字取的颜色是 `selection.stroke.color`,而本主题按
+            // Fluent 的规则把它设成了"强调色上的反色" —— 浅色主题里就是白。
+            // 文字又是左对齐的,进度小的时候整段都落在**未填充**的白底上,
+            // 于是白字白底,什么都看不见;深色主题同理(黑字压深底)。放外面
+            // 就和填充多少无关了,进度再小也读得出数。
+            ui.horizontal(|ui| {
+                ui.add(egui::ProgressBar::new(peak.clamp(0.0, 1.0)).desired_width(260.0));
+                ui.label(format!("输入峰值 {peak:.3}"));
+            });
         }
 
         ui.add_space(4.0);
@@ -1102,10 +1386,25 @@ impl App {
             });
 
         if status.stream_stats.is_empty() {
-            ui.label(
-                egui::RichText::new("暂时读不到统计(音频回调正忙),稍后会自动刷新。").weak(),
-            );
+            ui.label(egui::RichText::new("暂时读不到统计(音频回调正忙),稍后会自动刷新。").weak());
         }
+    }
+}
+
+/// 缓冲区选项的文字:大小 + 它在当前采样率下的延迟。
+///
+/// 延迟才是选缓冲区时真正要权衡的东西,所以直接写进选项里。
+fn buffer_label(size: u32, sample_rate: u32) -> String {
+    let latency = size as f32 / sample_rate.max(1) as f32 * 1000.0;
+    format!("{size} ({latency:.0}ms)")
+}
+
+/// 重采样质量的显示文字。
+fn resample_label(quality: ResampleQuality) -> &'static str {
+    match quality {
+        ResampleQuality::Sinc => "sinc(最好)",
+        ResampleQuality::Fast => "fast(省 CPU)",
+        ResampleQuality::None => "none(不重采样)",
     }
 }
 
@@ -1212,6 +1511,22 @@ mod tests {
     fn 长名字会被省略() {
         assert_eq!(elide("short", 10), "short");
         assert_eq!(elide("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn 缓冲区选项带上当前采样率下的延迟() {
+        // 48000Hz 下 128 帧约 2.7ms。
+        assert_eq!(buffer_label(128, 48_000), "128 (3ms)");
+        assert_eq!(buffer_label(512, 48_000), "512 (11ms)");
+        // 采样率损坏成 0 时不能算出 NaN/Inf(配置里不该出现,兜个底)。
+        assert!(buffer_label(256, 0).starts_with("256 ("));
+    }
+
+    #[test]
+    fn 重采样质量的文字三个变体都有() {
+        assert_eq!(resample_label(ResampleQuality::Sinc), "sinc(最好)");
+        assert_eq!(resample_label(ResampleQuality::Fast), "fast(省 CPU)");
+        assert_eq!(resample_label(ResampleQuality::None), "none(不重采样)");
     }
 
     #[test]
