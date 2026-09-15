@@ -73,7 +73,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let result = eframe::run_native(
-        "PigASIO 控制面板",
+        WINDOW_TITLE,
         options,
         Box::new(move |cc| {
             install_ui_font(&cc.egui_ctx);
@@ -339,6 +339,53 @@ fn parse_theme_arg() -> Option<ThemeMode> {
 // 界面偏好
 // ---------------------------------------------------------------------------
 
+/// 窗口标题。`run_native` 和按标题找窗口的地方都得是同一个。
+const WINDOW_TITLE: &str = "PigASIO 控制面板";
+
+/// 找本程序的主窗口。
+///
+/// eframe 没把窗口句柄交出来 —— `CreationContext` 里那个字段是 crate 私有的
+/// —— 只能按标题找。同一个进程里标题是唯一的,够用。
+#[cfg(windows)]
+fn find_main_window() -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: 标题以 NUL 结尾。找不到窗口就是空指针,由调用方判断。
+    unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) }
+}
+
+/// 让标题栏跟着主题走。
+///
+/// Windows 的标题栏默认由系统设置说了算,应用插不上手 —— 深色界面顶着一
+/// 条白标题栏很割裂。`DWMWA_USE_IMMERSIVE_DARK_MODE` 就是给应用改这个用的
+/// (Windows 10 1809 起支持)。
+#[cfg(windows)]
+fn apply_titlebar(dark: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+    let hwnd = find_main_window();
+    if hwnd.is_null() {
+        return;
+    }
+    let value: i32 = i32::from(dark);
+    // SAFETY: hwnd 有效;value 是本地的 i32,长度按 API 要求给出。
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&value as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_titlebar(_dark: bool) {}
+
 /// 把窗口预设成"下次显示就是最大化"。
 ///
 /// 窗口建出来之后、渲染出第一帧之前一直是隐藏的(eframe 自己就这么建,防
@@ -359,12 +406,10 @@ fn parse_theme_arg() -> Option<ThemeMode> {
 #[cfg(windows)]
 fn preset_maximized() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowPlacement, SetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+        GetWindowPlacement, SetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
     };
 
-    let title: Vec<u16> = "PigASIO 控制面板\0".encode_utf16().collect();
-    // SAFETY: 标题是以 NUL 结尾的宽字符串。找不到窗口就是空指针,下面判掉了。
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    let hwnd = find_main_window();
     if hwnd.is_null() {
         log::warn!("拿不到窗口句柄,最大化要等第一帧才生效(可能闪一下)");
         return;
@@ -736,6 +781,12 @@ struct App {
     window_size: Option<egui::Vec2>,
     /// 窗口是不是最大化,同上。
     maximized: bool,
+    /// 上一次给标题栏用的深浅。
+    ///
+    /// 标题栏不是每帧都设一遍,而是跟着主题走 —— 只在它变了的时候调一次。
+    /// 放在这里还能捎带处理"跟随系统"模式下用户在 Windows 设置里改颜色的
+    /// 情况:egui 自己会跟上,标题栏得我们替它跟。
+    titlebar_dark: Option<bool>,
     /// 启动时要不要恢复最大化。
     ///
     /// 只用来给第一帧发一次命令,发完就置 false。见 `main` 里那段说明 ——
@@ -792,6 +843,7 @@ impl App {
             // 恢复最大化时先当它已经最大化了:要等 `ViewportInfo` 回来才知道
             // 真实状态,而那时已经该判断"用户是不是刚取消了最大化"。
             maximized: restore.maximized,
+            titlebar_dark: None,
             restore_maximized: restore.maximized,
             pending_pos: if restore.maximized { restore.pos } else { None },
             pending_size: if restore.maximized {
@@ -1138,6 +1190,14 @@ impl eframe::App for App {
             // 补一次命令 —— 创建时那个 `with_maximized` 在 Windows 上会被
             // `with_inner_size` 搅乱,得在这里坐实。
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
+        // 标题栏跟着主题走。做成"变了才设"而不是切换时设一次:跟随系统模式
+        // 下,用户在 Windows 设置里改了颜色,egui 自己会跟上,标题栏不会。
+        let dark = ctx.style().visuals.dark_mode;
+        if self.titlebar_dark != Some(dark) {
+            self.titlebar_dark = Some(dark);
+            apply_titlebar(dark);
         }
 
         // 先收后台线程的结果。
