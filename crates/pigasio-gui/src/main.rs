@@ -1530,7 +1530,7 @@ impl App {
             // 于是白字白底,什么都看不见;深色主题同理(黑字压深底)。放外面
             // 就和填充多少无关了,进度再小也读得出数。
             ui.horizontal(|ui| {
-                ui.add(egui::ProgressBar::new(peak.clamp(0.0, 1.0)).desired_width(260.0));
+                theme::progress_bar(ui, peak.clamp(0.0, 1.0), 260.0);
                 ui.label(format!("输入峰值 {peak:.3}"));
             });
         }

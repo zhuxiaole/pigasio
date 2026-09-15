@@ -614,6 +614,26 @@ pub fn slider<'a>(ui: &mut egui::Ui, slider: egui::Slider<'a>) -> egui::Response
     .inner
 }
 
+/// 画一条电平表(进度条),底槽用看得见的灰。
+///
+/// 和 [`slider`] 是同一个毛病:egui 把进度条的底槽画成 `extreme_bg_color`
+/// (`progress_bar.rs` 里 `rect(outer_rect, .., visuals.extreme_bg_color, ..)`),
+/// 而本主题把它设成了卡片同色 —— 浅色下两者都是纯白,底槽整个隐形。电平低
+/// 的时候(试运行不发声,输入只有底噪)就只剩填充部分那么一个小圆点,看着
+/// 完全不像个条形控件。同理,底槽也不能全局改:多行文本框用的也是这个色。
+pub fn progress_bar(ui: &mut egui::Ui, progress: f32, width: f32) -> egui::Response {
+    let rail = if ui.visuals().dark_mode {
+        dark::RAIL
+    } else {
+        light::RAIL
+    };
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = rail;
+        ui.add(egui::ProgressBar::new(progress).desired_width(width))
+    })
+    .inner
+}
+
 /// 用于**面板自身**的边框(`TopBottomPanel::frame` / `SidePanel::frame`)。
 ///
 /// 和 [`content_frame`] 长得一样,但用途不同,这个区别很致命:
