@@ -467,7 +467,12 @@ pub fn interleave(planes: &[Vec<f32>], frames: usize, dst: &mut [f32]) {
     if ch == 0 {
         return;
     }
-    let max_frames = planes.iter().map(|p| p.len()).min().unwrap_or(0).min(frames);
+    let max_frames = planes
+        .iter()
+        .map(|p| p.len())
+        .min()
+        .unwrap_or(0)
+        .min(frames);
     for f in 0..max_frames {
         let base = f * ch;
         for (c, plane) in planes.iter().enumerate() {

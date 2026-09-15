@@ -339,6 +339,11 @@ fn parse_theme_arg() -> Option<ThemeMode> {
 // 界面偏好
 // ---------------------------------------------------------------------------
 
+/// 设备下拉框里表示"不打开设备"的那一项。
+///
+/// `from_config` 往里写、`to_config` 往外读,两个方向必须用同一个字符串。
+const NO_DEVICE: &str = "(禁用)";
+
 /// 界面上展示的版本号。
 ///
 /// `CARGO_PKG_VERSION` 是 cargo 在编译期塞进来的(取自 workspace 的
@@ -577,11 +582,20 @@ impl Default for StreamEdit {
 }
 
 impl StreamEdit {
+    /// 这条流会不会真的去开一个设备。
+    ///
+    /// 系统默认设备算数;`(禁用)` 和空串不算 —— 口径和 [`Self::to_config`]
+    /// 必须一致,不然界面上"看着有设备"的流在引擎那边是空的,时钟基准就会
+    /// 落到一个不存在的地方。
+    fn opens_device(&self) -> bool {
+        self.use_default_device || (!self.device.is_empty() && self.device != NO_DEVICE)
+    }
+
     /// 从配置里的 `StreamConfig` 还原出可编辑形式。
     fn from_config(cfg: &StreamConfig) -> Self {
         let (device, use_default_device) = match &cfg.device {
             DeviceRef::Default => (String::new(), true),
-            DeviceRef::None => ("(禁用)".to_string(), false),
+            DeviceRef::None => (NO_DEVICE.to_string(), false),
             DeviceRef::Substring(s) => (s.clone(), false),
             DeviceRef::Regex(r) => (format!("/{r}/"), false),
         };
@@ -613,7 +627,7 @@ impl StreamEdit {
     fn to_config(&self) -> StreamConfig {
         let device = if self.use_default_device {
             DeviceRef::Default
-        } else if self.device == "(禁用)" || self.device.is_empty() {
+        } else if self.device == NO_DEVICE || self.device.is_empty() {
             DeviceRef::None
         } else {
             // 用完整设备名做子串匹配:这是最不容易因为驱动更新而失配的做法。
@@ -954,6 +968,27 @@ impl App {
         }
     }
 
+    /// 让「时钟主设备」的勾选状态和实际生效的基准一致。
+    ///
+    /// 引擎在没人显式指定时会自己挑一条(优先第一个输出设备),可界面上什么
+    /// 都不显示 —— 用户不知道基准落在谁身上。这里把那个结果落进配置,单选框
+    /// 于是就是勾上的。
+    ///
+    /// 幂等:已经有显式指定就什么都不做。基准是**必须**存在的(没它引擎跑不
+    /// 起来),所以"取消勾选"的实际含义是"交回自动挑选",而不是"不要基准"。
+    fn sync_clock_master(&mut self) {
+        if self.inputs.iter().any(|s| s.clock_master) || self.outputs.iter().any(|s| s.clock_master)
+        {
+            return;
+        }
+        // 规矩和 `Config::clock_master()` 保持一致:优先第一个输出设备。
+        if let Some(stream) = self.outputs.iter_mut().find(|s| s.opens_device()) {
+            stream.clock_master = true;
+        } else if let Some(stream) = self.inputs.iter_mut().find(|s| s.opens_device()) {
+            stream.clock_master = true;
+        }
+    }
+
     fn save_to(&mut self, path: &std::path::Path) {
         let config = self.build_config();
         if let Err(e) = config.validate() {
@@ -1211,6 +1246,10 @@ impl eframe::App for App {
             self.titlebar_dark = Some(dark);
             apply_titlebar(dark);
         }
+
+        // 没人勾「时钟主设备」时,把引擎实际会用的那条标出来 —— 否则用户从
+        // 界面上看不出基准落在谁身上。幂等,放每帧开头最省心。
+        self.sync_clock_master();
 
         // 先收后台线程的结果。
         self.poll_runner_job(ctx);
@@ -1892,7 +1931,13 @@ impl App {
                 for s in stats {
                     let snap = &s.stats;
                     ui.label(s.kind.as_str());
-                    ui.label(elide(&s.device_name, 34));
+                    // 标出时钟基准:它不做重采样,其余流都跟着它走。
+                    ui.horizontal(|ui| {
+                        ui.label(elide(&s.device_name, 34));
+                        if s.is_clock_master {
+                            ui.label(egui::RichText::new("· 主时钟").small().weak());
+                        }
+                    });
                     ui.label(snap.queued_frames.to_string());
                     ui.label(format!("{:+.0}", snap.drift_ppm));
                     if snap.is_healthy() {

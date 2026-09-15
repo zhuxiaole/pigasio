@@ -145,7 +145,6 @@ impl AsioBufferSet {
         &self.outputs[channel][off..off + self.buffer_size]
     }
 
-
     /// 可变地取得一个输出通道的当前缓冲。
     pub fn output_plane_mut(&mut self, channel: usize, index: usize) -> &mut [f32] {
         let off = index * self.buffer_size;
@@ -445,22 +444,25 @@ impl AudioCore {
 
     fn status_rows(&self) -> Vec<StreamStatusSnapshot> {
         let mut rows = Vec::new();
-        for s in &self.inputs {
+        for (index, s) in self.inputs.iter().enumerate() {
             let snap = s.stats.snapshot();
             rows.push(StreamStatusSnapshot {
                 kind: StreamKind::Input,
+                index,
                 device_name: s.device_name.clone(),
                 channel_count: s.channels,
+                // 谁当基准是 `Engine` 的事,这里先留空,由 `Engine::status` 填。
                 is_clock_master: false,
                 drift_ppm: snap.drift_ppm,
                 had_glitch: !snap.is_healthy(),
                 stats: snap,
             });
         }
-        for s in &self.outputs {
+        for (index, s) in self.outputs.iter().enumerate() {
             let snap = s.stats.snapshot();
             rows.push(StreamStatusSnapshot {
                 kind: StreamKind::Output,
+                index,
                 device_name: s.device_name.clone(),
                 channel_count: s.channels,
                 is_clock_master: false,
@@ -542,7 +544,8 @@ where
         ..
     } = spec;
 
-    let mut writer = input_writer.ok_or_else(|| Error::Internal("输入流缺少 ring 生产者".into()))?;
+    let mut writer =
+        input_writer.ok_or_else(|| Error::Internal("输入流缺少 ring 生产者".into()))?;
     let mut scratch: Vec<f32> = Vec::new();
     let err_name = device_name.clone();
     // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
@@ -591,7 +594,8 @@ where
 fn build_output<T>(spec: StreamSpec) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::Sample + cpal::FromSample<f32> + Send + 'static,
-{    let StreamSpec {
+{
+    let StreamSpec {
         device,
         device_name,
         config,
@@ -603,7 +607,8 @@ where
         ..
     } = spec;
 
-    let mut reader = output_reader.ok_or_else(|| Error::Internal("输出流缺少 ring 消费者".into()))?;
+    let mut reader =
+        output_reader.ok_or_else(|| Error::Internal("输出流缺少 ring 消费者".into()))?;
     let mut scratch: Vec<f32> = Vec::new();
     let err_name = device_name.clone();
     // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
@@ -749,9 +754,7 @@ impl StreamHost {
                             if group == StreamGroup::Inputs {
                                 result = play_group(&inputs);
                             }
-                            if result.is_ok()
-                                && group == StreamGroup::Outputs
-                            {
+                            if result.is_ok() && group == StreamGroup::Outputs {
                                 result = play_group(&outputs);
                             }
                             let _ = reply.send(result);
@@ -837,8 +840,14 @@ pub struct StreamInfo {
 #[derive(Debug, Clone)]
 pub struct StreamStatusSnapshot {
     pub kind: StreamKind,
+    /// 这个方向上的第几条流(从 0 起),和配置里的顺序一致。
+    ///
+    /// 用来跟 `Engine::clock_master` 对上号 —— 那边就是这个索引口径。
+    pub index: usize,
     pub device_name: String,
     pub channel_count: usize,
+    /// 是不是时钟基准。由 [`Engine::status`] 填 —— 音频核心只管缓冲,
+    /// 不知道这件事。
     pub is_clock_master: bool,
     /// 当前漂移补偿量,ppm。
     pub drift_ppm: f64,
@@ -975,11 +984,7 @@ impl Engine {
         Ok(Engine {
             sample_rate: config.sample_rate,
             core: Arc::new(Mutex::new(AudioCore {
-                buffers: AsioBufferSet::new(
-                    input_channel_count,
-                    output_channel_count,
-                    buffer_size,
-                ),
+                buffers: AsioBufferSet::new(input_channel_count, output_channel_count, buffer_size),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 callback: Box::new(|_, _| {}),
@@ -1331,10 +1336,7 @@ impl Engine {
         loop {
             let ready = match self.core.try_lock() {
                 Some(core) => core.inputs.iter().all(|s| {
-                    let want = s
-                        .drift
-                        .target_frames()
-                        .max(s.resampler.input_frames_next());
+                    let want = s.drift.target_frames().max(s.resampler.input_frames_next());
                     s.reader.available_frames() >= want
                 }),
                 // 拿不到锁说明有回调正在跑,那种情况下也没法更精确了。
@@ -1384,7 +1386,10 @@ impl Engine {
         if let Some(host) = self.host.as_ref() {
             host.stop()?;
         }
-        log::info!("引擎已停止,已处理 {} 帧", self.samples_processed.load(Ordering::Relaxed));
+        log::info!(
+            "引擎已停止,已处理 {} 帧",
+            self.samples_processed.load(Ordering::Relaxed)
+        );
         Ok(())
     }
 
@@ -1416,12 +1421,16 @@ impl Engine {
     /// 用 `try_lock`:这个函数可能从 GUI 线程调用,而音频回调正持有锁。
     /// 拿不到就退化成只返回静态信息,绝不阻塞。
     pub fn status(&self) -> EngineStatus {
-        let (stream_stats, live) = match self.core.try_lock() {
+        let (mut stream_stats, live) = match self.core.try_lock() {
             Some(core) => (core.status_rows(), true),
             None => (Vec::new(), false),
         };
         if !live {
             log::debug!("状态查询时音频核心正忙,本次只返回静态信息");
+        }
+        // 谁在当时钟基准只有 `Engine` 知道(音频核心只管缓冲),在这里补上。
+        for stat in &mut stream_stats {
+            stat.is_clock_master = self.clock_master == (stat.kind, stat.index);
         }
         EngineStatus {
             sample_rate: self.sample_rate,
@@ -1448,7 +1457,11 @@ impl Engine {
             out.push((StreamKind::Input, s.device_name.clone(), s.stats.snapshot()));
         }
         for s in &core.outputs {
-            out.push((StreamKind::Output, s.device_name.clone(), s.stats.snapshot()));
+            out.push((
+                StreamKind::Output,
+                s.device_name.clone(),
+                s.stats.snapshot(),
+            ));
         }
         out
     }
@@ -1465,11 +1478,7 @@ impl Drop for Engine {
 // ---------------------------------------------------------------------------
 
 /// 检查同一方向上是否有设备被重复配置且通道重叠。
-fn check_duplicates_for(
-    resolved: &[DeviceInfo],
-    config: &Config,
-    kind: StreamKind,
-) -> Result<()> {
+fn check_duplicates_for(resolved: &[DeviceInfo], config: &Config, kind: StreamKind) -> Result<()> {
     let refs: Vec<(&str, &PigStreamConfig)> = resolved
         .iter()
         .map(|d| d.name.as_str())

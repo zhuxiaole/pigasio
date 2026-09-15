@@ -172,7 +172,8 @@ impl DriftController {
 
         // 误差为正(积压)时积分朝「减小比率」的方向累积。
         // 最终修正量要取负号,所以这里累计误差本身的符号。
-        self.integral = (self.integral + error * dt_seconds * KI).clamp(-self.max_adjust, self.max_adjust);
+        self.integral =
+            (self.integral + error * dt_seconds * KI).clamp(-self.max_adjust, self.max_adjust);
 
         // 比例项负责快速拉回水位,积分项负责消除稳态误差。
         let raw = -(KP * error + self.integral);
@@ -180,8 +181,7 @@ impl DriftController {
         // 限制单步变化量,避免比率突跳产生咔哒声。
         let step_limit = self.total_limit * MAX_STEP_FRACTION;
         let delta = (raw - self.last_adjust).clamp(-step_limit, step_limit);
-        self.last_adjust =
-            (self.last_adjust + delta).clamp(-self.total_limit, self.total_limit);
+        self.last_adjust = (self.last_adjust + delta).clamp(-self.total_limit, self.total_limit);
 
         self.last_adjust
     }

@@ -128,8 +128,8 @@ impl FrameWriter {
         }
 
         // 快路径:通道选取恰好是 0..n,整块拷贝即可。
-        let identity = ch_map.len() == src_channels
-            && ch_map.iter().enumerate().all(|(i, &c)| i == c);
+        let identity =
+            ch_map.len() == src_channels && ch_map.iter().enumerate().all(|(i, &c)| i == c);
         if identity {
             let end = want * src_channels;
             return self.write_interleaved(&src[..end], want);

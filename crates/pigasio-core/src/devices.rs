@@ -89,7 +89,10 @@ pub fn enumerate(kind: StreamKind) -> Result<Vec<DeviceInfo>> {
 
 /// 同时枚举输入和输出设备。
 pub fn enumerate_both() -> Result<(Vec<DeviceInfo>, Vec<DeviceInfo>)> {
-    Ok((enumerate(StreamKind::Input)?, enumerate(StreamKind::Output)?))
+    Ok((
+        enumerate(StreamKind::Input)?,
+        enumerate(StreamKind::Output)?,
+    ))
 }
 
 /// 取得系统默认设备。

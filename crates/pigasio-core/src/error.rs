@@ -18,10 +18,7 @@ pub enum Error {
         available: Vec<String>,
     },
     /// 设备存在,但无法按要求打开(通道数、采样率、独占模式等)。
-    DeviceOpen {
-        name: String,
-        reason: String,
-    },
+    DeviceOpen { name: String, reason: String },
     /// 设备报告的通道数不足以满足配置请求。
     ChannelOutOfRange {
         name: String,
@@ -70,7 +67,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Config(msg) => write!(f, "配置错误:{msg}"),
-            Error::DeviceNotFound { kind, spec, available } => {
+            Error::DeviceNotFound {
+                kind,
+                spec,
+                available,
+            } => {
                 write!(f, "找不到{kind}设备 “{spec}”")?;
                 if available.is_empty() {
                     write!(f, ";系统没有报告任何可用设备")
@@ -79,7 +80,11 @@ impl fmt::Display for Error {
                 }
             }
             Error::DeviceOpen { name, reason } => write!(f, "打开设备 “{name}” 失败:{reason}"),
-            Error::ChannelOutOfRange { name, requested, available } => write!(
+            Error::ChannelOutOfRange {
+                name,
+                requested,
+                available,
+            } => write!(
                 f,
                 "设备 “{name}” 只有 {available} 个通道,但配置请求了通道 {requested:?}"
             ),

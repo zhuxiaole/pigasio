@@ -31,7 +31,11 @@ struct Logger {
 }
 
 enum Sink {
-    File { file: File, #[allow(dead_code)] path: PathBuf },
+    File {
+        file: File,
+        #[allow(dead_code)]
+        path: PathBuf,
+    },
     Stderr,
 }
 

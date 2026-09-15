@@ -138,7 +138,11 @@ fn build_for(kind: StreamKind, streams: &[StreamInfo], allow_non_ascii: bool) ->
     }
 
     let labels = labels_for(&devices, allow_non_ascii);
-    let prefix = if kind == StreamKind::Input { "IN" } else { "OUT" };
+    let prefix = if kind == StreamKind::Input {
+        "IN"
+    } else {
+        "OUT"
+    };
 
     // 把每个设备的标签展开成它占用的那些通道。
     //
@@ -167,7 +171,9 @@ fn labels_for(devices: &[&StreamInfo], allow_non_ascii: bool) -> Vec<String> {
     if !allow_non_ascii {
         // 纯 ASCII 模式:用设备序号。设备名可能是纯中文,剔掉非 ASCII
         // 会得到空标签,不如直接用序号 —— 它同样能说明"来自哪块声卡"。
-        return (0..devices.len()).map(|i| format!("dev{}", i + 1)).collect();
+        return (0..devices.len())
+            .map(|i| format!("dev{}", i + 1))
+            .collect();
     }
 
     // 第一级:最短形式(括号之前的部分)。
@@ -264,7 +270,6 @@ fn long_label(name: &str) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +301,12 @@ mod tests {
         let names = ChannelNames::build(&config_with_non_ascii(true), &streams);
         assert_eq!(
             names.outputs(),
-            ["OUT 1 (Speakers)", "OUT 2 (Speakers)", "OUT 1 (S/PDIF)", "OUT 2 (S/PDIF)"]
+            [
+                "OUT 1 (Speakers)",
+                "OUT 2 (Speakers)",
+                "OUT 1 (S/PDIF)",
+                "OUT 2 (S/PDIF)"
+            ]
         );
         assert!(names.all_unique(StreamKind::Output));
     }
@@ -327,8 +337,16 @@ mod tests {
             names.outputs()
         );
         // 关键词应当出现在名字里,用户才认得出。
-        assert!(names.outputs()[2].contains("Realtek"), "{:?}", names.outputs());
-        assert!(names.outputs()[4].contains("AB13X"), "{:?}", names.outputs());
+        assert!(
+            names.outputs()[2].contains("Realtek"),
+            "{:?}",
+            names.outputs()
+        );
+        assert!(
+            names.outputs()[4].contains("AB13X"),
+            "{:?}",
+            names.outputs()
+        );
     }
 
     #[test]
@@ -352,7 +370,12 @@ mod tests {
         let names = ChannelNames::build(&config_with_non_ascii(false), &streams);
         assert_eq!(
             names.outputs(),
-            ["OUT 1 (dev1)", "OUT 2 (dev1)", "OUT 1 (dev2)", "OUT 2 (dev2)"]
+            [
+                "OUT 1 (dev1)",
+                "OUT 2 (dev1)",
+                "OUT 1 (dev2)",
+                "OUT 2 (dev2)"
+            ]
         );
         assert!(names.outputs().iter().all(|n| n.is_ascii()));
         assert!(names.all_unique(StreamKind::Output));

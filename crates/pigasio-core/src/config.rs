@@ -313,16 +313,15 @@ impl Default for Config {
 impl Config {
     /// 从 TOML 文本解析并校验。
     pub fn from_toml_str(text: &str) -> Result<Self> {
-        let raw: RawConfig = toml::from_str(text)
-            .map_err(|e| Error::Config(format!("解析 TOML 失败:{e}")))?;
+        let raw: RawConfig =
+            toml::from_str(text).map_err(|e| Error::Config(format!("解析 TOML 失败:{e}")))?;
         raw.finish()
     }
 
     /// 从文件解析。
     pub fn from_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            Error::Config(format!("读取配置文件 {} 失败:{e}", path.display()))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("读取配置文件 {} 失败:{e}", path.display())))?;
         Self::from_toml_str(&text)
     }
 
@@ -416,9 +415,7 @@ impl Config {
                 let mut seen = std::collections::HashSet::new();
                 for ch in s.channels.expand() {
                     if !seen.insert(ch) {
-                        return Err(Error::Config(format!(
-                            "{label} 的通道 {ch} 被重复选择"
-                        )));
+                        return Err(Error::Config(format!("{label} 的通道 {ch} 被重复选择")));
                     }
                 }
                 if let Some(lat) = s.latency_seconds {
@@ -432,9 +429,8 @@ impl Config {
                     return Err(Error::Config(format!("{label} 的 gain_db 不是有限数值")));
                 }
                 if let DeviceRef::Regex(pattern) = &s.device {
-                    regex::Regex::new(pattern).map_err(|e| {
-                        Error::Config(format!("{label} 的 device_regex 无效:{e}"))
-                    })?;
+                    regex::Regex::new(pattern)
+                        .map_err(|e| Error::Config(format!("{label} 的 device_regex 无效:{e}")))?;
                 }
             }
         }
@@ -651,9 +647,8 @@ impl RawStream {
                 ))
             }
             (None, Some(pattern)) => {
-                regex::Regex::new(pattern).map_err(|e| {
-                    Error::Config(format!("device_regex “{pattern}” 无效:{e}"))
-                })?;
+                regex::Regex::new(pattern)
+                    .map_err(|e| Error::Config(format!("device_regex “{pattern}” 无效:{e}")))?;
                 DeviceRef::Regex(pattern.to_string())
             }
             (Some(name), None) => match name.trim().to_ascii_lowercase().as_str() {
@@ -694,10 +689,12 @@ impl RawStream {
             channels,
             latency_seconds,
             gain_db: self.gain_db.unwrap_or(0.0),
-            wasapi: self.wasapi.map_or_else(WasapiOptions::default, |w| WasapiOptions {
-                exclusive: w.exclusive.unwrap_or(false),
-                auto_convert: w.auto_convert.unwrap_or(true),
-            }),
+            wasapi: self
+                .wasapi
+                .map_or_else(WasapiOptions::default, |w| WasapiOptions {
+                    exclusive: w.exclusive.unwrap_or(false),
+                    auto_convert: w.auto_convert.unwrap_or(true),
+                }),
             clock_master: self.clock_master.unwrap_or(false),
         })
     }
