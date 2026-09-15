@@ -90,8 +90,7 @@ check / monitor 的选项:
 
 fn cmd_devices() -> Result<(), String> {
     println!("=== 系统音频设备 ===\n");
-    let listing = pigasio_core::devices::describe_all()
-        .map_err(|e| format!("枚举设备失败:{e}"))?;
+    let listing = pigasio_core::devices::describe_all().map_err(|e| format!("枚举设备失败:{e}"))?;
     print!("{listing}");
 
     println!("提示:在 PigASIO.toml 里用 device = \"名字的一部分\" 来指定设备,");
@@ -478,7 +477,11 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     println!("各流状态:");
     for s in &status.stream_stats {
         let d = &s.stats;
-        let master = if s.is_clock_master { " [时钟主]" } else { "" };
+        let master = if s.is_clock_master {
+            " [时钟主]"
+        } else {
+            ""
+        };
         println!(
             "  {} “{}”{} × {} 通道",
             s.kind.as_str(),

@@ -43,7 +43,10 @@ mod platform {
 
     /// 把 Rust 字符串转成以 0 结尾的 UTF-16。
     fn wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     /// 打开(必要时创建)一个子键。
@@ -124,8 +127,10 @@ mod platform {
             let clsid_key = Key::create(HKEY_CLASSES_ROOT, &format!("CLSID\\{clsid}"))?;
             clsid_key.set(None, "PigASIO —— 多设备 ASIO 驱动")?;
 
-            let inproc_key =
-                Key::create(HKEY_CLASSES_ROOT, &format!("CLSID\\{clsid}\\InprocServer32"))?;
+            let inproc_key = Key::create(
+                HKEY_CLASSES_ROOT,
+                &format!("CLSID\\{clsid}\\InprocServer32"),
+            )?;
             inproc_key.set(None, dll)?;
             // 宿主可能从任意线程创建驱动对象,所以必须是 Both。
             inproc_key.set(Some("ThreadingModel"), "Both")?;
@@ -133,13 +138,14 @@ mod platform {
             // ---- HKCR\PigASIO.PigASIO.1(ProgID)----
             let progid_key = Key::create(HKEY_CLASSES_ROOT, "PigASIO.PigASIO.1")?;
             progid_key.set(None, ASIO_DRIVER_KEY)?;
-            let progid_clsid_key =
-                Key::create(HKEY_CLASSES_ROOT, "PigASIO.PigASIO.1\\CLSID")?;
+            let progid_clsid_key = Key::create(HKEY_CLASSES_ROOT, "PigASIO.PigASIO.1\\CLSID")?;
             progid_clsid_key.set(None, &clsid)?;
 
             // ---- HKLM\SOFTWARE\ASIO\PigASIO(ASIO 宿主靠这个枚举驱动)----
-            let asio_key =
-                Key::create(HKEY_LOCAL_MACHINE, &format!("SOFTWARE\\ASIO\\{ASIO_DRIVER_KEY}"))?;
+            let asio_key = Key::create(
+                HKEY_LOCAL_MACHINE,
+                &format!("SOFTWARE\\ASIO\\{ASIO_DRIVER_KEY}"),
+            )?;
             asio_key.set(Some("CLSID"), &clsid)?;
             asio_key.set(Some("Description"), "PigASIO —— 多设备 ASIO 驱动")?;
         }

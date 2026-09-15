@@ -46,7 +46,10 @@ fn ensure_initialized() {
     LOG_INIT.call_once(|| {
         match pigasio_core::log::init() {
             pigasio_core::log::LogStatus::Enabled(path) => {
-                log::info!("==== PigASIO {} 日志已开启 ====", pigasio_core::DRIVER_VERSION);
+                log::info!(
+                    "==== PigASIO {} 日志已开启 ====",
+                    pigasio_core::DRIVER_VERSION
+                );
                 log::info!("日志文件:{}", path.display());
             }
             pigasio_core::log::LogStatus::Failed(path, reason) => {
@@ -137,7 +140,13 @@ pub fn host_executable_dir() -> Option<PathBuf> {
 
     // 传 null 句柄得到的是**宿主进程**的 exe 路径,而不是本 DLL 的。
     let mut buffer = vec![0u16; 32768];
-    let len = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len = unsafe {
+        GetModuleFileNameW(
+            core::ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
     if len == 0 {
         return None;
     }

@@ -193,8 +193,8 @@ impl Default for ASIOChannelInfo {
 impl ASIOChannelInfo {
     /// 写入通道名。
     ///
-    /// 编码交给 [`encode_for_asio`] —— ASIO 的 `char[]` 是按系统 ANSI
-    /// 代码页解释的,直接塞 UTF-8 会让中文变成乱码。
+    /// 编码交给 [`encode_for_asio`] —— ASIO 是个 1996 年的纯 C 接口,从没
+    /// 规定过 `char[]` 用什么编码,只能挑一个宿主普遍认的,见那里的说明。
     pub fn set_name(&mut self, name: &str) {
         let encoded = encode_for_asio(name, self.name.len() - 1);
         self.name[..encoded.len()].copy_from_slice(&encoded);
@@ -210,79 +210,30 @@ impl ASIOChannelInfo {
 
 /// 把 Rust 字符串编码成 ASIO 期望的字节序列,最多 `max_bytes` 个字节。
 ///
-/// ASIO 头文件里通道名、驱动名、错误信息都是 `char xxx[N]`。这个协议从来
-/// 没规定过编码 —— 它是 1996 年的纯 C 接口,宿主一律按**系统 ANSI 代码页**
-/// 解释(中文 Windows 上是 GBK)。直接塞 UTF-8 字节进去就会乱码:
-/// "扬" 的 UTF-8 是 3 个字节,宿主按 GBK 读出来是别的字。
+/// ASIO 里通道名、驱动名、错误信息都是 `char xxx[N]`,而这个协议**从来没
+/// 规定过编码** —— 于是各家宿主的解释方式并不一致:
 ///
-/// 所以这里用 `WideCharToMultiByte(CP_ACP)` 转一道 —— 走系统代码页,
-/// 在哪国 Windows 上就用哪国的编码。
+/// * 老宿主沿用系统 ANSI 代码页(中文 Windows 上是 GBK);
+/// * 现在的宿主(Cantabile、REAPER、Ableton……)普遍按 **UTF-8** 处理。
 ///
-/// 截断按**字符**进行,不会把一个多字节字符切成两半。目标代码页表示不了
-/// 的字符会退化成 `?`,这是 ANSI 接口的固有限制,绕不开。
+/// 早先这里用 `WideCharToMultiByte(CP_ACP)` 写 GBK 字节,结果中文在
+/// Cantabile 里全是乱码 —— 它按 UTF-8 去解 GBK 的字节,自然对不上。现在
+/// 统一写 UTF-8,这也是 FlexASIO 等现代驱动的做法。代价是只认 ANSI 的老
+/// 宿主会显示不正常,那种情况可以把配置里的 `use_non_ascii_channel_names`
+/// 关掉,退化成纯 ASCII 名字。
+///
+/// 截断按**字符**进行,不会把一个多字节字符切成两半。
 pub fn encode_for_asio(s: &str, max_bytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(max_bytes);
     for ch in s.chars() {
-        let part = encode_char(ch);
+        let mut buf = [0u8; 4];
+        let part = ch.encode_utf8(&mut buf).as_bytes();
         if out.len() + part.len() > max_bytes {
             break;
         }
-        out.extend_from_slice(&part);
+        out.extend_from_slice(part);
     }
     out
-}
-
-#[cfg(windows)]
-fn encode_char(ch: char) -> Vec<u8> {
-    use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_ACP};
-
-    let mut scratch = [0u16; 2];
-    let wide: &[u16] = ch.encode_utf16(&mut scratch);
-    let count = wide.len() as i32;
-
-    // 先问长度,再分配,再真正转换。
-    //
-    // SAFETY: `wide` 是一段合法的 UTF-16;目标缓冲置空时
-    // `WideCharToMultiByte` 只报告所需长度,不写入。
-    let needed = unsafe {
-        WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            count,
-            core::ptr::null_mut(),
-            0,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-        )
-    };
-    if needed <= 0 {
-        return vec![b'?'];
-    }
-
-    let mut buf = vec![0u8; needed as usize];
-    // SAFETY: buf 有 needed 字节容量,正好是上面问出来的长度。
-    let written = unsafe {
-        WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            count,
-            buf.as_mut_ptr(),
-            needed,
-            core::ptr::null(),
-            core::ptr::null_mut(),
-        )
-    };
-    buf.truncate(written.max(0) as usize);
-    buf
-}
-
-#[cfg(not(windows))]
-fn encode_char(ch: char) -> Vec<u8> {
-    // 非 Windows 平台只用于跑测试,直接用 UTF-8。
-    let mut buf = [0u8; 4];
-    ch.encode_utf8(&mut buf).as_bytes().to_vec()
 }
 
 /// `ASIOClockSource` —— `ASIOGetClockSources()` 用。
@@ -321,12 +272,19 @@ impl Default for ASIOClockSource {
 #[derive(Clone, Copy, Default)]
 pub struct ASIOCallbacks {
     /// 缓冲区交换通知。宿主在这里读输入缓冲、写输出缓冲。
-    pub buffer_switch: Option<unsafe extern "system" fn(double_buffer_index: i32, direct_process: ASIOBool)>,
+    pub buffer_switch:
+        Option<unsafe extern "system" fn(double_buffer_index: i32, direct_process: ASIOBool)>,
     /// 采样率变化通知。
     pub sample_rate_did_change: Option<unsafe extern "system" fn(s_rate: ASIOSampleRate)>,
     /// 通用消息通道,见 [`asio_message`]。
-    pub asio_message:
-        Option<unsafe extern "system" fn(selector: i32, value: i32, message: *mut c_void, opt: *mut f64) -> i32>,
+    pub asio_message: Option<
+        unsafe extern "system" fn(
+            selector: i32,
+            value: i32,
+            message: *mut c_void,
+            opt: *mut f64,
+        ) -> i32,
+    >,
     /// 带时间信息的缓冲区交换。PigASIO 不会调用它,但结构体里必须留着
     /// 这个字段,否则宿主按 ASIO 2.3 的布局读取时会错位。
     pub buffer_switch_time_info: Option<
@@ -389,10 +347,16 @@ pub struct IAsioVtbl {
     pub get_error_message: unsafe extern "system" fn(this: *mut c_void, string: *mut u8),
     pub start: unsafe extern "system" fn(this: *mut c_void) -> ASIOError,
     pub stop: unsafe extern "system" fn(this: *mut c_void) -> ASIOError,
-    pub get_channels:
-        unsafe extern "system" fn(this: *mut c_void, num_input: *mut i32, num_output: *mut i32) -> ASIOError,
-    pub get_latencies:
-        unsafe extern "system" fn(this: *mut c_void, input_latency: *mut i32, output_latency: *mut i32) -> ASIOError,
+    pub get_channels: unsafe extern "system" fn(
+        this: *mut c_void,
+        num_input: *mut i32,
+        num_output: *mut i32,
+    ) -> ASIOError,
+    pub get_latencies: unsafe extern "system" fn(
+        this: *mut c_void,
+        input_latency: *mut i32,
+        output_latency: *mut i32,
+    ) -> ASIOError,
     pub get_buffer_size: unsafe extern "system" fn(
         this: *mut c_void,
         min_size: *mut i32,
@@ -400,9 +364,12 @@ pub struct IAsioVtbl {
         preferred_size: *mut i32,
         granularity: *mut i32,
     ) -> ASIOError,
-    pub can_sample_rate: unsafe extern "system" fn(this: *mut c_void, sample_rate: ASIOSampleRate) -> ASIOError,
-    pub get_sample_rate: unsafe extern "system" fn(this: *mut c_void, sample_rate: *mut ASIOSampleRate) -> ASIOError,
-    pub set_sample_rate: unsafe extern "system" fn(this: *mut c_void, sample_rate: ASIOSampleRate) -> ASIOError,
+    pub can_sample_rate:
+        unsafe extern "system" fn(this: *mut c_void, sample_rate: ASIOSampleRate) -> ASIOError,
+    pub get_sample_rate:
+        unsafe extern "system" fn(this: *mut c_void, sample_rate: *mut ASIOSampleRate) -> ASIOError,
+    pub set_sample_rate:
+        unsafe extern "system" fn(this: *mut c_void, sample_rate: ASIOSampleRate) -> ASIOError,
     pub get_clock_sources: unsafe extern "system" fn(
         this: *mut c_void,
         clocks: *mut ASIOClockSource,
@@ -414,7 +381,8 @@ pub struct IAsioVtbl {
         s_pos: *mut ASIOSamples,
         t_stamp: *mut ASIOTimeStamp,
     ) -> ASIOError,
-    pub get_channel_info: unsafe extern "system" fn(this: *mut c_void, info: *mut ASIOChannelInfo) -> ASIOError,
+    pub get_channel_info:
+        unsafe extern "system" fn(this: *mut c_void, info: *mut ASIOChannelInfo) -> ASIOError,
     pub create_buffers: unsafe extern "system" fn(
         this: *mut c_void,
         buffer_infos: *mut ASIOBufferInfo,
@@ -424,7 +392,8 @@ pub struct IAsioVtbl {
     ) -> ASIOError,
     pub dispose_buffers: unsafe extern "system" fn(this: *mut c_void) -> ASIOError,
     pub control_panel: unsafe extern "system" fn(this: *mut c_void) -> ASIOError,
-    pub future: unsafe extern "system" fn(this: *mut c_void, selector: i32, opt: *mut c_void) -> ASIOError,
+    pub future:
+        unsafe extern "system" fn(this: *mut c_void, selector: i32, opt: *mut c_void) -> ASIOError,
     pub output_ready: unsafe extern "system" fn(this: *mut c_void) -> ASIOError,
 }
 
@@ -559,10 +528,7 @@ mod tests {
         // ASIOClockSource = 4 + 4 + 4 + 4 + 32 = 48
         assert_eq!(size_of::<ASIOClockSource>(), 48);
         // ASIOCallbacks = 4 个函数指针
-        assert_eq!(
-            size_of::<ASIOCallbacks>(),
-            size_of::<*const c_void>() * 4
-        );
+        assert_eq!(size_of::<ASIOCallbacks>(), size_of::<*const c_void>() * 4);
         assert_eq!(align_of::<ASIOChannelInfo>(), 4);
     }
 

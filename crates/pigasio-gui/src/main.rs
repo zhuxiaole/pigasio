@@ -1668,10 +1668,11 @@ impl App {
                 ui.label("通道名带设备名");
                 ui.checkbox(&mut self.use_non_ascii_channel_names, "允许中文")
                     .on_hover_text(
-                        "ASIO 的通道名是 char[32],协议没规定编码。默认按系统代码页\
-                             写入,中文 Windows 上能显示中文设备名。少数宿主解释方式不同,\
-                             如果通道名显示成乱码,取消勾选就会退化成 OUT 1 (dev2) 这样的\
-                             纯 ASCII 形式。",
+                        "ASIO 的通道名是 char[32],协议没规定编码,各家宿主的解释方式\
+                             不一样。勾选后按 UTF-8 写入 —— Cantabile、REAPER 这类现代宿主\
+                             都认,能显示中文设备名。要是碰上只认老式 ANSI 代码页的宿主,\
+                             中文会变乱码,那种情况取消勾选,通道名就退化成 OUT 1 (dev2)\
+                             这样的纯 ASCII 形式。",
                     );
                 ui.end_row();
 

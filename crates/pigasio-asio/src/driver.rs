@@ -225,9 +225,9 @@ unsafe fn write_c_string(dst: *mut u8, capacity: usize, s: &str) {
     if dst.is_null() || capacity == 0 {
         return;
     }
-    // 编码成宿主会按**系统 ANSI 代码页**解释的字节(不是 UTF-8),
+    // 编码成宿主会认的字节(现在是 UTF-8,见 `encode_for_asio` 的说明),
     // 并留一个字节给结尾的 0。驱动名和错误信息都会走这里,而错误信息
-    // 是中文的 —— 用 UTF-8 写进去宿主只会显示乱码。
+    // 是中文的。
     let encoded = crate::abi::encode_for_asio(s, capacity - 1);
     core::ptr::copy_nonoverlapping(encoded.as_ptr(), dst, encoded.len());
     *dst.add(encoded.len()) = 0;
@@ -325,7 +325,8 @@ unsafe extern "system" fn vt_init(
                 config.outputs.len()
             );
 
-            let engine = Engine::new(config).map_err(|e| fail(map_core_error(&e), e.to_string()))?;
+            let engine =
+                Engine::new(config).map_err(|e| fail(map_core_error(&e), e.to_string()))?;
             log::info!(
                 "引擎就绪:{} 个 ASIO 输入通道,{} 个 ASIO 输出通道",
                 engine.input_channel_count(),
@@ -333,9 +334,9 @@ unsafe extern "system" fn vt_init(
             );
 
             // 发布无锁快照,给 getSamplePosition / outputReady 用。
-            obj.sample_rate.store(engine.sample_rate(), Ordering::Relaxed);
-            obj.sample_position
-                .store(0, Ordering::Relaxed);
+            obj.sample_rate
+                .store(engine.sample_rate(), Ordering::Relaxed);
+            obj.sample_position.store(0, Ordering::Relaxed);
 
             st.active_inputs = vec![false; engine.input_channel_count()];
             st.active_outputs = vec![false; engine.output_channel_count()];
@@ -442,7 +443,11 @@ unsafe extern "system" fn vt_get_channels(
         unsafe {
             *num_input = engine.input_channel_count() as i32;
             *num_output = engine.output_channel_count() as i32;
-            log::debug!("getChannels() -> {} 输入 / {} 输出", *num_input, *num_output);
+            log::debug!(
+                "getChannels() -> {} 输入 / {} 输出",
+                *num_input,
+                *num_output
+            );
         }
         ase::OK
     })
@@ -471,8 +476,8 @@ unsafe extern "system" fn vt_get_latencies(
         //
         // 报大了只是让宿主的对齐补偿多留一点余量;报小了才会让录音对不齐,
         // 所以这里不做任何"乐观"的缩减。
-        let frames = (engine.buffer_size() as f64 * engine.config().engine.buffer_watermark)
-            .round() as i32;
+        let frames =
+            (engine.buffer_size() as f64 * engine.config().engine.buffer_watermark).round() as i32;
         unsafe {
             *input_latency = frames;
             *output_latency = frames;
@@ -731,14 +736,16 @@ unsafe extern "system" fn vt_create_buffers(
             // 宿主可能在自己的缓冲处理里回头调用 getSamplePosition,
             // 所以采样位置由回调直接累加到原子量上,不走引擎的锁。
             let host_callbacks = st.callbacks;
-            let switch_callback: BufferSwitchCallback = Box::new(move |_buffers: &mut pigasio_core::AsioBufferSet, index: usize| {
-                if let Some(f) = host_callbacks.buffer_switch {
-                    // SAFETY: 宿主在 createBuffers 时提供了这个指针,
-                    // 并保证它在 disposeBuffers 之前一直有效。
-                    unsafe { f(index as i32, ASIO_FALSE) };
-                }
-                position.fetch_add(chunk as u64, Ordering::Relaxed);
-            });
+            let switch_callback: BufferSwitchCallback = Box::new(
+                move |_buffers: &mut pigasio_core::AsioBufferSet, index: usize| {
+                    if let Some(f) = host_callbacks.buffer_switch {
+                        // SAFETY: 宿主在 createBuffers 时提供了这个指针,
+                        // 并保证它在 disposeBuffers 之前一直有效。
+                        unsafe { f(index as i32, ASIO_FALSE) };
+                    }
+                    position.fetch_add(chunk as u64, Ordering::Relaxed);
+                },
+            );
 
             let engine = st
                 .engine
@@ -780,10 +787,8 @@ unsafe extern "system" fn vt_create_buffers(
                     ));
                 }
 
-                info.buffers[0] =
-                    engine.buffer_ptr(is_input, chan, 0) as *mut core::ffi::c_void;
-                info.buffers[1] =
-                    engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
+                info.buffers[0] = engine.buffer_ptr(is_input, chan, 0) as *mut core::ffi::c_void;
+                info.buffers[1] = engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
 
                 if is_input {
                     active_inputs[chan] = true;
@@ -903,60 +908,15 @@ mod tests {
         let len = buf.iter().position(|&b| b == 0).expect("缺少结尾的 0");
         assert!(len <= 7, "写入 {len} 字节,超过 capacity-1");
 
-        // 关键断言:写入的字节必须能被系统代码页**完整解码**。
-        // 如果从多字节字符中间截断,这里会解出非法序列。
-        let decoded = decode_ansi(&buf[..len]).expect("截断产生了非法序列");
+        // 关键断言:写入的字节必须是一段**合法的 UTF-8**。
+        // 如果从字符中间截断,这里会解出非法序列。
+        let decoded = std::str::from_utf8(&buf[..len]).expect("截断产生了非法序列");
         assert!(
-            "中文测试".starts_with(&decoded),
+            "中文测试".starts_with(decoded),
             "解码结果 “{decoded}” 不是原串的前缀"
         );
         // 而且至少放下了一个字 —— 否则测试本身没有意义。
         assert!(!decoded.is_empty());
-    }
-
-    /// 用系统 ANSI 代码页把字节解回字符串,仅供测试验证编码结果。
-    ///
-    /// 刻意不写死 GBK:这个测试要在任何语言的 Windows 上都能跑。
-    fn decode_ansi(bytes: &[u8]) -> Option<String> {
-        use windows_sys::Win32::Globalization::{
-            MultiByteToWideChar, CP_ACP, MB_ERR_INVALID_CHARS,
-        };
-
-        if bytes.is_empty() {
-            return Some(String::new());
-        }
-        let len = i32::try_from(bytes.len()).ok()?;
-        // SAFETY: bytes 是合法切片;先问长度再分配。
-        let needed = unsafe {
-            MultiByteToWideChar(
-                CP_ACP,
-                MB_ERR_INVALID_CHARS,
-                bytes.as_ptr(),
-                len,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        if needed <= 0 {
-            return None;
-        }
-        let mut wide = vec![0u16; needed as usize];
-        // SAFETY: wide 有 needed 个 u16 的容量。
-        let written = unsafe {
-            MultiByteToWideChar(
-                CP_ACP,
-                MB_ERR_INVALID_CHARS,
-                bytes.as_ptr(),
-                len,
-                wide.as_mut_ptr(),
-                needed,
-            )
-        };
-        if written <= 0 {
-            return None;
-        }
-        wide.truncate(written as usize);
-        String::from_utf16(&wide).ok()
     }
 
     #[test]
@@ -988,29 +948,22 @@ mod tests {
     }
 
     #[test]
-    fn 中文按系统代码页编码而不是_utf8() {
+    fn 中文按_utf8_编码() {
         // 这是"机架里通道名是乱码"那个 bug 的回归测试。
         //
-        // ASIO 的 char[] 被宿主按系统 ANSI 代码页解释,而 Rust 字符串是
-        // UTF-8。如果不做转换,"中" 会写成 3 个字节 E4 B8 AD,宿主按
-        // GBK 读出来是"涓"—— 典型的乱码。
+        // ASIO 的 char[] 协议没规定编码。早先这里按系统 ANSI 代码页(中文
+        // Windows 上是 GBK)写,"中" 写成两个字节 D6 D0;而 Cantabile 之类
+        // 现代宿主按 UTF-8 去解,就解出了乱码。现在统一写 UTF-8。
         let encoded = crate::abi::encode_for_asio("中", 8);
 
-        // 目标代码页表示不了这个字时会退化成 '?',那种情况下没什么可验证的。
-        if encoded == b"?" {
-            return;
-        }
-
-        assert_ne!(
+        assert_eq!(
             encoded.as_slice(),
             "中".as_bytes(),
-            "写进去的仍是 UTF-8 —— 宿主按系统代码页解释,中文必然乱码"
+            "中文应当原样按 UTF-8 写进去"
         );
-        // 必须能被同一个代码页完整解回来。
-        assert_eq!(
-            decode_ansi(&encoded).as_deref(),
-            Some("中"),
-            "编码结果无法用系统代码页解回,字节是 {encoded:?}"
+        assert!(
+            std::str::from_utf8(&encoded).is_ok(),
+            "写出来的字节不是合法 UTF-8:{encoded:?}"
         );
     }
 
@@ -1028,6 +981,9 @@ mod tests {
             }),
             ase::NOT_PRESENT
         );
-        assert_eq!(map_core_error(&CoreError::AlreadyRunning), ase::INVALID_MODE);
+        assert_eq!(
+            map_core_error(&CoreError::AlreadyRunning),
+            ase::INVALID_MODE
+        );
     }
 }

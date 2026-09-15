@@ -47,25 +47,22 @@ const NAME_BUDGET: usize = 31;
 /// ASIO 真正的约束。
 const LABEL_BUDGET: usize = NAME_BUDGET - 9;
 
-/// 估算一个字符在系统 ANSI 代码页下占几个字节。
+/// 一个字符在 UTF-8 下占几个字节:ASCII 1 个,汉字 3 个,再往上的符号 4 个。
 ///
-/// ASCII 是单字节;中文、日文、韩文在各自的 ANSI 代码页(GBK、Shift-JIS、
-/// UHC)里都是双字节。这里只需要**不低估**:低估会让最终写入超长,而
-/// `set_name` 那层的兜底截断可能把一个双字节字符切成两半,直接变乱码。
-fn ansi_len(c: char) -> usize {
-    if c.is_ascii() {
-        1
-    } else {
-        2
-    }
+/// 名字最终是当 UTF-8 写进 ASIO 的 `char[32]`(见 `pigasio_asio::abi` 里
+/// `encode_for_asio` 的说明),预算就得按 UTF-8 算。早先按"非 ASCII 一律
+/// 2 字节"估是 GBK 的口径,对汉字是低估 —— 3 字节的东西按 2 算,名字写进去
+/// 会超长,再挨 `set_name` 的一刀。
+fn encoded_len(c: char) -> usize {
+    c.len_utf8()
 }
 
-/// 按 ANSI 字节预算截断,不会切断字符。
+/// 按 UTF-8 字节预算截断,不会切断字符。
 fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
     let mut used = 0usize;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let n = ansi_len(c);
+        let n = encoded_len(c);
         if used + n > max_bytes {
             break;
         }
@@ -75,9 +72,9 @@ fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
     out
 }
 
-/// 整个字符串在 ANSI 代码页下占多少字节。
-fn ansi_bytes(s: &str) -> usize {
-    s.chars().map(ansi_len).sum()
+/// 整个字符串在 UTF-8 下占多少字节。
+fn encoded_bytes(s: &str) -> usize {
+    s.chars().map(encoded_len).sum()
 }
 
 /// 某个方向上每个 ASIO 通道的显示名,按通道号索引。
@@ -156,9 +153,9 @@ fn build_for(kind: StreamKind, streams: &[StreamInfo], allow_non_ascii: bool) ->
             // `set_name` 那层截断,而那里可能把一个汉字切成两半 ——
             // 与其让用户在机架里看到乱码,不如在测试里就炸出来。
             debug_assert!(
-                ansi_bytes(&name) <= NAME_BUDGET,
+                encoded_bytes(&name) <= NAME_BUDGET,
                 "通道名 “{name}” 占 {} 字节,超过 ASIO 的 {NAME_BUDGET} 字节上限",
-                ansi_bytes(&name)
+                encoded_bytes(&name)
             );
             names.push(name);
         }
@@ -407,7 +404,7 @@ mod tests {
         let name = &names.outputs()[0];
         // 整个名字必须放得进 ASIO 的 31 字节预算 —— 这是硬约束,
         // 超了就会被 `set_name` 那层截断,而那里可能切碎一个汉字。
-        let used = ansi_bytes(name);
+        let used = encoded_bytes(name);
         assert!(used <= NAME_BUDGET, "名字占 {used} 字节,超过 {NAME_BUDGET}");
     }
 
@@ -424,22 +421,25 @@ mod tests {
             format!("OUT 1 ({})", &name[..LABEL_BUDGET]).as_str(),
             "ASCII 名字没有用满预算"
         );
-        assert_eq!(ansi_bytes(got), NAME_BUDGET - 9 + 8);
+        assert_eq!(encoded_bytes(got), NAME_BUDGET - 9 + 8);
     }
 
     #[test]
     fn 中文名字不会超出字节预算() {
-        // 全是汉字,每个 2 字节。要确认截断发生在字符边界上,
+        // 全是汉字,每个 3 字节(UTF-8)。要确认截断发生在字符边界上,
         // 而且总长不超预算。
         let name = "这是一个非常非常长的中文设备名称用来测试截断行为";
         let streams = vec![device(StreamKind::Output, name, 0, 1)];
         let names = ChannelNames::build(&config_with_non_ascii(true), &streams);
         let got = &names.outputs()[0];
-        let used = ansi_bytes(got);
+        let used = encoded_bytes(got);
         assert!(used <= NAME_BUDGET, "占 {used} 字节,超过 {NAME_BUDGET}");
-        // 标签部分应当是偶数个字节(每个汉字 2 字节),说明没被切半。
+
+        // 标签部分应当是设备名的前缀,说明截断落在字符边界上。
+        // 不能用"字节数是偶数"来判断有没有切半 —— 那是 GBK 的算术
+        // (汉字 2 字节),UTF-8 下汉字是 3 字节。
         let label = got.trim_start_matches("OUT 1 (").trim_end_matches(')');
-        assert_eq!(ansi_bytes(label) % 2, 0, "汉字被切成了两半:{label}");
+        assert!(name.starts_with(label), "标签 “{label}” 不是设备名的前缀");
     }
 
     #[test]

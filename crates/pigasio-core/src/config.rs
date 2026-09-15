@@ -250,13 +250,16 @@ pub struct EngineConfig {
     pub buffer_watermark: f64,
     /// 通道名里是否允许非 ASCII 字符(比如中文设备名)。
     ///
-    /// ASIO 的通道名是 `char[32]`,协议从没规定过编码。PigASIO 默认按
-    /// **系统 ANSI 代码页**写入 —— 这是那个 1996 年的 C 接口的历史约定,
-    /// 中文 Windows 上能正常显示中文设备名。
+    /// ASIO 的通道名是 `char[32]`,协议从没规定过编码。PigASIO 按
+    /// **UTF-8** 写入 —— 现在的宿主(Cantabile、REAPER、Ableton 等)普遍
+    /// 按 UTF-8 解释,中文 Windows 上能正常显示中文设备名。
     ///
-    /// 但确实有少数宿主按 UTF-8 或别的编码解释这些字节,于是中文变乱码。
-    /// 遇到这种情况把这一项设为 `false`:通道名会退化成 `OUT 1 (dev2)`
-    /// 这样的纯 ASCII 形式,用设备序号代替设备名,任何编码下都不会出错。
+    /// 早先这里写的是系统 ANSI 代码页(中文 Windows 上是 GBK),结果在按
+    /// UTF-8 读的宿主里中文全是乱码,所以改成了 UTF-8。
+    ///
+    /// 反过来,要是碰上只认老式 ANSI 代码页的宿主,把这一项设为 `false`:
+    /// 通道名会退化成 `OUT 1 (dev2)` 这样的纯 ASCII 形式,用设备序号代替
+    /// 设备名,任何编码下都不会出错。
     pub use_non_ascii_channel_names: bool,
 }
 
