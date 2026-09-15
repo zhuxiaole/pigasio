@@ -293,6 +293,17 @@ pub struct RingStats {
     /// 专门存成整数,因为原子浮点操作在多数平台上要绕道 CAS 循环,
     /// 而音频回调里不该有那种东西。
     pub drift_ppm: std::sync::atomic::AtomicI64,
+    /// 累计写进 ring / 从 ring 读走的帧数。
+    ///
+    /// `queued_frames` 看的是**存量**(某一刻积压多少),这两个看的是**流量**。
+    /// 定位积压问题时存量只能说明"满了",流量才能指出是生产太快还是消费太慢。
+    pub written_frames: std::sync::atomic::AtomicU64,
+    pub read_frames: std::sync::atomic::AtomicU64,
+    /// 重采样失败的次数。
+    ///
+    /// 同样是"音频线程只记数、不打印" —— 失败发生在 `fill`/`drain` 里,而那
+    /// 两条路径跑在实时线程上,`log::warn!` 会阻塞。由 `Engine::status()` 取走。
+    pub resample_failures: std::sync::atomic::AtomicU64,
 }
 
 impl RingStats {
@@ -310,6 +321,8 @@ impl RingStats {
             // `drift_ppm` 里存的就是 ppm,不需要再乘系数 ——
             // 早先这里错误地又除了一次 1e6,结果所有非零修正都显示成 0.0。
             drift_ppm: self.drift_ppm.load(Relaxed) as f64,
+            written_frames: self.written_frames.load(Relaxed),
+            read_frames: self.read_frames.load(Relaxed),
         }
     }
 }
@@ -323,6 +336,9 @@ pub struct RingStatsSnapshot {
     pub queued_frames: u64,
     /// 漂移比率的偏差量,例如 0.0001 表示正在以 +100 ppm 补偿。
     pub drift_ppm: f64,
+    /// 累计写入 / 读出的帧数。见 [`RingStats::written_frames`]。
+    pub written_frames: u64,
+    pub read_frames: u64,
 }
 
 impl RingStatsSnapshot {

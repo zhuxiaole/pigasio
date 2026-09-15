@@ -1950,14 +1950,29 @@ impl App {
 
         ui.add_space(4.0);
         egui::Grid::new("runner_streams")
-            .num_columns(5)
+            .num_columns(7)
             .striped(true)
             .spacing([14.0, 4.0])
             .show(ui, |ui| {
                 ui.strong("方向");
                 ui.strong("设备");
                 ui.strong("水位(帧)");
+                // 设备侧的真实块大小,逐流列出 —— 汇总成一个数看不出是谁慢。
+                ui.strong("块(帧)").on_hover_text(
+                    "这块声卡的回调实际每块送来多少帧。它是量出来的,由系统\
+                         音频引擎决定,和我们报给 ASIO 宿主的「缓冲区」不是一回事。\
+                         整条链路的水位得能装下最大的一块,所以这个数最大的那条\
+                         设备决定了延迟下限。",
+                );
                 ui.strong("漂移(ppm)");
+                // 累计写进 ring / 读走的帧数。存量(水位)只能说明"满了",
+                // 这两个才能指出是生产太快还是消费太慢 —— 盯着看几秒,跑在前
+                // 面的那一侧就是问题所在。
+                ui.strong("写/读(k帧)").on_hover_text(
+                    "设备侧累计写进环形缓冲、和消费侧累计读走的帧数(单位千帧)。\
+                         正常时两者同步增长;若「写」持续跑在前面,说明生产快于消费,\
+                         缓冲会一路积到容量上限。",
+                );
                 ui.strong("状态");
                 ui.end_row();
 
@@ -1972,7 +1987,17 @@ impl App {
                         }
                     });
                     ui.label(snap.queued_frames.to_string());
+                    if s.device_frames > 0 {
+                        ui.label(s.device_frames.to_string());
+                    } else {
+                        ui.label("-");
+                    }
                     ui.label(format!("{:+.0}", snap.drift_ppm));
+                    ui.label(format!(
+                        "{:.0}k/{:.0}k",
+                        snap.written_frames as f64 / 1000.0,
+                        snap.read_frames as f64 / 1000.0
+                    ));
                     if snap.is_healthy() {
                         ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
                     } else {

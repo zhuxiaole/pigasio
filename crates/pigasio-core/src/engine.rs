@@ -46,7 +46,7 @@
 //! 设备流」全部收拢到一个专用线程,引擎本体只保留一个命令通道,
 //! 从而对宿主表现为完全线程安全。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -67,7 +67,22 @@ const RING_CAPACITY_FACTOR: f64 = 6.0;
 /// 环形缓冲至少容纳的时长(秒)。
 const RING_MIN_SECONDS: f64 = 0.25;
 /// 一次时钟推进最多连续处理的 ASIO 缓冲区个数。
-const MAX_BUFFERS_PER_ADVANCE: usize = 4;
+///
+/// 注意它**不是**"每轮该处理多少"—— 那是设备块说了算的。比如设备块 1056 帧
+/// 配 128 帧的 ASIO 缓冲,一轮就该处理 8 个。这个常量只是道**安全阀**,防的是
+/// `accumulated` 因为异常暴涨时在这里空转太久。
+///
+/// 早先取的 4 是个错误:设备块一旦超过 4 个 ASIO 缓冲(512 帧),引擎每轮就
+/// 跟不上了 —— 消费只有生产的一半,环形缓冲一路积到容量上限(250 ms),而漂移
+/// 补偿那 ±0.5% 的修正量对这种量级的缺口杯水车薪。实测的 1056 帧设备块正好
+/// 踩在这个坑上。
+const MAX_BUFFERS_PER_ADVANCE: usize = 64;
+
+/// 查状态时愿意为 `core` 锁等多久。
+///
+/// 见 [`Engine::status`]:等一小会儿比一次不等更实际。20 ms 远小于控制面板
+/// 200 ms 的刷新周期,不会把界面拖慢。
+const STATUS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// 宿主提供的缓冲区交换回调。
 ///
@@ -199,6 +214,10 @@ impl InputStreamRuntime {
     fn fill(&mut self, buffers: &mut AsioBufferSet, index: usize, chunk: usize) {
         let need = self.resampler.input_frames_next();
         let got = self.reader.read_into_planar(&mut self.resample_in, need);
+        // 记下真正从 ring 取走多少 —— 和写入量一比就知道是哪一侧不匹配。
+        self.stats
+            .read_frames
+            .fetch_add(got as u64, Ordering::Relaxed);
 
         // 数据不够就补静音。这多发生在启动的头几个缓冲区,或者设备侧
         // 跟不上时。补零而不是重复旧数据,免得产生可听的回音。
@@ -223,8 +242,9 @@ impl InputStreamRuntime {
             .process_into(&self.resample_in, &mut self.resample_out)
         {
             Ok(outcome) => outcome.frames_out,
-            Err(e) => {
-                log::warn!("输入重采样失败:{e}");
+            Err(_) => {
+                // 实时线程只记数,不打印 —— 见 `RingStats::resample_failures`。
+                self.stats.resample_failures.fetch_add(1, Ordering::Relaxed);
                 0
             }
         };
@@ -293,8 +313,9 @@ impl OutputStreamRuntime {
             .process_into(&self.resample_in, &mut self.resample_out)
         {
             Ok(outcome) => outcome.frames_out,
-            Err(e) => {
-                log::warn!("输出重采样失败:{e}");
+            Err(_) => {
+                // 同输入侧:实时线程只记数,不打印。
+                self.stats.resample_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
@@ -353,6 +374,12 @@ struct AudioCore {
     running: bool,
     /// 已处理帧数。与 `Engine` 共享,`getSamplePosition()` 读它时不加锁。
     samples_processed: Arc<AtomicU64>,
+    /// 音频线程上攒下的「时钟推进落后」帧数。
+    ///
+    /// **绝不在这里打印。** `log::warn!` 最终要落盘,而落盘是阻塞操作 ——
+    /// 调用它的却是实时音频线程,一次磁盘 I/O 就够让缓冲区欠载。所以这里
+    /// 只累加,等 `Engine::status()` 那条非实时路径来取走再打印。
+    drift_dropped: u64,
 }
 
 impl AudioCore {
@@ -384,9 +411,33 @@ impl AudioCore {
         if self.accumulated >= size {
             // 正常情况走不到这里。真走到了说明累积异常,丢弃多余计数,
             // 免得延迟无限增长。
+            //
+            // 只记数、**不打印** —— 这里跑在实时音频线程上,而打印要落盘。
+            // 攒着交给 `Engine::status()` 那条非实时路径去说。
             let dropped = self.accumulated / size;
             self.accumulated %= size;
-            log::warn!("时钟推进落后,丢弃 {dropped} 个缓冲区的累积计数");
+            self.drift_dropped = self.drift_dropped.saturating_add(dropped as u64);
+        }
+    }
+
+    /// 取走音频线程攒下的告警并打印。
+    ///
+    /// **只能从非实时路径调用**(目前是 `Engine::status`)。读一次清零一次,
+    /// 所以同一条告警不会反复刷屏。
+    fn report_audio_warnings(&mut self) {
+        if self.drift_dropped > 0 {
+            log::warn!(
+                "时钟推进落后,丢弃累计 {} 帧的计数(设备块与 ASIO 缓冲区不匹配?)",
+                self.drift_dropped
+            );
+            self.drift_dropped = 0;
+        }
+        // 输入和输出是不同的类型,chain 不起来,分两趟走。
+        for stream in self.inputs.iter() {
+            report_resample_failures(&stream.device_name, &stream.stats);
+        }
+        for stream in self.outputs.iter() {
+            report_resample_failures(&stream.device_name, &stream.stats);
         }
     }
 
@@ -453,6 +504,8 @@ impl AudioCore {
                 channel_count: s.channels,
                 // 谁当基准是 `Engine` 的事,这里先留空,由 `Engine::status` 填。
                 is_clock_master: false,
+                // 设备块大小由 `Engine::status` 回填 —— 音频核心看不到那个。
+                device_frames: 0,
                 drift_ppm: snap.drift_ppm,
                 had_glitch: !snap.is_healthy(),
                 stats: snap,
@@ -466,6 +519,8 @@ impl AudioCore {
                 device_name: s.device_name.clone(),
                 channel_count: s.channels,
                 is_clock_master: false,
+                // 设备块大小由 `Engine::status` 回填 —— 音频核心看不到那个。
+                device_frames: 0,
                 drift_ppm: snap.drift_ppm,
                 had_glitch: !snap.is_healthy(),
                 stats: snap,
@@ -505,6 +560,13 @@ struct StreamSpec {
     /// 大小问不出来(`config.buffer_size` 通常是 `Default`),所以拿引擎的
     /// chunk 当代表 —— 同一个数量级就够它做判断了。
     frames_per_buffer: u32,
+    /// 回调往里写自己实际收到的每块帧数。
+    ///
+    /// 每条流一个,和流一一对应 —— `Engine` 那边按顺序收集它们,
+    /// 见 `Engine::device_frames_per_stream`。
+    device_frames: Arc<AtomicUsize>,
+    /// ring 的统计。设备回调往里记写入量,消费侧记读取量 —— 见 `RingStats`。
+    stats: Arc<RingStats>,
 }
 
 impl StreamSpec {
@@ -585,8 +647,10 @@ where
         ch_map,
         input_writer,
         master_core,
+        stats,
         err_flag,
         frames_per_buffer,
+        device_frames,
         ..
     } = spec;
 
@@ -614,6 +678,10 @@ where
 
                 let device_channels = device_channels.max(1);
                 let frames = data.len() / device_channels;
+                // 量下设备实际每块多少帧 —— 这是唯一能拿到真实缓冲大小的
+                // 办法(见 `Engine::device_frames_per_stream`)。`store` 无锁,
+                // 放在音频线程里是安全的。
+                device_frames.store(frames, Ordering::Relaxed);
                 let total = frames * device_channels;
                 if total == 0 {
                     return;
@@ -624,7 +692,13 @@ where
                 for (dst, src) in scratch[..total].iter_mut().zip(data[..total].iter()) {
                     *dst = f32::from_sample(*src);
                 }
-                writer.write_selected(&scratch[..total], device_channels, &ch_map, frames);
+                // 记下真正写进去多少(ring 满时会少于 `frames`)—— 和消费量
+                // 一比就知道积压在哪一侧。
+                let written =
+                    writer.write_selected(&scratch[..total], device_channels, &ch_map, frames);
+                stats
+                    .written_frames
+                    .fetch_add(written as u64, Ordering::Relaxed);
 
                 // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
                 if let Some(core) = master_core.as_ref() {
@@ -662,6 +736,7 @@ where
         master_core,
         err_flag,
         frames_per_buffer,
+        device_frames,
         ..
     } = spec;
 
@@ -688,6 +763,8 @@ where
                 if frames == 0 {
                     return;
                 }
+                // 同输入侧:量出设备实际的块大小。
+                device_frames.store(frames, Ordering::Relaxed);
                 let ring_channels = ch_map.len().max(1);
                 let ring_samples = frames * ring_channels;
                 if scratch.len() < ring_samples {
@@ -915,6 +992,12 @@ pub struct StreamStatusSnapshot {
     /// 是不是时钟基准。由 [`Engine::status`] 填 —— 音频核心只管缓冲,
     /// 不知道这件事。
     pub is_clock_master: bool,
+    /// 这条流的设备回调**实际**每块送来多少帧。由 [`Engine::status`] 填。
+    ///
+    /// WASAPI 共享模式下缓冲由系统音频引擎决定,而我们给 cpal 的本来就是
+    /// `Default` —— 所以这个数只能在回调里量,和报给宿主的 `buffer_size`
+    /// 不是一回事。逐流分开记才能定位到是哪块设备。0 表示还没量到。
+    pub device_frames: usize,
     /// 当前漂移补偿量,ppm。
     pub drift_ppm: f64,
     pub had_glitch: bool,
@@ -954,6 +1037,17 @@ pub struct Engine {
     channel_names: ChannelNames,
     stream_error: Arc<AtomicBool>,
     prepared: Arc<AtomicBool>,
+    /// 每条流各自的设备块大小,顺序同 `stream_infos`(先输入后输出)。
+    ///
+    /// 这是量出来的,不是我们请求的:WASAPI 共享模式下缓冲由系统音频引擎
+    /// 决定,而我们给 cpal 的本来就是 `BufferSize::Default`。cpal 0.15 也没
+    /// 提供查询接口(`StreamTrait` 只有 `play`/`pause`),唯一可靠的办法就是
+    /// 在回调里量 —— 每收到一块,`data.len() / channels` 就是那一块的帧数。
+    ///
+    /// **按流分开存**而不是汇总成一个数,是因为不同设备可能各有一套周期
+    /// (虚拟声卡常见 20 ms 上下,物理声卡可能是 10 ms)。汇总成一个最大值
+    /// 只能看出"最慢的那块有多慢",定位不到是谁。
+    device_frames_per_stream: Vec<Arc<AtomicUsize>>,
 }
 
 impl Engine {
@@ -1059,6 +1153,7 @@ impl Engine {
                 sample_rate: config.sample_rate as f64,
                 running: false,
                 samples_processed: Arc::clone(&samples_processed),
+                drift_dropped: 0,
             })),
             host: None,
             buffer_size,
@@ -1068,6 +1163,7 @@ impl Engine {
             samples_processed,
             stream_error: Arc::new(AtomicBool::new(false)),
             prepared: Arc::new(AtomicBool::new(false)),
+            device_frames_per_stream: Vec::new(),
             stream_infos,
             channel_names,
             config,
@@ -1181,6 +1277,9 @@ impl Engine {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         let mut input_offset = 0usize;
+        // 每条流各自的设备块大小。顺序跟 `stream_infos` 一致(先输入后输出),
+        // `status()` 才能按同样的下标对回去。
+        let mut device_frames_per_stream: Vec<Arc<AtomicUsize>> = Vec::new();
 
         // ---- 输入流 ----
         for (i, cfg) in self.config.active_inputs() {
@@ -1237,6 +1336,12 @@ impl Engine {
                 master_core: is_master.then(|| Arc::clone(&self.core)),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
+                stats: Arc::clone(&stats),
+                device_frames: {
+                    let slot = Arc::new(AtomicUsize::new(0));
+                    device_frames_per_stream.push(Arc::clone(&slot));
+                    slot
+                },
             });
             input_offset += ring_channels;
         }
@@ -1298,6 +1403,12 @@ impl Engine {
                 master_core: is_master.then(|| Arc::clone(&self.core)),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
+                stats: Arc::clone(&stats),
+                device_frames: {
+                    let slot = Arc::new(AtomicUsize::new(0));
+                    device_frames_per_stream.push(Arc::clone(&slot));
+                    slot
+                },
             });
             output_offset += ring_channels;
         }
@@ -1319,6 +1430,7 @@ impl Engine {
 
         // 流在这个专用线程上创建并驻留。
         self.host = Some(StreamHost::spawn(specs)?);
+        self.device_frames_per_stream = device_frames_per_stream;
         self.prepared.store(true, Ordering::Release);
         log::info!(
             "已准备 {} 路输入 / {} 路输出,ASIO 缓冲区 {} 帧 @ {} Hz",
@@ -1486,11 +1598,23 @@ impl Engine {
 
     /// 状态快照,控制面板和日志用。
     ///
-    /// 用 `try_lock`:这个函数可能从 GUI 线程调用,而音频回调正持有锁。
-    /// 拿不到就退化成只返回静态信息,绝不阻塞。
+    /// 锁只等 [`STATUS_LOCK_TIMEOUT`] 那么久,不无限期阻塞 —— 这个函数是从
+    /// GUI 线程调的,拿不到就退化成只返回静态信息。
+    ///
+    /// 早先这里用的是 `try_lock`(一次不等)。本意是"绝不阻塞",实测下来
+    /// 却走到了另一个极端:实时状态连续三十秒都显示"暂时读不到统计(音频
+    /// 回调正忙)"。音频线程持锁虽然只有几毫秒,但它每 22 ms 就来一轮,
+    /// 撞上的概率高得离谱。等一小会儿是划算的 —— 界面晚 20 ms 拿到数据,
+    /// 总好过一直拿不到。
     pub fn status(&self) -> EngineStatus {
-        let (mut stream_stats, live) = match self.core.try_lock() {
-            Some(core) => (core.status_rows(), true),
+        let (mut stream_stats, live) = match self.core.try_lock_for(STATUS_LOCK_TIMEOUT) {
+            Some(mut core) => {
+                let stats = core.status_rows();
+                // 顺手把音频线程攒下的告警取走打印 —— 这是非实时路径,
+                // 在这里落盘不会伤到音频。见 `AudioCore::report_audio_warnings`。
+                core.report_audio_warnings();
+                (stats, true)
+            }
             None => (Vec::new(), false),
         };
         if !live {
@@ -1499,6 +1623,15 @@ impl Engine {
         // 谁在当时钟基准只有 `Engine` 知道(音频核心只管缓冲),在这里补上。
         for stat in &mut stream_stats {
             stat.is_clock_master = self.clock_master == (stat.kind, stat.index);
+        }
+        // 设备块大小也一样 —— 那是回调量出来的,存在 Engine 这边。
+        // `status_rows` 的顺序是先输入后输出,和 `device_frames_per_stream`
+        // 的收集顺序一致,所以能按位置对回去。
+        for (stat, frames) in stream_stats
+            .iter_mut()
+            .zip(self.device_frames_per_stream.iter())
+        {
+            stat.device_frames = frames.load(Ordering::Relaxed);
         }
         EngineStatus {
             sample_rate: self.sample_rate,
@@ -1594,6 +1727,16 @@ fn ring_capacity(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
 /// 用户的声卡和机器,该让他自己试,而不是由代码猜一个数。
 fn target_watermark_frames(chunk: usize, watermark: f64) -> usize {
     ((chunk as f64 * watermark).round() as usize).max(1)
+}
+
+/// 取走某条流攒下的重采样失败计数并打印。
+///
+/// 和 [`AudioCore::report_audio_warnings`] 一样,只能从非实时路径调用。
+fn report_resample_failures(device_name: &str, stats: &RingStats) {
+    let failures = stats.resample_failures.swap(0, Ordering::Relaxed);
+    if failures > 0 {
+        log::warn!("设备 “{device_name}” 重采样失败 {failures} 次");
+    }
 }
 
 /// 与设备协商出一个可用的流配置。
