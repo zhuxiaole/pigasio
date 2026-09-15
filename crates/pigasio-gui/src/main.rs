@@ -29,7 +29,7 @@ use pigasio_core::config::{
     AsioSampleType, ChannelSelection, Config, DeviceRef, EngineConfig, ResampleQuality,
     StreamConfig, WasapiOptions,
 };
-use pigasio_core::{AsioBufferSet, Engine, Result as CoreResult, StreamKind};
+use pigasio_core::{AsioBufferSet, Engine, Result as CoreResult, StreamKind, StreamStatusSnapshot};
 
 mod theme;
 use theme::ThemeMode;
@@ -554,6 +554,13 @@ struct App {
     /// 枚举要加载驱动、问它要通道表,同样不能压在 UI 线程上 —— 窗口刚弹
     /// 出来时那一次也在其中。
     devices_job: Option<std::sync::mpsc::Receiver<DeviceLists>>,
+    /// 上一次成功读到的各流统计。
+    ///
+    /// [`Engine::status`] 是用 `try_lock` 拿状态的:音频回调正忙时它会返回
+    /// **空**的统计。照它直接渲染,表格就会在"几行数据"和"一行提示"之间
+    /// 反复跳高度 —— 而 egui 在内容变矮时会把滚动位置夹回顶部,表现正是
+    /// "刷新一下又滑回顶上了"。所以留一份上次的结果兜着。
+    last_stats: Vec<StreamStatusSnapshot>,
     /// 当前主题模式。切换时会立即重新应用样式。
     theme_mode: ThemeMode,
 }
@@ -585,6 +592,7 @@ impl App {
             runner: None,
             runner_job: None,
             devices_job: None,
+            last_stats: Vec::new(),
             theme_mode: initial_theme,
         };
 
@@ -706,6 +714,8 @@ impl App {
                 let _ = tx.send(());
             });
             self.runner_job = Some(RunnerJob::Stopping(rx));
+            // 统计是跟着这一次运行走的,别留给下一次。
+            self.last_stats.clear();
             self.set_info("正在停止引擎…".into());
             return;
         }
@@ -724,6 +734,8 @@ impl App {
             let _ = tx.send(Runner::start(config));
         });
         self.runner_job = Some(RunnerJob::Starting(rx));
+        // 上一次试运行留下的统计不能给这一次用。
+        self.last_stats.clear();
         self.set_info("正在启动引擎…".into());
     }
 
@@ -1484,10 +1496,21 @@ impl App {
 
         let status = runner.engine.status();
         let peak = runner.peak_level();
+        let elapsed = runner.elapsed();
+
+        // 这次没读到就沿用上一次的,别让表格忽高忽低(见 `last_stats`)。
+        if !status.stream_stats.is_empty() {
+            self.last_stats = status.stream_stats.clone();
+        }
+        let stats: &[StreamStatusSnapshot] = if status.stream_stats.is_empty() {
+            &self.last_stats
+        } else {
+            &status.stream_stats
+        };
 
         ui.horizontal(|ui| {
             ui.heading("实时状态");
-            ui.label(format!("已运行 {:.1} 秒", runner.elapsed()));
+            ui.label(format!("已运行 {elapsed:.1} 秒"));
             ui.separator();
             ui.label(format!(
                 "{} Hz · {} 帧 · {} 路输入 / {} 路输出",
@@ -1525,7 +1548,7 @@ impl App {
                 ui.strong("状态");
                 ui.end_row();
 
-                for s in &status.stream_stats {
+                for s in stats {
                     let snap = &s.stats;
                     ui.label(s.kind.as_str());
                     ui.label(elide(&s.device_name, 34));
@@ -1546,7 +1569,7 @@ impl App {
                 }
             });
 
-        if status.stream_stats.is_empty() {
+        if stats.is_empty() {
             ui.label(egui::RichText::new("暂时读不到统计(音频回调正忙),稍后会自动刷新。").weak());
         }
     }
