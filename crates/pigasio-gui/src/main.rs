@@ -1615,7 +1615,7 @@ impl App {
                     .selected_text(buffer_label(self.buffer_size, sample_rate))
                     .width(COMBO)
                     .show_ui(ui, |ui| {
-                        for size in [128u32, 256, 512, 1024, 2048] {
+                        for size in BUFFER_SIZES {
                             ui.selectable_value(
                                 &mut self.buffer_size,
                                 size,
@@ -2079,12 +2079,25 @@ impl App {
     }
 }
 
+/// 缓冲区大小可选值,单位采样帧。
+///
+/// 只放 2 的幂 —— ASIO 宿主普遍偏好这个,有些会直接拒绝别的值(引擎在配置
+/// 校验里对非 2 的幂也只会 warn)。
+///
+/// 下到 16:延迟虽然由水位主导(见 `watermark_ms`),但缓冲区仍是唯一能压到
+/// 亚毫秒的那一项,而且实测 16 帧在本机跑得稳。往上到 2048 就够覆盖"宿主里
+/// 挂了一堆插件、回调来不及跑"的场景了,再大纯属徒增延迟。
+/// 注意宿主会按 `getBufferSize()` 报的值来建缓冲,而驱动只报配置里这一个值,
+/// 所以这份列表就是宿主能用的全部选项。
+const BUFFER_SIZES: [u32; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
+
 /// 缓冲区选项的文字:大小 + 它在当前采样率下的延迟。
 ///
-/// 延迟才是选缓冲区时真正要权衡的东西,所以直接写进选项里。
+/// 延迟才是选缓冲区时真正要权衡的东西,所以直接写进选项里。必须带一位小数 ——
+/// 16 和 64 帧都取整到 0 位的话会一起显示成 "0ms"/"1ms",反而看不出区别。
 fn buffer_label(size: u32, sample_rate: u32) -> String {
     let latency = size as f32 / sample_rate.max(1) as f32 * 1000.0;
-    format!("{size} ({latency:.0}ms)")
+    format!("{size} ({latency:.1}ms)")
 }
 
 /// 重采样质量的显示文字。
@@ -2243,11 +2256,32 @@ mod tests {
 
     #[test]
     fn 缓冲区选项带上当前采样率下的延迟() {
-        // 48000Hz 下 128 帧约 2.7ms。
-        assert_eq!(buffer_label(128, 48_000), "128 (3ms)");
-        assert_eq!(buffer_label(512, 48_000), "512 (11ms)");
+        // 48000Hz 下 128 帧约 2.7ms。保留一位小数,否则 16/64/128 会挤成
+        // 同一个整数,小缓冲区之间反而分不出来。
+        assert_eq!(buffer_label(128, 48_000), "128 (2.7ms)");
+        assert_eq!(buffer_label(16, 48_000), "16 (0.3ms)");
+        assert_eq!(buffer_label(64, 48_000), "64 (1.3ms)");
+        assert_eq!(buffer_label(2048, 48_000), "2048 (42.7ms)");
         // 采样率损坏成 0 时不能算出 NaN/Inf(配置里不该出现,兜个底)。
         assert!(buffer_label(256, 0).starts_with("256 ("));
+    }
+
+    #[test]
+    fn 缓冲区选项全是二的幂且升序() {
+        // 引擎对非 2 的幂只会 warn,宿主却可能直接拒绝加载 —— 界面不该给出
+        // 这种选项。升序则是下拉框可读性的前提。
+        for (i, pair) in BUFFER_SIZES.windows(2).enumerate() {
+            assert!(pair[0] < pair[1], "第 {i} 项没有升序:{pair:?}");
+            assert!(
+                pair[0].is_power_of_two(),
+                "{} 不是 2 的幂,部分宿主会拒绝",
+                pair[0]
+            );
+        }
+        assert!(BUFFER_SIZES[BUFFER_SIZES.len() - 1].is_power_of_two());
+        // 小缓冲区是延迟的关键选项,别在重构里被删掉。
+        assert!(BUFFER_SIZES.contains(&32), "缺少 32 帧选项");
+        assert!(BUFFER_SIZES.contains(&64), "缺少 64 帧选项");
     }
 
     #[test]
