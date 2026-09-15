@@ -38,8 +38,14 @@ fn main() -> eframe::Result<()> {
     init_logging();
 
     let config_path = parse_config_arg();
-    // 主题默认跟随系统;`--theme light|dark` 可以强制指定,方便截图和排查。
-    let theme_mode = parse_theme_arg();
+    // 主题的优先级:命令行 > 上次的选择 > 跟随系统。
+    // `--theme light|dark` 用来强制指定,方便截图和排查。
+    let theme_mode = parse_theme_arg().unwrap_or_else(|| {
+        load_ui_prefs()
+            .theme
+            .and_then(|name| ThemeMode::parse(&name))
+            .unwrap_or_default()
+    });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 780.0])
@@ -286,22 +292,86 @@ fn parse_config_arg() -> Option<PathBuf> {
 /// 解析 `--theme light|dark|system`。
 ///
 /// 默认跟随系统。强制指定主要用于截图和对比排查 —— 界面里也有切换按钮。
-fn parse_theme_arg() -> ThemeMode {
+fn parse_theme_arg() -> Option<ThemeMode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--theme" {
-            match args.get(i + 1).map(String::as_str) {
-                Some("light") => return ThemeMode::Light,
-                Some("dark") => return ThemeMode::Dark,
-                Some("system") => return ThemeMode::System,
-                Some(other) => log::warn!("--theme 的值 “{other}” 无法识别,改用跟随系统"),
-                None => log::warn!("--theme 后面缺少参数"),
-            }
+            return match args.get(i + 1).map(String::as_str) {
+                Some(value) => match ThemeMode::parse(value) {
+                    Some(mode) => Some(mode),
+                    None => {
+                        log::warn!("--theme 的值 “{value}” 无法识别,改用记住的主题");
+                        None
+                    }
+                },
+                None => {
+                    log::warn!("--theme 后面缺少参数");
+                    None
+                }
+            };
         }
         i += 1;
     }
-    ThemeMode::System
+    None
+}
+
+// ---------------------------------------------------------------------------
+// 界面偏好
+// ---------------------------------------------------------------------------
+
+/// 界面偏好的文件名。和引擎配置放同一个目录(用户主目录)。
+const UI_PREFS_FILE_NAME: &str = "PigASIO-ui.toml";
+
+/// 界面偏好。
+///
+/// 单独存一份,不塞进 `PigASIO.toml`:
+///
+/// * 那份配置驱动也要读,而它的解析器是 `#[serde(deny_unknown_fields)]` 的,
+///   多一个 `[ui]` 段会让驱动直接报错;
+/// * 主题本来就是"这台机器上的这个人"的偏好,不该跟着配置文件跑 ——
+///   用户完全可以把配置另存到项目目录里去。
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UiPrefs {
+    /// 主题模式,[`ThemeMode::as_str`] 的那个名字。
+    theme: Option<String>,
+}
+
+/// 界面偏好存在哪。跟着用户目录走,不受 `--config` 影响。
+fn ui_prefs_path() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| PathBuf::from(home).join(UI_PREFS_FILE_NAME))
+}
+
+/// 读界面偏好。文件不存在(第一次运行)或者读坏了都退回默认值 ——
+/// 界面偏好不该拦住程序启动。
+fn load_ui_prefs() -> UiPrefs {
+    let Some(path) = ui_prefs_path() else {
+        return UiPrefs::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+            log::warn!("{} 读不出来,按默认偏好看待:{e}", path.display());
+            UiPrefs::default()
+        }),
+        Err(_) => UiPrefs::default(),
+    }
+}
+
+/// 写界面偏好。写失败只记一条日志:主题已经生效了,不值得为它弹个错。
+fn save_ui_prefs(prefs: &UiPrefs) {
+    let Some(path) = ui_prefs_path() else {
+        return;
+    };
+    match toml::to_string(prefs) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                log::warn!("{} 写不进去:{e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("界面偏好序列化失败:{e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +1034,11 @@ impl eframe::App for App {
                     {
                         self.theme_mode = mode;
                         theme::apply(ctx, mode);
+                        // 切换即记住。主题是随手改一下的东西,不该还要求用户
+                        // 再去点一次「保存」—— 那个按钮存的是引擎配置。
+                        save_ui_prefs(&UiPrefs {
+                            theme: Some(mode.as_str().to_string()),
+                        });
                     }
                 }
                 if ui.button("保存").clicked() {
@@ -1624,6 +1699,23 @@ fn elide_middle(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 界面偏好往返保持主题() {
+        let prefs = UiPrefs {
+            theme: Some("dark".to_string()),
+        };
+        let text = toml::to_string(&prefs).expect("序列化界面偏好");
+        let back: UiPrefs = toml::from_str(&text).expect("读回界面偏好");
+        assert_eq!(back.theme.as_deref(), Some("dark"));
+    }
+
+    /// 老版本没写过这个文件,或者文件被清空了 —— 两种都得能读。
+    #[test]
+    fn 界面偏好缺字段时退回默认() {
+        let prefs: UiPrefs = toml::from_str("").expect("空文件也要能读");
+        assert!(prefs.theme.is_none());
+    }
 
     #[test]
     fn 字符串转义为合法_toml() {

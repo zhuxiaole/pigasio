@@ -59,6 +59,26 @@ impl ThemeMode {
             ThemeMode::Dark => "深色",
         }
     }
+
+    /// 存进界面偏好用的名字。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::System => "system",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+
+    /// 从界面偏好(或命令行)里读回来。认不出来返回 `None`,让调用方决定
+    /// 怎么兜底。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(ThemeMode::System),
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +534,18 @@ mod tests {
             ThemeMode::System.to_preference(),
             egui::ThemePreference::System
         );
+    }
+
+    /// 存进界面偏好的名字必须能原样读回来,否则重启就丢主题。
+    #[test]
+    fn 主题模式的名字可往返() {
+        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+            assert_eq!(ThemeMode::parse(mode.as_str()), Some(mode));
+        }
+        // 大小写和首尾空格无所谓。
+        assert_eq!(ThemeMode::parse(" DARK "), Some(ThemeMode::Dark));
+        // 认不出来的交给调用方兜底,这里不能瞎猜一个模式。
+        assert_eq!(ThemeMode::parse("solarized"), None);
     }
 }
 
