@@ -102,11 +102,35 @@ if (Test-Path $examples) {
     Copy-Item $examples $examplesDst -Recurse -Force
 }
 
+# ---- 4. 生成安装包 ----
+#
+# 安装包(installer\PigASIO.iss)会把驱动、控制面板和 CLI 一起装进去,并在
+# 安装时注册 ASIO 驱动、卸载时反注册 —— 这是 dist\ 里那三个散装文件做不到
+# 的,所以能出就出一份。
+Write-Host ""
+Write-Host "=== 生成安装包 ===" -ForegroundColor Cyan
+
+# ISCC 从 PATH 里找(装 Inno Setup 时会问要不要加,选加就不用管)。
+# 装在别处、或者装完没重开终端时,用环境变量 ISCC 指个明确路径 ——
+# 路径不写死在这个脚本里,换台机器也能用。
+$iscc = if ($env:ISCC) { $env:ISCC } else { 'iscc' }
+if (-not (Get-Command $iscc -ErrorAction SilentlyContinue)) {
+    Write-Host "没找到 ISCC,跳过生成安装包(不影响 dist\ 里的散装文件)。" -ForegroundColor Yellow
+    Write-Host "装上 Inno Setup 后重开一个终端即可;若装在别处,可以这样指定:" -ForegroundColor DarkGray
+    Write-Host "    `$env:ISCC = 'D:\software\Inno Setup 7\ISCC.exe'" -ForegroundColor DarkGray
+} else {
+    & $iscc (Join-Path $root 'installer\PigASIO.iss')
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "生成安装包失败。" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
+
 Write-Host ""
 Write-Host "=== 打包完成 ===" -ForegroundColor Green
 Write-Host "输出目录:$dist"
 Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
-    Write-Host ("  {0,-20} {1,12:N0} 字节" -f $_.Name, $_.Length)
+    Write-Host ("  {0,-32} {1,12:N0} 字节" -f $_.Name, $_.Length)
 }
 
 Write-Host ""
@@ -124,3 +148,5 @@ Write-Host "       .\pigasio install"
 Write-Host ""
 Write-Host "卸载:.\pigasio uninstall" -ForegroundColor DarkGray
 Write-Host "提示:dist 目录整个拷到哪都行,但三个文件不能拆开。" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "分发给别人时用上面那个安装包:它会把三件套装到一起,并在安装时自动注册驱动、卸载时反注册。" -ForegroundColor DarkGray
