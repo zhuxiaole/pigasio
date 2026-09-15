@@ -339,8 +339,20 @@ fn parse_theme_arg() -> Option<ThemeMode> {
 // 界面偏好
 // ---------------------------------------------------------------------------
 
-/// 窗口标题。`run_native` 和按标题找窗口的地方都得是同一个。
-const WINDOW_TITLE: &str = "PigASIO 控制面板";
+/// 界面上展示的版本号。
+///
+/// `CARGO_PKG_VERSION` 是 cargo 在编译期塞进来的(取自 workspace 的
+/// `version`),不用手工维护。
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
+/// 窗口标题。带上版本号,任务栏和 Alt+Tab 里也看得见。
+///
+/// 它同时还是"按标题找窗口"的依据(`find_main_window`),所以只能有这一个
+/// 出处 —— 两处各写一遍字符串,改了名字就会静默找不到窗口。
+///
+/// 版本号这里得原样再写一遍 `env!`:`concat!` 只吃字面量,没法引用
+/// [`VERSION_LABEL`]。
+const WINDOW_TITLE: &str = concat!("PigASIO 控制面板 v", env!("CARGO_PKG_VERSION"));
 
 /// 找本程序的主窗口。
 ///
@@ -1242,6 +1254,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("PigASIO");
                 ui.label("多设备 ASIO 驱动");
+                // 版本号退到次要位置:它是"想确认时才看一眼"的信息。
+                ui.label(egui::RichText::new(VERSION_LABEL).small().weak());
                 ui.separator();
 
                 if ui
