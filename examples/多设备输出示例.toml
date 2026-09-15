@@ -6,7 +6,7 @@ buffer_size_samples = 1024
 resample_quality = "sinc"
 drift_correction = true
 max_drift_ppm = 500.0
-buffer_watermark = 3.0
+watermark_ms = 30.0
 
 [[output]]
 device = "扬声器 (Realtek"

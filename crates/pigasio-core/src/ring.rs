@@ -281,9 +281,29 @@ impl FrameReader {
 /// 通过 `Arc` 共享的统计信息,供控制面板读取。
 ///
 /// 音频回调不能加锁,所以统计量全部走原子操作。
+///
+/// # 谁负责写哪一项
+///
+/// 环形缓冲的两个半端分散在不同线程上,而 `underflow_frames` /
+/// `overflow_frames` 的计数分别记在**半端自己**的普通字段里(见
+/// [`FrameReader`] / [`FrameWriter`])。所以这两个数必须由**持有那一半端的人**
+/// 上报 —— 换个说法:欠载只有持有 reader 的一侧看得见,溢出只有持有 writer
+/// 的一侧看得见。
+///
+/// 这里踩过坑:两条流各自都只上报了「恰好落在 ASIO 侧」的那一半。输入流的
+/// ASIO 侧是 reader(上报欠载),它的 writer 在设备回调里,于是**输入溢出
+/// 永远不显示**;输出流反过来,**输出欠载永远不显示** —— 水位掉到不足一块
+/// 设备缓冲、设备每次都读空,界面上仍是「正常」。修法就是在设备回调里补上
+/// 对应那一半的上报(见 `build_output_stream` / `build_input_stream`)。
+///
+/// 往这个结构里加新计数器时,先想清楚它归哪一侧,再由那一侧 `store`。
+/// **两个人都写同一个字段**(一个 `store` 一个 `fetch_add`)会互相覆盖,
+/// 结果比不写还难解释。
 #[derive(Debug, Default)]
 pub struct RingStats {
+    /// 读走时数据不够的帧数。由持有 [`FrameReader`] 的一侧上报。
     pub underflow_frames: std::sync::atomic::AtomicU64,
+    /// 写入时缓冲已满、被丢掉的帧数。由持有 [`FrameWriter`] 的一侧上报。
     pub overflow_frames: std::sync::atomic::AtomicU64,
     pub dropped_frames: std::sync::atomic::AtomicU64,
     /// 当前积压帧数,由 ASIO 回调定期更新。

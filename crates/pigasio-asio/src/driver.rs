@@ -471,13 +471,15 @@ unsafe extern "system" fn vt_get_latencies(
         //
         // 多设备驱动里这个值由环形缓冲维持的水位决定 —— 数据要先在
         // 环形缓冲里排队,然后才被重采样送进设备(输出方向)或者被宿主
-        // 读到(输入方向)。所以延迟约等于 `buffer_size * buffer_watermark`
-        // 帧,而不是一个缓冲区。
+        // 读到(输入方向)。所以延迟是「水位 + 一个 ASIO 缓冲区」,而不是
+        // 一个缓冲区,也不是 `buffer_size × 水位`(那是水位还以缓冲区为
+        // 单位时的旧算法,数字偏大得多)。
         //
         // 报大了只是让宿主的对齐补偿多留一点余量;报小了才会让录音对不齐,
         // 所以这里不做任何"乐观"的缩减。
-        let frames =
-            (engine.buffer_size() as f64 * engine.config().engine.buffer_watermark).round() as i32;
+        let watermark =
+            engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
+        let frames = (watermark.round() as i32).saturating_add(engine.buffer_size() as i32);
         unsafe {
             *input_latency = frames;
             *output_latency = frames;

@@ -161,9 +161,12 @@ drift_correction = true
 # 如果日志里频繁出现“水位异常”,可以适当调大。
 max_drift_ppm = 500.0
 
-# 每个流的缓冲区目标水位,单位是「多少个 ASIO 缓冲区」。
-# 调大更抗抖动但延迟更高。3.0 是实测出来的下限 —— 低于它开场容易欠载。
-buffer_watermark = 3.0
+# 每个流的缓冲区目标水位,**单位是毫秒**。
+# 它直接加在延迟上:水位多少毫秒,音频路径就多出多少等待。
+# 填的是绝对时间,所以调小 buffer_size_samples 不会连带把它缩掉。
+# 多厚才够?至少要盖过一块设备的回调周期(WASAPI 共享模式下普遍 10 ms),
+# 30.0 是个稳妥的起点。调小之后如果实时状态里开始出现「欠载」,就往回调一点。
+watermark_ms = 30.0
 
 # ---- 输出设备 ----
 # 可以写多个 [[output]]。默认播放设备:
@@ -489,9 +492,19 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             master,
             s.channel_count
         );
+        // 「设备块」是这条流的声卡回调一次实际送来(或取走)多少帧,由系统
+        // 音频引擎决定,和报给宿主的 `buffer_size` 不是一回事。欠载与否看的是
+        // 水位和它的关系,所以这两个数得摆在一起。
         println!(
-            "      水位 {} 帧 | 漂移补偿 {:+.1} ppm | 欠载 {} / 溢出 {} / 丢弃 {} 帧",
-            d.queued_frames, d.drift_ppm, d.underflow_frames, d.overflow_frames, d.dropped_frames
+            "      水位 {} 帧 | 设备块 {} 帧({:.0} ms) | 漂移补偿 {:+.1} ppm | \
+             欠载 {} / 溢出 {} / 丢弃 {} 帧",
+            d.queued_frames,
+            s.device_frames,
+            s.device_frames as f64 / rate.max(1) as f64 * 1000.0,
+            d.drift_ppm,
+            d.underflow_frames,
+            d.overflow_frames,
+            d.dropped_frames
         );
     }
 
@@ -516,7 +529,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         .collect();
     if !glitchy.is_empty() {
         problems.push(format!(
-            "以下流出现过欠载或溢出:{}。可以试着调大 engine.buffer_watermark 或 buffer_size_samples",
+            "以下流出现过欠载或溢出:{}。欠载说明缓冲水位不够厚,可以调大 \
+             engine.watermark_ms(单位毫秒);溢出则相反,是水位偏大、设备消化不掉",
             glitchy.join("、")
         ));
     }
@@ -583,29 +597,31 @@ fn cmd_monitor(args: &[String]) -> Result<(), String> {
 
     println!("实时监控中(按 Ctrl+C 结束)…\n");
     println!(
-        "{:>8}  {:<28} {:>10} {:>12}",
-        "方向", "设备", "水位(帧)", "漂移(ppm)"
+        "{:>6}  {:<28} {:>10} {:>12} {:>12} {:>14}",
+        "方向", "设备", "水位(帧)", "设备块(帧)", "漂移(ppm)", "欠载/溢出"
     );
-    println!("{}", "-".repeat(62));
+    println!("{}", "-".repeat(90));
 
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs_f64(opts.seconds) {
         std::thread::sleep(Duration::from_secs(1));
-        let rows = engine.ring_stats();
+        // 设备块只有 `status()` 带得出来,而水位够不够厚恰恰要看它锚在哪个
+        // 量级上,所以这里用 `status()` 而不是更轻的 `ring_stats()`。
+        let rows = engine.status().stream_stats;
         // 用 ANSI 光标上移来原地刷新,而不是刷屏。
         print!("\x1b[{}A", rows.len());
-        for (kind, name, snap) in &rows {
-            let short: String = name.chars().take(28).collect();
-            let flag = if snap.is_healthy() { " " } else { "!" };
+        for s in &rows {
+            let short: String = s.device_name.chars().take(28).collect();
+            let flag = if s.had_glitch { "!" } else { " " };
             println!(
-                "{:>8}  {:<28} {:>10} {:>11.1} {flag}",
-                match kind {
-                    StreamKind::Input => "输入",
-                    StreamKind::Output => "输出",
-                },
+                "{:>6}  {:<28} {:>10} {:>12} {:>11.1} {:>6}/{:<6} {flag}",
+                s.kind.as_str(),
                 short,
-                snap.queued_frames,
-                snap.drift_ppm
+                s.stats.queued_frames,
+                s.device_frames,
+                s.stats.drift_ppm,
+                s.stats.underflow_frames,
+                s.stats.overflow_frames,
             );
         }
         use std::io::Write;

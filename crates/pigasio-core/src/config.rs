@@ -238,20 +238,30 @@ pub struct EngineConfig {
     /// 漂移补偿允许的最大修正量,单位 ppm(百万分之一)。
     /// 这个值同时决定了重采样器可以工作的变速范围。
     pub max_drift_ppm: f64,
-    /// 每个流环形缓冲区的目标水位,单位是 ASIO 缓冲区的倍数。
+    /// 每个流环形缓冲区的目标水位,**单位毫秒**。
     ///
-    /// 它决定了启动时要预热多少数据,以及稳态下维持多少缓冲。取值必须
-    /// 让系统撑得过「设备回调周期」与「ASIO 缓冲区周期」之间的差异:
-    /// 如果一块设备每次回调才送来相当于一个 ASIO 缓冲区的数据,那么水位
-    /// 低于 2 个缓冲区时,宿主连续两次请求输入就会撞上空缓冲。
+    /// 它决定了启动时要预热多少数据,以及稳态下维持多少缓冲。这一项
+    /// **直接加在延迟上**:水位是多少毫秒,音频路径上就多出多少等待。
     ///
-    /// 这一项**直接加在延迟上**:`buffer_size × 水位` 就是音频路径上多出来
-    /// 的等待时间。所以想降延迟就往下调,不用怕 —— 欠载会在实时状态里以
-    /// 「欠载 N 帧」的形式立刻显出来,那时候再往回调一点即可。
+    /// # 为什么单位是时间而不是「几个缓冲区」
     ///
-    /// 默认 3.0 是在真机上试出来的**保守起点**(2.5 仍会偶发开场欠载),
-    /// 不是下限:引擎不会再背着你抬高它。
-    pub buffer_watermark: f64,
+    /// 水位真正要保证的是**撑得住多久** —— 具体说,是撑得过设备回调的
+    /// 抖动。而设备回调周期是由系统音频引擎定的,和 ASIO 缓冲区大小没有
+    /// 关系(WASAPI 共享模式下普遍是 10 ms 一块)。
+    ///
+    /// 早先这里是「ASIO 缓冲区的倍数」,于是踩了个坑:用户为了降延迟把
+    /// `buffer_size_samples` 从 1024 调到 128,水位从 64 ms 缩到 8 ms ——
+    /// 而 8 ms 比一块设备的回调周期还短,**本来是为了降延迟,结果反而开始
+    /// 欠载**。倍数看着没变,绝对时间缩了 8 倍,界面上又只有「3.00 个
+    /// 缓冲区」,看不出 8 ms 意味着什么。
+    ///
+    /// 换成毫秒之后,这个量不再随缓冲区大小漂移:调小缓冲区就是纯粹地
+    /// 降延迟,不会顺手把安全余量也抽走。
+    ///
+    /// 默认 30.0 ms 是个**保守起点**(约等于 3 块 10 ms 的设备回调),
+    /// 不是下限:引擎不会背着你抬高它。欠载会在实时状态里以「欠载 N 帧」
+    /// 的形式立刻显出来,那时候再往回调一点即可。
+    pub watermark_ms: f64,
     /// 通道名里是否允许非 ASCII 字符(比如中文设备名)。
     ///
     /// ASIO 的通道名是 `char[32]`,协议从没规定过编码。PigASIO 按
@@ -273,7 +283,7 @@ impl Default for EngineConfig {
             resample_quality: ResampleQuality::Sinc,
             drift_correction: true,
             max_drift_ppm: 500.0,
-            buffer_watermark: 3.0,
+            watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
         }
     }
@@ -388,10 +398,14 @@ impl Config {
                 self.buffer_size_samples
             );
         }
-        if self.engine.buffer_watermark < 1.0 {
-            return Err(Error::Config(
-                "engine.buffer_watermark 必须 >= 1.0(至少一个 ASIO 缓冲区的预填充)".into(),
-            ));
+        // `is_finite` 顺手挡掉 NaN 和 inf —— 只写区间比较的话 NaN 会溜过去
+        // (NaN 和任何数比都是 false)。
+        let watermark_ms = self.engine.watermark_ms;
+        if !watermark_ms.is_finite() || watermark_ms <= 0.0 || watermark_ms > 2000.0 {
+            return Err(Error::Config(format!(
+                "engine.watermark_ms = {} 超出合理范围(0, 2000] 毫秒",
+                self.engine.watermark_ms
+            )));
         }
         if self.engine.max_drift_ppm <= 0.0 || self.engine.max_drift_ppm > 100_000.0 {
             return Err(Error::Config(
@@ -516,6 +530,15 @@ struct RawEngine {
     drift_correction: Option<bool>,
     max_drift_ppm: Option<f64>,
     use_non_ascii_channel_names: Option<bool>,
+    /// 目标水位,单位毫秒。
+    watermark_ms: Option<f64>,
+    /// 旧字段:目标水位,单位是 ASIO 缓冲区的倍数。
+    ///
+    /// 被 [`watermark_ms`](Self::watermark_ms) 取代。这个单位会随
+    /// `buffer_size_samples` 一起缩放,调小缓冲区时会把安全余量一起抽走,
+    /// 是个坑(见 `EngineConfig::watermark_ms` 的说明)。仍然接受,是为了
+    /// 让老配置文件不报错 —— 解析时按当时的缓冲区大小和采样率折算成毫秒,
+    /// 保持**行为不变**,同时打一条日志请用户改成新字段。
     buffer_watermark: Option<f64>,
 }
 
@@ -584,6 +607,13 @@ impl RawConfig {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        // 先定下采样率和缓冲区大小 —— 旧版 `buffer_watermark` 折算成毫秒
+        // 要用到这两个值。
+        let sample_rate = self.sample_rate.unwrap_or(default.sample_rate);
+        let buffer_size_samples = self
+            .buffer_size_samples
+            .unwrap_or(default.buffer_size_samples);
+
         let engine = match self.engine {
             None => EngineConfig::default(),
             Some(e) => EngineConfig {
@@ -597,9 +627,29 @@ impl RawConfig {
                 max_drift_ppm: e
                     .max_drift_ppm
                     .unwrap_or(EngineConfig::default().max_drift_ppm),
-                buffer_watermark: e
-                    .buffer_watermark
-                    .unwrap_or(EngineConfig::default().buffer_watermark),
+                watermark_ms: match (e.watermark_ms, e.buffer_watermark) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::Config(
+                            "engine.watermark_ms 和 engine.buffer_watermark 不能同时写;\
+                             buffer_watermark 是旧字段,请改用 watermark_ms"
+                                .into(),
+                        ))
+                    }
+                    (Some(ms), None) => ms,
+                    (None, Some(buffers)) => {
+                        let ms = buffers * buffer_size_samples as f64 / sample_rate.max(1) as f64
+                            * 1000.0;
+                        log::warn!(
+                            "engine.buffer_watermark = {buffers} 是旧写法,已按当前配置\
+                             (缓冲区 {buffer_size_samples} 帧 @ {sample_rate} Hz)折算成 \
+                             {ms:.1} ms。请把这一行改成 `watermark_ms = {ms:.1}` —— \
+                             「几个缓冲区」这个单位会随 buffer_size_samples 一起缩放,\
+                             调小缓冲区时会把安全余量一起抽走。"
+                        );
+                        ms
+                    }
+                    (None, None) => EngineConfig::default().watermark_ms,
+                },
                 use_non_ascii_channel_names: e
                     .use_non_ascii_channel_names
                     .unwrap_or(EngineConfig::default().use_non_ascii_channel_names),
@@ -607,10 +657,8 @@ impl RawConfig {
         };
 
         let config = Config {
-            sample_rate: self.sample_rate.unwrap_or(default.sample_rate),
-            buffer_size_samples: self
-                .buffer_size_samples
-                .unwrap_or(default.buffer_size_samples),
+            sample_rate,
+            buffer_size_samples,
             asio_sample_type: match self.asio_sample_type {
                 Some(s) => AsioSampleType::parse(&s)?,
                 None => default.asio_sample_type,
@@ -764,5 +812,72 @@ pub fn load(host_exe_dir: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
             config.validate()?;
             Ok((config, None))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 默认水位是三十毫秒() {
+        assert_eq!(EngineConfig::default().watermark_ms, 30.0);
+    }
+
+    #[test]
+    fn 水位只认毫秒不认缓冲区大小() {
+        // 同样的 watermark_ms,配上不同的 buffer_size_samples,应该是同一段时间。
+        // 这条是这次改单位的全部意义:以前调小缓冲区会把水位一起缩掉。
+        let mut seen = Vec::new();
+        for buffer in [128, 512, 1024] {
+            let cfg = Config::from_toml_str(&format!(
+                "buffer_size_samples = {buffer}\n[engine]\nwatermark_ms = 25.0\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.engine.watermark_ms, 25.0);
+            seen.push(cfg.buffer_size_samples);
+        }
+        assert_eq!(seen, vec![128, 512, 1024]);
+    }
+
+    #[test]
+    fn 旧字段_buffer_watermark_按当时配置折算成毫秒() {
+        // 缓冲区 128 帧、3 个缓冲区,折算出来是 8 ms —— 正是那个「比设备块
+        // 还薄、必然欠载」的配置。折算的意义是**保持原行为**,不去猜用户
+        // 本来想要多少,免得静默改掉他调好的延迟。
+        let cfg = Config::from_toml_str(
+            "sample_rate = 48000\nbuffer_size_samples = 128\n[engine]\nbuffer_watermark = 3.0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.engine.watermark_ms, 8.0);
+
+        // 默认缓冲区 1024 配 3.0 则是 64 ms。
+        let cfg =
+            Config::from_toml_str("[engine]\nbuffer_watermark = 3.0\n").unwrap();
+        assert_eq!(cfg.engine.watermark_ms, 64.0);
+    }
+
+    #[test]
+    fn 新旧水位字段不能同时出现() {
+        let err = Config::from_toml_str(
+            "sample_rate = 48000\n[engine]\nwatermark_ms = 30.0\nbuffer_watermark = 3.0\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("watermark_ms") && msg.contains("buffer_watermark"), "{msg}");
+    }
+
+    #[test]
+    fn 水位超出合理范围会被拒绝() {
+        for bad in ["0.0", "-1.0", "5000.0", "nan"] {
+            let text = format!("[engine]\nwatermark_ms = {bad}\n");
+            match Config::from_toml_str(&text) {
+                Ok(cfg) => panic!("watermark_ms = {bad} 本该被拒绝,却解析出 {}", cfg.engine.watermark_ms),
+                Err(e) => assert!(e.to_string().contains("watermark_ms"), "{bad}: {e}"),
+            }
+        }
+        // 边界值本身合法。
+        assert!(Config::from_toml_str("[engine]\nwatermark_ms = 2000.0\n").is_ok());
+        assert!(Config::from_toml_str("[engine]\nwatermark_ms = 1.0\n").is_ok());
     }
 }

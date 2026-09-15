@@ -216,7 +216,7 @@ buffer_size_samples = 512
 resample_quality = "sinc"      # 默认;音质最好
 drift_correction = true        # 关掉它,几十秒内必然爆音
 max_drift_ppm = 500.0          # 稳态漂移补偿能力
-buffer_watermark = 3.0         # 每个流的缓冲目标水位(以 ASIO 缓冲区为单位)
+watermark_ms = 30.0            # 每个流的缓冲目标水位,单位毫秒,直接加在延迟上
 use_non_ascii_channel_names = true   # 通道名带中文设备名(乱码时设为 false)
 
 # 第一块输出设备:主板声卡,接监听音箱
@@ -266,7 +266,7 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `engine.resample_quality` | `"sinc"` | `sinc` / `fast` / `none` |
 | `engine.drift_correction` | `true` | 是否补偿设备间时钟漂移 |
 | `engine.max_drift_ppm` | `500.0` | 稳态漂移补偿上限 |
-| `engine.buffer_watermark` | `3.0` | 缓冲目标水位,单位是 ASIO 缓冲区个数 |
+| `engine.watermark_ms` | `30.0` | 缓冲目标水位,**单位毫秒**;直接加在延迟上 |
 | `engine.use_non_ascii_channel_names` | `true` | 通道名是否允许中文;显示乱码时设为 `false` |
 | `[[input]]` / `[[output]].device` | `"default"` | 设备名片段;`"default"` 用系统默认设备,`"none"` 禁用 |
 | `...device_regex` | — | 与 `device` 二选一,正则匹配设备名 |
@@ -438,8 +438,17 @@ pigasio channels
 是无效的。PigASIO 已经做了输入预热来减轻它。
 
 **延迟太高**
-把 `buffer_size_samples` 降到 256 或 128。注意 `buffer_watermark` 决定
-了实际需要缓冲多少数据,降低它也能减延迟,但更容易欠载。
+把 `buffer_size_samples` 降到 256 或 128,这一项是纯收益 —— `watermark_ms`
+填的是绝对时间,不会跟着缩水。再往下就要动 `watermark_ms` 了:它同样直接
+加在延迟上,但代价是抗抖动能力变差。
+
+**欠载**
+`watermark_ms` 不够厚。它至少要盖过一块设备的回调周期 —— WASAPI 共享模式下
+设备普遍 10 ms 一块,所以低于 10 ms 基本一定会欠载。控制面板会在试运行之后
+把实测的设备块大小和水位摆在一起比,不够厚会直接标黄。
+
+注意这两种毛病的方向是相反的:**调小 `buffer_size_samples` 只降延迟,不会
+让水位变薄**;**调小 `watermark_ms` 才是在拿抗抖动能力换延迟。**
 
 ## 已知限制
 

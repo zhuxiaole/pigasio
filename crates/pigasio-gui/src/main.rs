@@ -795,7 +795,7 @@ struct App {
     resample_quality: ResampleQuality,
     drift_correction: bool,
     max_drift_ppm: f64,
-    buffer_watermark: f64,
+    watermark_ms: f64,
     use_non_ascii_channel_names: bool,
     inputs: Vec<StreamEdit>,
     outputs: Vec<StreamEdit>,
@@ -873,7 +873,7 @@ impl App {
             resample_quality: ResampleQuality::Sinc,
             drift_correction: true,
             max_drift_ppm: 500.0,
-            buffer_watermark: 3.0,
+            watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
             inputs: vec![StreamEdit::default()],
             outputs: vec![StreamEdit::default()],
@@ -967,7 +967,7 @@ impl App {
         self.drift_correction = config.engine.drift_correction;
         self.max_drift_ppm = config.engine.max_drift_ppm;
         self.use_non_ascii_channel_names = config.engine.use_non_ascii_channel_names;
-        self.buffer_watermark = config.engine.buffer_watermark;
+        self.watermark_ms = config.engine.watermark_ms;
         self.inputs = config.inputs.iter().map(StreamEdit::from_config).collect();
         self.outputs = config.outputs.iter().map(StreamEdit::from_config).collect();
     }
@@ -985,7 +985,7 @@ impl App {
                 drift_correction: self.drift_correction,
                 max_drift_ppm: self.max_drift_ppm,
                 use_non_ascii_channel_names: self.use_non_ascii_channel_names,
-                buffer_watermark: self.buffer_watermark,
+                watermark_ms: self.watermark_ms,
             },
         }
     }
@@ -1179,7 +1179,7 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
         "use_non_ascii_channel_names = {}",
         config.engine.use_non_ascii_channel_names
     );
-    let _ = writeln!(out, "buffer_watermark = {}", config.engine.buffer_watermark);
+    let _ = writeln!(out, "watermark_ms = {}", config.engine.watermark_ms);
 
     for (label, streams) in [("output", &config.outputs), ("input", &config.inputs)] {
         for (i, s) in streams.iter().enumerate() {
@@ -1690,23 +1690,76 @@ impl App {
                 ui.end_row();
 
                 ui.label("缓冲目标水位");
-                // 水位换算成毫秒得在闭包外先算好 —— 闭包里要可变借用
-                // `self.buffer_watermark`,再读 `self.sample_rate` 就打架了。
-                let chunk_ms = self.buffer_size as f64 / self.sample_rate.max(1) as f64 * 1000.0;
+                // 闭包里要可变借用 `self.watermark_ms`,所以采样率得先拷出来。
+                let sample_rate = self.sample_rate.max(1) as f64;
                 theme::slider(
                     ui,
-                    egui::Slider::new(&mut self.buffer_watermark, 1.0..=12.0).custom_formatter(
-                        move |v, _| format!("{v:.2} 个缓冲区 ≈ {:.0} ms", v * chunk_ms),
-                    ),
+                    egui::Slider::new(&mut self.watermark_ms, 1.0..=200.0)
+                        .logarithmic(true)
+                        .custom_formatter(move |v, _| {
+                            format!("{v:.0} ms ≈ {:.0} 帧", v / 1000.0 * sample_rate)
+                        }),
                 )
                 .on_hover_text(
-                    "每个流的环形缓冲要维持多少数据。这一项**直接加在延迟上**:\
-                         水位 × 缓冲区大小就是音频路径上多出来的等待时间。\
-                         调小能降延迟;调到实时状态里开始出现「欠载」,就说明\
-                         水位不够厚,该往回调一点了。",
+                    "每个流的环形缓冲要维持多少数据,**单位是时间**。这一项直接加在\
+                         延迟上:水位有多少毫秒,音频路径上就多出多少等待。\n\n\
+                         填的是绝对时间,所以调小缓冲区不会连带把它缩掉 —— 调小缓冲区\
+                         就是纯粹地降延迟。\n\n\
+                         多厚才够?至少要盖过一块设备的回调周期。WASAPI 共享模式下\
+                         设备普遍 10 ms 一块,所以低于 10 ms 基本一定会欠载;30 ms 是个\
+                         稳妥的起点。",
                 );
                 ui.end_row();
             });
+
+        // 拿实测到的设备块跟水位比一比。这是唯一能在**跑起来之后**发现「水位比
+        // 设备回调周期还短」的地方 —— 这种配置必然欠载,而且原因很不直观:水位
+        // 用自己的数字看着挺正常,实际却薄于设备一次回调的间隔。
+        //
+        // 没运行过就没有实测值,那就只留上面滑动条提示里的经验值(10 ms 一块)。
+        // 放在 Grid 外面是为了让它按栏宽折行,不至于把表格撑宽。
+        let block_frames = self
+            .last_stats
+            .iter()
+            .map(|s| s.device_frames)
+            .max()
+            .unwrap_or(0);
+        if block_frames > 0 {
+            let sample_rate = self.sample_rate.max(1) as f64;
+            let block_ms = block_frames as f64 / sample_rate * 1000.0;
+            ui.add_space(6.0);
+            if self.watermark_ms < block_ms {
+                let label = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "⚠ 水位 {:.0} ms 比实测设备块 {block_ms:.0} ms({block_frames} 帧)\
+                             还薄 —— 余量不足一块设备缓冲,随时可能欠载,建议至少调到 {:.0} ms",
+                            self.watermark_ms,
+                            (block_ms * 1.5).ceil(),
+                        ))
+                        .color(egui::Color32::from_rgb(220, 160, 60)),
+                    )
+                    .wrap(),
+                );
+                label.on_hover_text(
+                    "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频引擎\
+                     决定,和 ASIO 缓冲区大小无关。两块设备回调之间环形缓冲没有新数据\
+                     补充,所以水位得比这个时间长,否则宿主来取数据时缓冲里是空的。",
+                );
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "实测最大设备块 {block_ms:.0} ms({block_frames} 帧),\
+                             水位比它厚 {:.1} 倍",
+                            self.watermark_ms / block_ms
+                        ))
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+            }
+        }
     }
 
     fn draw_streams(&mut self, ui: &mut egui::Ui, kind: StreamKind) {

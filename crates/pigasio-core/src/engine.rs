@@ -64,7 +64,8 @@ use crate::ring::{self, FrameReader, FrameWriter, RingStats, RingStatsSnapshot};
 
 /// 环形缓冲容量相对于目标水位的倍数。
 const RING_CAPACITY_FACTOR: f64 = 6.0;
-/// 环形缓冲至少容纳的时长(秒)。
+/// 环形缓冲至少容纳的时长(秒)。这是**容量**的下限,不是水位的 —— 水位
+/// 本身没有下限,用户填多少就是多少(见 `target_watermark_frames`)。
 const RING_MIN_SECONDS: f64 = 0.25;
 /// 一次时钟推进最多连续处理的 ASIO 缓冲区个数。
 ///
@@ -329,12 +330,36 @@ impl OutputStreamRuntime {
             }
         }
 
-        let written = self.writer.write_interleaved(&self.staging, usable);
-        if written < usable {
-            self.stats
-                .overflow_frames
-                .fetch_add((usable - written) as u64, Ordering::Relaxed);
+        // 写不进去的部分由 `write_interleaved` 自己记进生产者的
+        // `overflow_frames`,`update_drift` 会把它上报到共享统计里。这里**不**
+        // 再 `fetch_add` 一次 —— 那既是重复计数,又会被随后的 `store` 覆盖,
+        // 白白让这个数变得无法解释。
+        self.writer.write_interleaved(&self.staging, usable);
+    }
+
+    /// 用静音把环形缓冲垫到目标水位。
+    ///
+    /// 输入流启动前有 [`Engine::wait_for_input_prime`] 替它等设备灌到目标水位,
+    /// 输出流原本什么都没有 —— 设备一开始播放就对着一个近乎全空的 ring,每块
+    /// 回调都取不满,启动后的头几秒一直在欠载。
+    ///
+    /// 更麻烦的是之后:ring 只能靠漂移补偿那个 ±0.5% 的偏置慢慢涨。水位配得越大
+    /// 涨得越久 —— 200 ms 要靠 0.5% 灌满得四十多秒,这段时间水位始终远低于目标,
+    /// 用户看到的就成「都配到 200 ms 了还是欠载」。水位明明是用来买余量的,
+    /// 调大反而更糟,因为补上余量的速度没变。
+    ///
+    /// 垫静音没有副作用:这些静音本来就会送到设备上播放,只是把「慢慢涨上去」
+    /// 换成「一开始就停在目标水位」,稳态延迟不变。启动初期设备多播几十毫秒静音,
+    /// 正是 `getLatencies` 报给宿主的那个值。
+    fn prime_to_target(&mut self) {
+        let target = self.drift.target_frames();
+        let have = self.writer.queued_frames();
+        if have >= target {
+            return;
         }
+        // 只走这一次,不在音频线程上,分配是安全的。
+        let silence = vec![0.0f32; (target - have) * self.channels];
+        self.writer.write_interleaved(&silence, target - have);
     }
 
     fn update_drift(&mut self, dt_seconds: f64) {
@@ -482,13 +507,17 @@ impl AudioCore {
         samples_processed.fetch_add(chunk as u64, Ordering::Relaxed);
     }
 
-    /// 启动前把宿主已经填好的输出缓冲(ASIO 约定是 index 1)推进设备 ring。
+    /// 启动前把输出环形缓冲垫到目标水位,再把宿主已经填好的输出缓冲
+    /// (ASIO 约定是 index 1)推到队尾。
     fn prime_outputs(&mut self) {
         let chunk = self.buffer_size();
         let AudioCore {
             buffers, outputs, ..
         } = self;
         for stream in outputs.iter_mut() {
+            // 顺序很重要:先垫静音、再推宿主的音频。反过来的话宿主那一块
+            // 会被设备立刻取走,ring 又回到近乎全空的状态。
+            stream.prime_to_target();
             stream.drain(buffers, 1, chunk);
         }
     }
@@ -699,6 +728,13 @@ where
                 stats
                     .written_frames
                     .fetch_add(written as u64, Ordering::Relaxed);
+                // 这一侧的溢出只能在这里上报。ring 的生产者半端就在本回调手里,
+                // 它的计数除了这里没有第二个人能读走 —— `InputStreamRuntime`
+                // 拿到的是消费者半端,只能看到欠载。少这一行,输入侧的溢出就
+                // 永远不会出现在界面上。
+                stats
+                    .overflow_frames
+                    .store(writer.overflow_frames(), Ordering::Relaxed);
 
                 // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
                 if let Some(core) = master_core.as_ref() {
@@ -734,6 +770,7 @@ where
         ch_map,
         output_reader,
         master_core,
+        stats,
         err_flag,
         frames_per_buffer,
         device_frames,
@@ -783,6 +820,15 @@ where
                     // 从设备的 ring 只有我们自己碰,不需要锁。
                     got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
                 }
+
+                // 这一侧的欠载只能在这里上报。ring 的消费者半端就在本回调手里,
+                // 它的计数除了这里没有第二个人能读走 —— `OutputStreamRuntime`
+                // 拿到的是生产者半端,只能看到溢出。少这一行,输出侧的欠载就
+                // 永远不会出现在界面上:水位掉到不足一块设备缓冲时,界面照样
+                // 显示「正常」。
+                stats
+                    .underflow_frames
+                    .store(reader.underflow_frames(), Ordering::Relaxed);
 
                 // 格式转换放在锁外,尽量缩短持锁时间。
                 for s in data.iter_mut() {
@@ -1289,7 +1335,7 @@ impl Engine {
             let (device_cfg, device_channels, sample_format) =
                 negotiate_config(&info.device, StreamKind::Input, sample_rate, &info.name)?;
 
-            let capacity = ring_capacity(chunk, engine_cfg.buffer_watermark, sample_rate);
+            let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);
             let stats = RingStats::new();
 
@@ -1310,7 +1356,7 @@ impl Engine {
                 reader,
                 resampler,
                 drift: DriftController::new(
-                    target_watermark_frames(chunk, engine_cfg.buffer_watermark),
+                    target_watermark_frames(sample_rate, engine_cfg.watermark_ms),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1355,7 +1401,7 @@ impl Engine {
             let (device_cfg, device_channels, sample_format) =
                 negotiate_config(&info.device, StreamKind::Output, sample_rate, &info.name)?;
 
-            let capacity = ring_capacity(chunk, engine_cfg.buffer_watermark, sample_rate);
+            let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);
             let stats = RingStats::new();
 
@@ -1376,7 +1422,7 @@ impl Engine {
                 writer,
                 resampler,
                 drift: DriftController::new(
-                    target_watermark_frames(chunk, engine_cfg.buffer_watermark),
+                    target_watermark_frames(sample_rate, engine_cfg.watermark_ms),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1644,28 +1690,6 @@ impl Engine {
             stream_stats,
         }
     }
-
-    /// 每条流当前的统计快照,按「先输入后输出」排列。
-    ///
-    /// 与 [`Self::status`] 一样用 `try_lock`:它可能从 GUI 线程调用,
-    /// 而此刻音频回调正持有锁。拿不到就返回空列表,绝不阻塞。
-    pub fn ring_stats(&self) -> Vec<(StreamKind, String, RingStatsSnapshot)> {
-        let Some(core) = self.core.try_lock() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for s in &core.inputs {
-            out.push((StreamKind::Input, s.device_name.clone(), s.stats.snapshot()));
-        }
-        for s in &core.outputs {
-            out.push((
-                StreamKind::Output,
-                s.device_name.clone(),
-                s.stats.snapshot(),
-            ));
-        }
-        out
-    }
 }
 
 impl Drop for Engine {
@@ -1692,41 +1716,41 @@ fn check_duplicates_for(resolved: &[DeviceInfo], config: &Config, kind: StreamKi
 }
 
 /// 计算环形缓冲的容量。
-fn ring_capacity(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
-    let by_watermark = (chunk as f64 * watermark * RING_CAPACITY_FACTOR).ceil() as usize;
+///
+/// `watermark_ms` 是目标水位(毫秒)。容量取三者中最大的一个:水位的若干倍
+/// (水位附近要有调节余地,漂移补偿靠的就是在这里加减)、至少 0.25 秒、以及
+/// 至少四个 ASIO 缓冲区(一次 `advance` 至少要能整块进出)。
+fn ring_capacity(chunk: usize, watermark_ms: f64, sample_rate: u32) -> usize {
+    let by_watermark = (sample_rate as f64 * watermark_ms / 1000.0 * RING_CAPACITY_FACTOR).ceil()
+        as usize;
     let by_time = (sample_rate as f64 * RING_MIN_SECONDS).ceil() as usize;
     by_watermark.max(by_time).max(chunk * 4).max(1)
 }
 
-/// 计算每个流的目标水位,单位帧。
+/// 把配置里的目标水位(毫秒)换算成帧数。
 ///
-/// 就是配置里的「多少个 ASIO 缓冲区」乘上缓冲大小。水位真正要表达的是
-/// **能撑住多久**,所以下面这张换算表才是它的本意 —— 用户填的是倍数,
-/// 而决定抗抖动能力的是绝对时间:
+/// 单位是时间而不是「几个缓冲区」,所以这个换算是**唯一**的:帧数 = 采样率
+/// × 毫秒数,和 `buffer_size_samples` 无关。
 ///
-/// | buffer_size | watermark | 实际水位 |
-/// |---|---|---|
-/// | 1024 | 3.0 | 3072 帧 = 64 ms |
-/// | 256 | 3.0 | 768 帧 = 16 ms |
+/// 早先这里算的是 `chunk × watermark`。那个写法有个坑:用户为了降延迟把缓冲区
+/// 从 1024 调到 128,水位从 64 ms 缩到 8 ms —— 而 8 ms 比一块设备的回调周期
+/// (WASAPI 共享模式下普遍 10 ms)还短,**本来是为了降延迟,结果反而开始欠载**。
+/// 界面上只显示「3.00 个缓冲区」,看不出那是 8 ms,于是这个坑很难爬出来。
 ///
 /// # 为什么不再兜一个绝对时间下限
 ///
-/// 这里原本有个 30 ms 的硬下限。理由是上面那个 16 ms 的格子实测会欠载:
-/// 采集设备的回调周期可能接近甚至超过 20 ms,而宿主每 5.3 ms 就来要一次
-/// 数据,连续几次读取之间设备一次都没回调,环形缓冲就空了。
+/// 这里一度有个 30 ms 的硬下限,正是为了挡住上面那种情况。但那等于把用户的
+/// 选择悄悄盖掉 —— 用户设 1,实际跑 30 ms,无论界面还是日志都看不出来,
+/// 想压延迟就会撞上一堵看不见的墙。
 ///
-/// 但那等于把用户的选择悄悄盖掉 —— 用户设 1,实际跑 30 ms,无论界面还是
-/// 日志都看不出来,想压延迟就会撞上一堵看不见的墙。
+/// 把单位本身改成时间之后,下限就没有存在的意义了:用户填的数字**就是**
+/// 绝对时间,不再会随缓冲区大小缩水。真正该做的是让这个数字在界面上可读、
+/// 并且和水位不够时的反馈(实时状态里的「欠载 / 溢出」两列)对得上。
 ///
-/// 而"水位不够"这件事本身是有反馈的:实时状态里那两列「欠载 / 溢出」会
-/// 立刻跳出来。既然用户看得见、也能自己调回来,就不该由代码替他拍板。
-/// 于是那个下限降级成了配置里的默认值(见 `EngineConfig::buffer_watermark`
-/// 的 3.0)——想换更低延迟就往下调,代价自己看得见。
-///
-/// 唯一真正绕不开的是设备回调的抖动:抖动越大,水位就得越厚。但那取决于
-/// 用户的声卡和机器,该让他自己试,而不是由代码猜一个数。
-fn target_watermark_frames(chunk: usize, watermark: f64) -> usize {
-    ((chunk as f64 * watermark).round() as usize).max(1)
+/// 唯一绕不开的是设备回调的抖动:抖动越大,水位就得越厚。但那取决于用户的
+/// 声卡和机器,该让他自己试,而不是由代码猜一个数。
+fn target_watermark_frames(sample_rate: u32, watermark_ms: f64) -> usize {
+    ((sample_rate as f64 * watermark_ms / 1000.0).round() as usize).max(1)
 }
 
 /// 取走某条流攒下的重采样失败计数并打印。
@@ -1843,24 +1867,33 @@ mod tests {
 
     #[test]
     fn 环形缓冲容量随水位与时间增长() {
-        let c = ring_capacity(64, 2.0, 48_000);
+        let c = ring_capacity(64, 20.0, 48_000);
         assert!(c >= (48_000.0 * RING_MIN_SECONDS) as usize);
 
-        let c = ring_capacity(8192, 2.0, 48_000);
+        let c = ring_capacity(8192, 20.0, 48_000);
         assert!(c >= 8192 * 4);
     }
 
     #[test]
-    fn 小缓冲区下的目标水位由绝对时间兜底() {
-        // 这个函数以前会兜一个 30 ms 的绝对下限,把用户设的小水位悄悄抬上去
-        // ——256 帧配 3.0 只有 16 ms,会被抬到 1440 帧。现在不兜了:水位就是
-        // 用户给的值,欠载与否交给实时状态里那两列统计去说话。
-        assert_eq!(target_watermark_frames(256, 3.0), 768);
-        assert_eq!(target_watermark_frames(128, 1.0), 128);
-        assert_eq!(target_watermark_frames(1024, 3.0), 3072);
-        assert_eq!(target_watermark_frames(1024, 6.0), 6144);
+    fn 目标水位按毫秒换算且不随缓冲区大小漂移() {
+        // 单位是时间,所以帧数只跟采样率和毫秒数有关 —— 缓冲区大小不再参与。
+        // 这是这个函数最重要的性质:以前算的是 `chunk × 倍数`,用户为了降延迟
+        // 把缓冲区从 1024 调到 128,水位会跟着从 64 ms 缩到 8 ms,比一块设备的
+        // 回调周期还短,于是「降延迟」反而变成「欠载」。
+        assert_eq!(target_watermark_frames(48_000, 30.0), 1440);
+        assert_eq!(target_watermark_frames(48_000, 10.0), 480);
+        assert_eq!(target_watermark_frames(44_100, 10.0), 441);
+
+        // 同一毫秒数在任何采样率下都是同一段时间(±1 帧取整误差)。
+        for ms in [5.0, 8.0, 30.0, 64.0] {
+            let frames = target_watermark_frames(48_000, ms);
+            let back = frames as f64 / 48_000.0 * 1000.0;
+            assert!((back - ms).abs() < 0.1, "{ms} ms 往返成了 {back} ms");
+        }
+
         // 极端值兜底:至少留一帧,不能让下游一帧数据都拿不到。
-        assert_eq!(target_watermark_frames(128, 0.0), 1);
+        assert_eq!(target_watermark_frames(48_000, 0.0), 1);
+        assert_eq!(target_watermark_frames(0, 30.0), 1);
     }
 
     #[test]
