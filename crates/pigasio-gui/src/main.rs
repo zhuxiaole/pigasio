@@ -38,18 +38,37 @@ fn main() -> eframe::Result<()> {
     init_logging();
 
     let config_path = parse_config_arg();
+    let prefs = load_ui_prefs();
+
     // 主题的优先级:命令行 > 上次的选择 > 跟随系统。
     // `--theme light|dark` 用来强制指定,方便截图和排查。
-    let theme_mode = parse_theme_arg().unwrap_or_else(|| {
-        load_ui_prefs()
-            .theme
-            .and_then(|name| ThemeMode::parse(&name))
-            .unwrap_or_default()
-    });
+    let theme_mode = parse_theme_arg()
+        .or_else(|| prefs.theme.as_deref().and_then(ThemeMode::parse))
+        .unwrap_or_default();
+
+    let restore = WindowRestore {
+        maximized: prefs.maximized == Some(true),
+        pos: prefs.window_pos.map(|[x, y]| egui::pos2(x, y)),
+        size: prefs.window_size.map(|[w, h]| egui::vec2(w, h)),
+    };
+
+    let mut viewport = egui::ViewportBuilder::default().with_min_inner_size([760.0, 520.0]);
+    if restore.maximized {
+        // 最大化时位置和尺寸都不给。真正的"一出生就是最大化"由
+        // `preset_maximized` 在窗口显示之前设好 —— 这里给了反而会被 Windows
+        // 用来先摆一个窗口化窗口。
+        //
+        // 代价是取消最大化之后窗口回到系统默认大小:所以把用户上次摆的位置
+        // 和尺寸留着,等他取消最大化再补回去,见 `App::pending_pos`。
+    } else {
+        viewport = viewport.with_inner_size(restore.size.unwrap_or(egui::vec2(1000.0, 780.0)));
+        if let Some([x, y]) = prefs.window_pos {
+            viewport = viewport.with_position([x, y]);
+        }
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 780.0])
-            .with_min_inner_size([760.0, 520.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -59,7 +78,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             install_ui_font(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, theme_mode);
-            Ok(Box::new(App::new(cc, config_path, theme_mode)))
+            Ok(Box::new(App::new(cc, config_path, theme_mode, restore)))
         }),
     );
 
@@ -320,6 +339,64 @@ fn parse_theme_arg() -> Option<ThemeMode> {
 // 界面偏好
 // ---------------------------------------------------------------------------
 
+/// 把窗口预设成"下次显示就是最大化"。
+///
+/// 窗口建出来之后、渲染出第一帧之前一直是隐藏的(eframe 自己就这么建,防
+/// 白闪),趁这个空档把它的显示状态设成最大化 —— 等它真显出来的时候就已经
+/// 是最大化尺寸了,不会先闪一下小窗口。
+///
+/// 为什么不用 egui 那套:
+///
+/// * `ViewportBuilder::with_maximized` 交到 Windows 手上会被 `with_inner_size`
+///   搅乱 —— 位置进了最大化的位置,尺寸却留在窗口大小;
+/// * 改成第一帧发 `ViewportCommand::Maximized` 吧,那条命令要等这一帧跑完
+///   才处理,而窗口紧接着就显示了。实测会先以窗口化尺寸露一下脸,过几百
+///   毫秒才跳成最大化 —— 用户看得见。
+///
+/// `SetWindowPlacement` 只改状态、不显示窗口,所以不会把窗口提前暴露出来
+/// (那样会白屏)。等 eframe 自己 `set_visible(true)` 时,窗口直接以最大化的
+/// 形态出现。
+#[cfg(windows)]
+fn preset_maximized() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowPlacement, SetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+    };
+
+    let title: Vec<u16> = "PigASIO 控制面板\0".encode_utf16().collect();
+    // SAFETY: 标题是以 NUL 结尾的宽字符串。找不到窗口就是空指针,下面判掉了。
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        log::warn!("拿不到窗口句柄,最大化要等第一帧才生效(可能闪一下)");
+        return;
+    }
+
+    // SAFETY: 全零的 WINDOWPLACEMENT 是合法的初始值,length 随后按 API 要求填。
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    // SAFETY: hwnd 有效;placement 是本地结构,length 已填好。
+    unsafe {
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return;
+        }
+        placement.showCmd = SW_SHOWMAXIMIZED as u32;
+        SetWindowPlacement(hwnd, &placement);
+    }
+}
+
+#[cfg(not(windows))]
+fn preset_maximized() {}
+
+/// 启动时要恢复的窗口状态。
+#[derive(Clone, Copy)]
+struct WindowRestore {
+    /// 上次关窗时是不是最大化。
+    maximized: bool,
+    /// 上次窗口化时窗口的位置和大小。恢复最大化时它们同样有用 —— 用户一
+    /// 取消最大化,就得靠它们把窗口摆回原样。
+    pos: Option<egui::Pos2>,
+    size: Option<egui::Vec2>,
+}
+
 /// 界面偏好的文件名。和引擎配置放同一个目录(用户主目录)。
 const UI_PREFS_FILE_NAME: &str = "PigASIO-ui.toml";
 
@@ -335,6 +412,18 @@ const UI_PREFS_FILE_NAME: &str = "PigASIO-ui.toml";
 struct UiPrefs {
     /// 主题模式,[`ThemeMode::as_str`] 的那个名字。
     theme: Option<String>,
+    /// 上次关窗时窗口左上角的位置(逻辑点)。
+    ///
+    /// 要是拔掉了外接显示器,这个值可能指向一块已经不存在的屏幕,窗口就会
+    /// "开了但看不见" —— 删掉这个文件即可回到系统默认位置。
+    window_pos: Option<[f32; 2]>,
+    /// 上次关窗时的窗口大小(逻辑点,客户区)。
+    ///
+    /// **最大化期间不更新它**:那时候量到的尺寸是整个屏幕,存下来用户下次
+    /// 一取消最大化,就只能看到一个占满屏幕的窗口了。
+    window_size: Option<[f32; 2]>,
+    /// 上次关窗时窗口是不是最大化。
+    maximized: Option<bool>,
 }
 
 /// 界面偏好存在哪。跟着用户目录走,不受 `--config` 影响。
@@ -357,6 +446,16 @@ fn load_ui_prefs() -> UiPrefs {
         }),
         Err(_) => UiPrefs::default(),
     }
+}
+
+/// 改一项界面偏好,其余保持不变。
+///
+/// 两个字段是各自独立地变的(切主题、挪窗口),各自直接构造一份 `UiPrefs`
+/// 写回去的话,后写的那个会把先写的那个冲掉。
+fn update_ui_prefs(change: impl FnOnce(&mut UiPrefs)) {
+    let mut prefs = load_ui_prefs();
+    change(&mut prefs);
+    save_ui_prefs(&prefs);
 }
 
 /// 写界面偏好。写失败只记一条日志:主题已经生效了,不值得为它弹个错。
@@ -631,6 +730,25 @@ struct App {
     /// 反复跳高度 —— 而 egui 在内容变矮时会把滚动位置夹回顶部,表现正是
     /// "刷新一下又滑回顶上了"。所以留一份上次的结果兜着。
     last_stats: Vec<StreamStatusSnapshot>,
+    /// 窗口左上角,每帧跟着实际位置更新,退出时写进界面偏好。
+    window_pos: Option<egui::Pos2>,
+    /// 窗口客户区大小,同上。
+    window_size: Option<egui::Vec2>,
+    /// 窗口是不是最大化,同上。
+    maximized: bool,
+    /// 启动时要不要恢复最大化。
+    ///
+    /// 只用来给第一帧发一次命令,发完就置 false。见 `main` 里那段说明 ——
+    /// 光靠 `ViewportBuilder::with_maximized` 不够稳。
+    restore_maximized: bool,
+    /// 启动即最大化时,用户上次摆的窗口位置和大小。
+    ///
+    /// 恢复最大化时我们没给窗口位置和尺寸(给了会先闪一下小窗口),所以窗口
+    /// 还原时得拿它们摆回原样;补完就清掉,免得反复覆盖用户后来的调整。
+    /// 只有"启动即最大化"才留 —— 窗口化启动的用户自己最大化再还原时,
+    /// 不该被这两个陈旧的值拽回去。
+    pending_pos: Option<egui::Pos2>,
+    pending_size: Option<egui::Vec2>,
     /// 当前主题模式。切换时会立即重新应用样式。
     theme_mode: ThemeMode,
 }
@@ -640,7 +758,13 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         config_path: Option<PathBuf>,
         initial_theme: ThemeMode,
+        restore: WindowRestore,
     ) -> Self {
+        // 趁窗口还没露脸,先把最大化状态设好 —— 见 `preset_maximized`。
+        if restore.maximized {
+            preset_maximized();
+        }
+
         // 主题在进入这里之前已经应用过了,这里只把模式记下来供界面切换用。
         let _ = cc;
         let mut app = App {
@@ -663,6 +787,18 @@ impl App {
             runner_job: None,
             devices_job: None,
             last_stats: Vec::new(),
+            window_pos: None,
+            window_size: None,
+            // 恢复最大化时先当它已经最大化了:要等 `ViewportInfo` 回来才知道
+            // 真实状态,而那时已经该判断"用户是不是刚取消了最大化"。
+            maximized: restore.maximized,
+            restore_maximized: restore.maximized,
+            pending_pos: if restore.maximized { restore.pos } else { None },
+            pending_size: if restore.maximized {
+                restore.size
+            } else {
+                None
+            },
             theme_mode: initial_theme,
         };
 
@@ -995,9 +1131,47 @@ fn toml_string(s: &str) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 恢复最大化。只发一次:发完就清掉,否则用户手动取消最大化之后
+        // 又会被按回去。
+        if self.restore_maximized {
+            self.restore_maximized = false;
+            // 补一次命令 —— 创建时那个 `with_maximized` 在 Windows 上会被
+            // `with_inner_size` 搅乱,得在这里坐实。
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
         // 先收后台线程的结果。
         self.poll_runner_job(ctx);
         self.poll_devices(ctx);
+
+        // 跟着窗口走。拖动/缩放时每帧都在变,所以这里只更新内存,落盘交给
+        // `on_exit` —— 没必要为一次拖动写几十遍文件。
+        let was_maximized = self.maximized;
+        let mut now_maximized = was_maximized;
+        ctx.input(|i| {
+            let vp = i.viewport();
+            if let Some(rect) = vp.outer_rect {
+                self.window_pos = Some(rect.min);
+            }
+            if let Some(size) = vp.inner_rect.map(|rect| rect.size()) {
+                self.window_size = Some(size);
+            }
+            if let Some(maximized) = vp.maximized {
+                now_maximized = maximized;
+            }
+        });
+        self.maximized = now_maximized;
+
+        // 刚把窗口从最大化还原回来。因为启动时没给位置和尺寸(给了会先闪
+        // 一下小窗口),这会儿得把用户上次摆的样子补回去。
+        if was_maximized && !now_maximized {
+            if let Some(pos) = self.pending_pos.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+            if let Some(size) = self.pending_size.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
 
         // 试运行时周期性重绘以刷新统计;平时按需重绘即可。
         if self.runner.is_some() {
@@ -1036,9 +1210,7 @@ impl eframe::App for App {
                         theme::apply(ctx, mode);
                         // 切换即记住。主题是随手改一下的东西,不该还要求用户
                         // 再去点一次「保存」—— 那个按钮存的是引擎配置。
-                        save_ui_prefs(&UiPrefs {
-                            theme: Some(mode.as_str().to_string()),
-                        });
+                        update_ui_prefs(|prefs| prefs.theme = Some(mode.as_str().to_string()));
                     }
                 }
                 if ui.button("保存").clicked() {
@@ -1224,6 +1396,26 @@ impl eframe::App for App {
                     );
                 });
             });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 窗口位置/大小只在这里落盘 —— 拖动缩放时它们每帧都在变,跟着写
+        // 文件没必要。
+        let (pos, size, maximized) = (self.window_pos, self.window_size, self.maximized);
+        update_ui_prefs(|prefs| {
+            // 最大化时量到的位置和尺寸都是"铺满屏幕"的那一套(位置往往还带
+            // 负偏移),不是用户摆放的样子。存下去的话,下次一取消最大化就
+            // 只能看到一个占满屏幕、还偏到屏幕外的窗口。
+            if !maximized {
+                if let Some(pos) = pos {
+                    prefs.window_pos = Some([pos.x, pos.y]);
+                }
+                if let Some(size) = size {
+                    prefs.window_size = Some([size.x, size.y]);
+                }
+            }
+            prefs.maximized = Some(maximized);
+        });
     }
 }
 
@@ -1701,20 +1893,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 界面偏好往返保持主题() {
+    fn 界面偏好往返保持各项() {
         let prefs = UiPrefs {
             theme: Some("dark".to_string()),
+            window_pos: Some([120.0, 64.0]),
+            window_size: Some([900.0, 600.0]),
+            maximized: Some(true),
         };
         let text = toml::to_string(&prefs).expect("序列化界面偏好");
         let back: UiPrefs = toml::from_str(&text).expect("读回界面偏好");
         assert_eq!(back.theme.as_deref(), Some("dark"));
+        assert_eq!(back.window_pos, Some([120.0, 64.0]));
+        assert_eq!(back.window_size, Some([900.0, 600.0]));
+        assert_eq!(back.maximized, Some(true));
     }
 
     /// 老版本没写过这个文件,或者文件被清空了 —— 两种都得能读。
+    /// 字段是逐个加进来的,少几个也要照读不误。
     #[test]
     fn 界面偏好缺字段时退回默认() {
         let prefs: UiPrefs = toml::from_str("").expect("空文件也要能读");
         assert!(prefs.theme.is_none());
+        assert!(prefs.window_pos.is_none());
+        assert!(prefs.window_size.is_none());
+        assert!(prefs.maximized.is_none());
+
+        // 只写了主题的第一版文件。
+        let v1: UiPrefs = toml::from_str("theme = \"light\"").expect("旧文件也要能读");
+        assert_eq!(v1.theme.as_deref(), Some("light"));
+        assert!(v1.window_pos.is_none());
+        assert!(v1.window_size.is_none());
+
+        // 加了窗口位置、还没有大小和最大化的第二版。
+        let v2: UiPrefs =
+            toml::from_str("theme = \"dark\"\nwindow_pos = [10.0, 20.0]").expect("旧文件也要能读");
+        assert_eq!(v2.window_pos, Some([10.0, 20.0]));
+        assert!(v2.window_size.is_none());
+        assert!(v2.maximized.is_none());
     }
 
     #[test]
