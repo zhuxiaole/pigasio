@@ -475,6 +475,14 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     if non_finite > 0 {
         println!("⚠ 异常样本    : {non_finite} 个非有限值(NaN/Inf)");
     }
+    // 引擎级的丢帧:不属于哪条流,所以单列一行。正常恒为 0。
+    if status.dropped_frames > 0 {
+        println!(
+            "⚠ 引擎丢帧    : {} 帧(时钟推进跟不上,{} ms)",
+            status.dropped_frames,
+            status.dropped_frames as f64 / rate.max(1) as f64 * 1000.0
+        );
+    }
 
     println!();
     println!("各流状态:");
@@ -496,15 +504,23 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         // 音频引擎决定,和报给宿主的 `buffer_size` 不是一回事。欠载与否看的是
         // 水位和它的关系,所以这两个数得摆在一起。
         println!(
-            "      水位 {} 帧 | 设备块 {} 帧({:.0} ms) | 漂移补偿 {:+.1} ppm | \
-             欠载 {} / 溢出 {} / 丢弃 {} 帧",
+            "      水位 {} 帧 | 设备块 {} 帧({:.0} ms) | 漂移补偿 {:+.1} ppm",
             d.queued_frames,
             s.device_frames,
             s.device_frames as f64 / rate.max(1) as f64 * 1000.0,
             d.drift_ppm,
+        );
+        // 流量:写进 / 读出环形缓冲的累计帧数。稳态下两者应该基本相等 ——
+        // 差得多就说明这一侧在丢数据,而「水位」是存量,看不出这件事。
+        //
+        // 这里不列「丢弃」:每流的丢弃计数没有任何来源(引擎真正丢帧记在
+        // 全引擎级的 `status.dropped_frames`,上面单独一行)。
+        println!(
+            "      写 {:.1}k / 读 {:.1}k 帧 | 欠载 {} / 溢出 {} 帧",
+            d.written_frames as f64 / 1000.0,
+            d.read_frames as f64 / 1000.0,
             d.underflow_frames,
             d.overflow_frames,
-            d.dropped_frames
         );
     }
 
@@ -514,8 +530,17 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 
     if missed_ratio > 0.02 {
         problems.push(format!(
-            "缓冲区交换次数比期望少 {:.1}%,说明音频回调有中断",
+            "缓冲区交换次数比期望少 {:.1}%:引擎没能按实时速度处理完,宿主每次请求\
+             都晚于标称周期",
             missed_ratio * 100.0
+        ));
+    }
+    if status.dropped_frames > 0 {
+        problems.push(format!(
+            "引擎丢掉 {} 帧({:.0} ms):时钟推进一轮要处理的缓冲数超过了上限,说明\
+             单个时钟周期里的工作量已经压满",
+            status.dropped_frames,
+            status.dropped_frames as f64 / rate.max(1) as f64 * 1000.0
         ));
     }
     if non_finite > 0 {

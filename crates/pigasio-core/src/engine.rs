@@ -334,7 +334,13 @@ impl OutputStreamRuntime {
         // `overflow_frames`,`update_drift` 会把它上报到共享统计里。这里**不**
         // 再 `fetch_add` 一次 —— 那既是重复计数,又会被随后的 `store` 覆盖,
         // 白白让这个数变得无法解释。
-        self.writer.write_interleaved(&self.staging, usable);
+        let written = self.writer.write_interleaved(&self.staging, usable);
+        // 流量计数和输入侧的 `fill()` 对称:谁从 ring 里取走/送进去,就由谁记。
+        // 少这一行,输出流的「写」永远是 0 —— 和之前欠载计数器只上报一半
+        // 是同一类问题。
+        self.stats
+            .written_frames
+            .fetch_add(written as u64, Ordering::Relaxed);
     }
 
     /// 用静音把环形缓冲垫到目标水位。
@@ -399,12 +405,19 @@ struct AudioCore {
     running: bool,
     /// 已处理帧数。与 `Engine` 共享,`getSamplePosition()` 读它时不加锁。
     samples_processed: Arc<AtomicU64>,
-    /// 音频线程上攒下的「时钟推进落后」帧数。
+    /// 引擎跟不上时丢掉的帧数(**累计**),与 `Engine` 共享。
+    ///
+    /// 全引擎级的:丢的是"时钟推进的计数",不属于哪一条流,所以不进
+    /// `RingStats`,而是由 [`EngineStatus::dropped_frames`] 带出去。做成原子
+    /// 而不是核心里一个普通字段,是因为 `Engine::status()` 拿不到锁时也要能
+    /// 读到一个可信的值 —— 否则界面上的数字会在真值和 0 之间跳。
     ///
     /// **绝不在这里打印。** `log::warn!` 最终要落盘,而落盘是阻塞操作 ——
-    /// 调用它的却是实时音频线程,一次磁盘 I/O 就够让缓冲区欠载。所以这里
-    /// 只累加,等 `Engine::status()` 那条非实时路径来取走再打印。
-    drift_dropped: u64,
+    /// 调用它的却是实时音频线程,一次磁盘 I/O 就够让缓冲区欠载。这条路径
+    /// 只累加,由 `Engine::status()` 那条非实时路径落盘。
+    dropped_frames: Arc<AtomicU64>,
+    /// 上次落盘之后又攒了多少丢帧,供日志报"本次新增"。
+    dropped_since_log: u64,
 }
 
 impl AudioCore {
@@ -439,31 +452,49 @@ impl AudioCore {
             //
             // 只记数、**不打印** —— 这里跑在实时音频线程上,而打印要落盘。
             // 攒着交给 `Engine::status()` 那条非实时路径去说。
-            let dropped = self.accumulated / size;
-            self.accumulated %= size;
-            self.drift_dropped = self.drift_dropped.saturating_add(dropped as u64);
+            let (dropped, kept) = drop_excess_accumulated(self.accumulated, size);
+            self.accumulated = kept;
+            let dropped = dropped as u64;
+            self.dropped_frames.fetch_add(dropped, Ordering::Relaxed);
+            self.dropped_since_log = self.dropped_since_log.saturating_add(dropped);
         }
     }
 
-    /// 取走音频线程攒下的告警并打印。
+    /// 取走音频线程攒下的告警,**返回待打印的文字,不自己打印**。
+    ///
+    /// 调用方(`Engine::status`)必须拿着返回的字符串**出了锁再**落盘。这里
+    /// 早先是直接 `log::warn!` 的,而它跑在 `try_lock_for` 的守卫里 ——
+    /// 于是控制面板每 200 ms 查一次状态,一旦恰好有告警要打,锁就被按住
+    /// 一次磁盘 I/O 的时间,而音频线程正靠这把锁推进时钟:轻则时钟停一拍,
+    /// 重则设备回调抢不到锁、整块送静音(见输出回调里对 `try_lock` 的处理)。
+    ///
+    /// `format!` 的分配留在锁内是有意的:那是微秒级,而且告警本来就是低频
+    /// 事件,换来的是不必把计数器搬来搬去。
     ///
     /// **只能从非实时路径调用**(目前是 `Engine::status`)。读一次清零一次,
     /// 所以同一条告警不会反复刷屏。
-    fn report_audio_warnings(&mut self) {
-        if self.drift_dropped > 0 {
-            log::warn!(
-                "时钟推进落后,丢弃累计 {} 帧的计数(设备块与 ASIO 缓冲区不匹配?)",
-                self.drift_dropped
-            );
-            self.drift_dropped = 0;
+    fn take_audio_warnings(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.dropped_since_log > 0 {
+            out.push(format!(
+                "时钟推进落后,本次丢弃 {} 帧(累计 {} 帧;设备块与 ASIO 缓冲区不匹配?)",
+                self.dropped_since_log,
+                self.dropped_frames.load(Ordering::Relaxed),
+            ));
+            self.dropped_since_log = 0;
         }
         // 输入和输出是不同的类型,chain 不起来,分两趟走。
         for stream in self.inputs.iter() {
-            report_resample_failures(&stream.device_name, &stream.stats);
+            if let Some(msg) = take_resample_failures(&stream.device_name, &stream.stats) {
+                out.push(msg);
+            }
         }
         for stream in self.outputs.iter() {
-            report_resample_failures(&stream.device_name, &stream.stats);
+            if let Some(msg) = take_resample_failures(&stream.device_name, &stream.stats) {
+                out.push(msg);
+            }
         }
+        out
     }
 
     /// 一个完整的 ASIO 缓冲区周期:填输入 → 叫宿主 → 收输出 → 调漂移。
@@ -808,18 +839,19 @@ where
                     scratch.resize(ring_samples, 0.0);
                 }
 
-                // 读 ring 必须在锁内完成 —— ring 的生产者半端由时钟线程
-                // 通过 `AudioCore` 访问。
-                let mut got = 0usize;
-                if let Some(core) = master_core.as_ref() {
-                    if let Some(mut core) = core.try_lock() {
-                        got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
-                        core.advance(frames);
-                    }
-                } else {
-                    // 从设备的 ring 只有我们自己碰,不需要锁。
-                    got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
-                }
+                // 先把本流自己的 ring 读出来 —— **不需要锁**。
+                //
+                // reader 半端由本回调独占;生产者半端只被 `advance()` 里的
+                // `drain()` 碰,而时钟推进就发生在这个回调里(`master_core`
+                // 那一支),所以两边其实是同一个线程。唯一的例外是启动时
+                // `prime_outputs()` 从控制线程写过一次,但那发生在输出设备
+                // 启动之前,不会有回调与它并发。
+                //
+                // 这里曾经整个包在 `try_lock` 里。代价是抢不到锁时这一整块
+                // 只能送静音,而且 `read_interleaved` 根本没被调用 —— 欠载
+                // 计数也不会增加,丢得无声无息。现在读和锁解耦,设备永远能
+                // 拿到 ring 里的数据,计数也永远准。
+                let got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
 
                 // 这一侧的欠载只能在这里上报。ring 的消费者半端就在本回调手里,
                 // 它的计数除了这里没有第二个人能读走 —— `OutputStreamRuntime`
@@ -829,6 +861,17 @@ where
                 stats
                     .underflow_frames
                     .store(reader.underflow_frames(), Ordering::Relaxed);
+                // 流量计数同样和输入侧对称:从 ring 里取走多少就在这里记多少。
+                stats.read_frames.fetch_add(got as u64, Ordering::Relaxed);
+
+                // 时钟推进要碰所有流的另一半端,这才需要锁。抢不到就跳过这
+                // 一拍:数据没丢(上面已经读到手了),只是引擎时钟停一拍,
+                // 下一次回调会把欠的那部分一起补上。
+                if let Some(core) = master_core.as_ref() {
+                    if let Some(mut core) = core.try_lock() {
+                        core.advance(frames);
+                    }
+                }
 
                 // 格式转换放在锁外,尽量缩短持锁时间。
                 for s in data.iter_mut() {
@@ -1059,6 +1102,12 @@ pub struct EngineStatus {
     pub output_channels: usize,
     pub running: bool,
     pub sample_position: u64,
+    /// 引擎跟不上、被丢掉的**累计帧数**。全引擎级,不属于哪一条流。
+    ///
+    /// 它和逐流的「欠载 / 溢出」是两码事:那两个量的是某条流自己的环形缓冲,
+    /// 这个量的是时钟推进本身 —— `MAX_BUFFERS_PER_ADVANCE` 那一轮没处理完、
+    /// 只能把多余累积丢掉的部分。正常情况恒为 0。
+    pub dropped_frames: u64,
     pub streams: Vec<StreamInfo>,
     pub stream_stats: Vec<StreamStatusSnapshot>,
 }
@@ -1078,6 +1127,8 @@ pub struct Engine {
     running: Arc<AtomicBool>,
     /// `getSamplePosition()` 会用到,由音频回调更新,读取不加锁。
     samples_processed: Arc<AtomicU64>,
+    /// 引擎跟不上时丢掉的累计帧数,由音频回调更新。见 `AudioCore::dropped_frames`。
+    dropped_frames: Arc<AtomicU64>,
     stream_infos: Vec<StreamInfo>,
     /// 每个 ASIO 通道的显示名,构造时一次算好。
     channel_names: ChannelNames,
@@ -1186,6 +1237,7 @@ impl Engine {
         let channel_names = ChannelNames::build(&config, &stream_infos);
 
         let samples_processed = Arc::new(AtomicU64::new(0));
+        let dropped_frames = Arc::new(AtomicU64::new(0));
 
         Ok(Engine {
             sample_rate: config.sample_rate,
@@ -1199,7 +1251,8 @@ impl Engine {
                 sample_rate: config.sample_rate as f64,
                 running: false,
                 samples_processed: Arc::clone(&samples_processed),
-                drift_dropped: 0,
+                dropped_frames: Arc::clone(&dropped_frames),
+                dropped_since_log: 0,
             })),
             host: None,
             buffer_size,
@@ -1207,6 +1260,7 @@ impl Engine {
             output_channel_count,
             running: Arc::new(AtomicBool::new(false)),
             samples_processed,
+            dropped_frames,
             stream_error: Arc::new(AtomicBool::new(false)),
             prepared: Arc::new(AtomicBool::new(false)),
             device_frames_per_stream: Vec::new(),
@@ -1653,16 +1707,21 @@ impl Engine {
     /// 撞上的概率高得离谱。等一小会儿是划算的 —— 界面晚 20 ms 拿到数据,
     /// 总好过一直拿不到。
     pub fn status(&self) -> EngineStatus {
-        let (mut stream_stats, live) = match self.core.try_lock_for(STATUS_LOCK_TIMEOUT) {
+        let (mut stream_stats, warnings, live) = match self.core.try_lock_for(STATUS_LOCK_TIMEOUT) {
             Some(mut core) => {
                 let stats = core.status_rows();
-                // 顺手把音频线程攒下的告警取走打印 —— 这是非实时路径,
-                // 在这里落盘不会伤到音频。见 `AudioCore::report_audio_warnings`。
-                core.report_audio_warnings();
-                (stats, true)
+                // 只**取数**,不打印 —— 见下。
+                let warnings = core.take_audio_warnings();
+                (stats, warnings, true)
             }
-            None => (Vec::new(), false),
+            None => (Vec::new(), Vec::new(), false),
         };
+        // 落盘放在锁外。`log::warn!` 是阻塞的,而音频线程正靠这把锁推进时钟
+        // —— 在锁内打印等于让磁盘 I/O 去和实时线程抢锁。上面那句
+        // `try_lock_for(20ms)` 之所以要等 20 ms,也是同一件事的另一面。
+        for warning in &warnings {
+            log::warn!("{warning}");
+        }
         if !live {
             log::debug!("状态查询时音频核心正忙,本次只返回静态信息");
         }
@@ -1686,6 +1745,9 @@ impl Engine {
             output_channels: self.output_channel_count,
             running: self.running.load(Ordering::Acquire),
             sample_position: self.sample_position(),
+            // 原子读,和上面那笔锁无关 —— 拿不到锁时也能给出真实值,
+            // 界面上的丢帧数不会在真值和 0 之间跳。
+            dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
             streams: self.stream_infos.clone(),
             stream_stats,
         }
@@ -1753,14 +1815,26 @@ fn target_watermark_frames(sample_rate: u32, watermark_ms: f64) -> usize {
     ((sample_rate as f64 * watermark_ms / 1000.0).round() as usize).max(1)
 }
 
-/// 取走某条流攒下的重采样失败计数并打印。
+/// 一轮 `advance` 处理不完时,把超出的累计帧数丢掉,返回 (丢掉的帧数, 保留的余数)。
 ///
-/// 和 [`AudioCore::report_audio_warnings`] 一样,只能从非实时路径调用。
-fn report_resample_failures(device_name: &str, stats: &RingStats) {
+/// 单位必须是**帧**。`accumulated` 是帧,除以缓冲区大小得到的是"多少个
+/// ASIO 缓冲区",这两个数差着一个 `buffer_size` 的因子 —— 早先直接把那个商
+/// 当帧数记了,于是日志写成"丢弃累计 3 帧",而实际丢掉的是 3 × 1024 = 3072 帧。
+///
+/// 余数(`< size` 的那部分)不算丢:它下次还能凑成整块,留着才是对的。
+fn drop_excess_accumulated(accumulated: usize, size: usize) -> (usize, usize) {
+    debug_assert!(size > 0, "缓冲区大小不可能为 0,除之前先确认");
+    let buffers = accumulated / size;
+    (buffers * size, accumulated % size)
+}
+
+/// 取走某条流攒下的重采样失败计数,拼成待打印的文字。
+///
+/// 和 [`AudioCore::take_audio_warnings`] 一样,只取数不打印 —— 调用方要拿着
+/// 返回的字符串出锁之后再落盘。只能从非实时路径调用。
+fn take_resample_failures(device_name: &str, stats: &RingStats) -> Option<String> {
     let failures = stats.resample_failures.swap(0, Ordering::Relaxed);
-    if failures > 0 {
-        log::warn!("设备 “{device_name}” 重采样失败 {failures} 次");
-    }
+    (failures > 0).then(|| format!("设备 “{device_name}” 重采样失败 {failures} 次"))
 }
 
 /// 与设备协商出一个可用的流配置。
@@ -1894,6 +1968,20 @@ mod tests {
         // 极端值兜底:至少留一帧,不能让下游一帧数据都拿不到。
         assert_eq!(target_watermark_frames(48_000, 0.0), 1);
         assert_eq!(target_watermark_frames(0, 30.0), 1);
+    }
+
+    #[test]
+    fn 丢帧计数按帧而不是按缓冲区个数() {
+        // 1024 帧的缓冲区、累计 3072 帧:丢掉 3 整块 = 3072 帧,不留余数。
+        assert_eq!(drop_excess_accumulated(3072, 1024), (3072, 0));
+        // 早先的写法会把「3 个缓冲区」当成「3 帧」记下来 —— 差 1024 倍。
+        assert_ne!(drop_excess_accumulated(3072, 1024).0, 3);
+
+        // 不足一块的余数不算丢:下次还能凑成整块。
+        assert_eq!(drop_excess_accumulated(2500, 1024), (2048, 452));
+        assert_eq!(drop_excess_accumulated(1023, 1024), (0, 1023));
+        // 刚好一块:整块都要丢,余数为 0(边界不能落到"保留一整块"那边去)。
+        assert_eq!(drop_excess_accumulated(1024, 1024), (1024, 0));
     }
 
     #[test]
