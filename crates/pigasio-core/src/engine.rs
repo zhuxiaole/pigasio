@@ -1140,7 +1140,7 @@ impl Engine {
                 reader,
                 resampler,
                 drift: DriftController::new(
-                    (chunk as f64 * engine_cfg.buffer_watermark) as usize,
+                    target_watermark_frames(chunk, engine_cfg.buffer_watermark, sample_rate),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1199,7 +1199,7 @@ impl Engine {
                 writer,
                 resampler,
                 drift: DriftController::new(
-                    (chunk as f64 * engine_cfg.buffer_watermark) as usize,
+                    target_watermark_frames(chunk, engine_cfg.buffer_watermark, sample_rate),
                     engine_cfg.max_drift_ppm,
                     engine_cfg.drift_correction,
                 ),
@@ -1488,6 +1488,43 @@ fn ring_capacity(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
     by_watermark.max(by_time).max(chunk * 4).max(1)
 }
 
+/// 计算每个流的目标水位,单位帧。
+///
+/// 配置里给的是「多少个 ASIO 缓冲区」,但那个单位在**小缓冲区**下会失效 ——
+/// 水位的真正意义是「能撑住多久」,而 `chunk × watermark` 是绝对时间:
+///
+/// | buffer_size | watermark | 实际水位 |
+/// |---|---|---|
+/// | 1024 | 3.0 | 3072 帧 = 64 ms(充裕) |
+/// | 256 | 3.0 | 768 帧 = **16 ms**(不足) |
+///
+/// 16 ms 为什么不够:采集设备的回调周期可能接近甚至超过 20 ms,而宿主
+/// 每 5.3 ms 就来要一次数据。连续几次读取之间设备一次都没回调,环形缓冲
+/// 就空了,于是欠载。
+///
+/// **只有输入方向会这样** —— 输出方向 ASIO 是生产者,总是能填满缓冲区,
+/// 设备来得晚只会让它读到旧数据。输入方向 ASIO 是消费者,设备不送数据
+/// 就只能补静音。这个不对称是多设备驱动里最容易忽略的一点。
+///
+/// 所以这里再兜一个绝对时间的下限。在这台机器上实测(`chunk=256`,
+/// 48 kHz,五块设备)的临界点:
+///
+/// | 水位 | 结果 |
+/// |---|---|
+/// | 16 ms(768 帧) | 两个麦克风都欠载 255 帧 |
+/// | 20 ms(960 帧) | 一只麦克风好了,另一只仍欠载 |
+/// | 30 ms(1440 帧) | **全部归零** |
+///
+/// 取下限 30 ms,给回调周期留足余量。
+fn target_watermark_frames(chunk: usize, watermark: f64, sample_rate: u32) -> usize {
+    /// 目标水位不得低于这么多秒的数据。
+    const MIN_WATERMARK_SECONDS: f64 = 0.03;
+
+    let by_ratio = chunk as f64 * watermark;
+    let by_time = sample_rate as f64 * MIN_WATERMARK_SECONDS;
+    by_ratio.max(by_time).round() as usize
+}
+
 /// 与设备协商出一个可用的流配置。
 ///
 /// 优先找**原生 f32** 格式:那是 Windows 音频引擎内部用的格式,共享模式
@@ -1597,6 +1634,26 @@ mod tests {
 
         let c = ring_capacity(8192, 2.0, 48_000);
         assert!(c >= 8192 * 4);
+    }
+
+    #[test]
+    fn 小缓冲区下的目标水位由绝对时间兜底() {
+        // 这是"试运行显示欠载"那个问题的回归测试。
+        // 256 帧 @ 48 kHz 配 3.0 只有 16 ms,实测会欠载;应当被抬到 20 ms 以上。
+        let frames = target_watermark_frames(256, 3.0, 48_000);
+        assert!(
+            frames >= 1440,
+            "目标水位只有 {frames} 帧(约 {:.1} ms),不足 30 ms 的下限",
+            frames as f64 / 48_000.0 * 1000.0
+        );
+    }
+
+    #[test]
+    fn 正常缓冲区下目标水位仍按用户给的倍数() {
+        // 1024 帧配 3.0 是 64 ms,远高于下限,不该被改动。
+        assert_eq!(target_watermark_frames(1024, 3.0, 48_000), 3072);
+        // 用户主动调大时也不能被下限"拉低"。
+        assert_eq!(target_watermark_frames(1024, 6.0, 48_000), 6144);
     }
 
     #[test]
