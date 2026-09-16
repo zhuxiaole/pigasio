@@ -1497,12 +1497,15 @@ impl eframe::App for App {
                                 ui.set_max_width(w);
                                 // 标题画在滚动区外面,只有列表本体滚动。
                                 self.draw_streams_header(ui, StreamKind::Input);
-                                egui::ScrollArea::vertical()
+                                let chosen = egui::ScrollArea::vertical()
                                     .id_salt("inputs_scroll")
                                     .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        self.draw_streams(ui, StreamKind::Input);
-                                    });
+                                    .show(ui, |ui| self.draw_streams(ui, StreamKind::Input))
+                                    .inner;
+                                // 勾了新的时钟主:两个方向里只留这一个。
+                                if let Some(i) = chosen {
+                                    self.enforce_single_clock_master((StreamKind::Input, i));
+                                }
                             });
                         },
                     );
@@ -1524,12 +1527,14 @@ impl eframe::App for App {
                                 ui.set_max_width(w);
                                 // 同上:标题钉在滚动区外面。
                                 self.draw_streams_header(ui, StreamKind::Output);
-                                egui::ScrollArea::vertical()
+                                let chosen = egui::ScrollArea::vertical()
                                     .id_salt("outputs_scroll")
                                     .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        self.draw_streams(ui, StreamKind::Output);
-                                    });
+                                    .show(ui, |ui| self.draw_streams(ui, StreamKind::Output))
+                                    .inner;
+                                if let Some(i) = chosen {
+                                    self.enforce_single_clock_master((StreamKind::Output, i));
+                                }
                             });
                         },
                     );
@@ -1807,7 +1812,7 @@ impl App {
 
     /// 设备列表本体。标题由调用方先画(见 [`Self::draw_streams_header`]),
     /// 这一部分才放进滚动区。
-    fn draw_streams(&mut self, ui: &mut egui::Ui, kind: StreamKind) {
+    fn draw_streams(&mut self, ui: &mut egui::Ui, kind: StreamKind) -> Option<usize> {
         let is_input = kind == StreamKind::Input;
         let device_names = if is_input {
             self.input_devices.clone()
@@ -1951,15 +1956,9 @@ impl App {
             ui.add_space(4.0);
         }
 
-        // 单选语义:选中了新的主设备就把其他的清掉。放在循环外做,
-        // 避免在遍历 `streams` 时再次可变借用它。
-        if let Some(chosen) = new_clock_master {
-            for (j, other) in streams.iter_mut().enumerate() {
-                if j != chosen {
-                    other.clock_master = false;
-                }
-            }
-        }
+        // 时钟主的单选**不在这里做**:本方向和另一方向的列表得一起清,而
+        // `streams` 的借用要到函数尾才算结束,中途再借另一个方向借不动。
+        // 把选择返回给调用方,由 [`Self::enforce_single_clock_master`] 统一处理。
 
         if let Some(i) = remove {
             streams.remove(i);
@@ -1973,6 +1972,22 @@ impl App {
                 ))
                 .weak(),
             );
+        }
+        new_clock_master
+    }
+
+    /// 强制「时钟主设备」全局唯一:只保留 `keep` 指定的那一个,两个方向里
+    /// 其余的勾全部清掉。
+    ///
+    /// 时钟主是整个引擎唯一的时间基准。这里曾经只清本方向的勾 —— 在输入方向
+    /// 选一个、输出方向再选一个,就能构造出两个主设备,配置校验会直接拒绝
+    /// (「只能有一个」),用户却看不出冲突在哪。
+    fn enforce_single_clock_master(&mut self, keep: (StreamKind, usize)) {
+        for (j, s) in self.inputs.iter_mut().enumerate() {
+            s.clock_master = keep == (StreamKind::Input, j);
+        }
+        for (j, s) in self.outputs.iter_mut().enumerate() {
+            s.clock_master = keep == (StreamKind::Output, j);
         }
     }
 
