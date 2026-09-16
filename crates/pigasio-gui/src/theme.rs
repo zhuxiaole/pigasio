@@ -618,6 +618,21 @@ mod regression_tests {
     }
 }
 
+/// 小节标题下面留出的空白。
+///
+/// 标题和正文贴在一起会糊成一片 —— 分不清哪行是标题、哪行是第一项内容。
+/// 特别是「引擎设置」这种标题后面紧跟 Grid 的情况:Grid 第一行的标签和标题
+/// 只隔默认行距,看着像同一段。
+pub const HEADING_GAP: f32 = 10.0;
+
+/// 小节标题:标题本身 + 下面那段固定留白。
+///
+/// 标题一律走这里,免得各处 `add_space()` 的值越改越散。
+pub fn section_heading(ui: &mut egui::Ui, text: impl Into<egui::RichText>) {
+    ui.heading(text);
+    ui.add_space(HEADING_GAP);
+}
+
 /// 画一条滑条,底槽用看得见的灰。
 ///
 /// egui 的滑条底槽固定取 `widgets.inactive.bg_fill`(见 `slider.rs` 里

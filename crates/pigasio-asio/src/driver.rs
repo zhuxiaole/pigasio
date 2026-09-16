@@ -477,8 +477,7 @@ unsafe extern "system" fn vt_get_latencies(
         //
         // 报大了只是让宿主的对齐补偿多留一点余量;报小了才会让录音对不齐,
         // 所以这里不做任何"乐观"的缩减。
-        let watermark =
-            engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
+        let watermark = engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
         let frames = (watermark.round() as i32).saturating_add(engine.buffer_size() as i32);
         unsafe {
             *input_latency = frames;

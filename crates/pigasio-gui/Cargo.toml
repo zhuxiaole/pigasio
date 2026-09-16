@@ -18,6 +18,7 @@ egui = "0.29"
 toml = { workspace = true }
 # 界面偏好(主题)单独存一份,见 `UiPrefs` 的说明。
 serde = { workspace = true }
+egui_extras = { version = "0.29", default-features = false }
 
 [build-dependencies]
 # 把 assets/pigasio.ico 编进 exe 的 Windows 资源(见 build.rs)。

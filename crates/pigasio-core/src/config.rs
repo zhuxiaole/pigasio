@@ -852,8 +852,7 @@ mod tests {
         assert_eq!(cfg.engine.watermark_ms, 8.0);
 
         // 默认缓冲区 1024 配 3.0 则是 64 ms。
-        let cfg =
-            Config::from_toml_str("[engine]\nbuffer_watermark = 3.0\n").unwrap();
+        let cfg = Config::from_toml_str("[engine]\nbuffer_watermark = 3.0\n").unwrap();
         assert_eq!(cfg.engine.watermark_ms, 64.0);
     }
 
@@ -864,7 +863,10 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("watermark_ms") && msg.contains("buffer_watermark"), "{msg}");
+        assert!(
+            msg.contains("watermark_ms") && msg.contains("buffer_watermark"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -872,7 +874,10 @@ mod tests {
         for bad in ["0.0", "-1.0", "5000.0", "nan"] {
             let text = format!("[engine]\nwatermark_ms = {bad}\n");
             match Config::from_toml_str(&text) {
-                Ok(cfg) => panic!("watermark_ms = {bad} 本该被拒绝,却解析出 {}", cfg.engine.watermark_ms),
+                Ok(cfg) => panic!(
+                    "watermark_ms = {bad} 本该被拒绝,却解析出 {}",
+                    cfg.engine.watermark_ms
+                ),
                 Err(e) => assert!(e.to_string().contains("watermark_ms"), "{bad}: {e}"),
             }
         }

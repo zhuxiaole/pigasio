@@ -1783,8 +1783,8 @@ fn check_duplicates_for(resolved: &[DeviceInfo], config: &Config, kind: StreamKi
 /// (水位附近要有调节余地,漂移补偿靠的就是在这里加减)、至少 0.25 秒、以及
 /// 至少四个 ASIO 缓冲区(一次 `advance` 至少要能整块进出)。
 fn ring_capacity(chunk: usize, watermark_ms: f64, sample_rate: u32) -> usize {
-    let by_watermark = (sample_rate as f64 * watermark_ms / 1000.0 * RING_CAPACITY_FACTOR).ceil()
-        as usize;
+    let by_watermark =
+        (sample_rate as f64 * watermark_ms / 1000.0 * RING_CAPACITY_FACTOR).ceil() as usize;
     let by_time = (sample_rate as f64 * RING_MIN_SECONDS).ceil() as usize;
     by_watermark.max(by_time).max(chunk * 4).max(1)
 }

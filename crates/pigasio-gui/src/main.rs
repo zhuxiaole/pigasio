@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use pigasio_core::config::{
     AsioSampleType, ChannelSelection, Config, DeviceRef, EngineConfig, ResampleQuality,
     StreamConfig, WasapiOptions,
@@ -1443,19 +1444,18 @@ impl eframe::App for App {
         // 更多空间;平时又可以压扁让设备列表占满。
         egui::TopBottomPanel::bottom("runner_panel")
             .resizable(true)
-            .default_height(180.0)
+            // 默认 300:9 条流配 22px 一行,180px 的高度只能看见表头和两三行,
+            // 每次试运行都得先拖一下。300 够放下表头加八九行,常态不用拖。
+            .default_height(300.0)
             .min_height(90.0)
-            .max_height(400.0)
+            .max_height(700.0)
             .show_separator_line(false)
             .frame(theme::panel_frame(ctx))
             .show(ctx, |ui| {
+                // 不再在外面套滚动区 —— 标题行由 `draw_runner_status` 自己
+                // 画在滚动区**外面**,否则流一多标题就跟着滚走了。
                 theme::panel_card(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("runner_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.draw_runner_status(ui);
-                        });
+                    self.draw_runner_status(ui);
                 });
             });
 
@@ -1495,6 +1495,8 @@ impl eframe::App for App {
                                 let w = ui.available_width();
                                 ui.set_min_width(w);
                                 ui.set_max_width(w);
+                                // 标题画在滚动区外面,只有列表本体滚动。
+                                self.draw_streams_header(ui, StreamKind::Input);
                                 egui::ScrollArea::vertical()
                                     .id_salt("inputs_scroll")
                                     .auto_shrink([false, false])
@@ -1520,6 +1522,8 @@ impl eframe::App for App {
                                 let w = ui.available_width();
                                 ui.set_min_width(w);
                                 ui.set_max_width(w);
+                                // 同上:标题钉在滚动区外面。
+                                self.draw_streams_header(ui, StreamKind::Output);
                                 egui::ScrollArea::vertical()
                                     .id_salt("outputs_scroll")
                                     .auto_shrink([false, false])
@@ -1556,7 +1560,7 @@ impl eframe::App for App {
 
 impl App {
     fn draw_engine_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("引擎设置");
+        theme::section_heading(ui, "引擎设置");
         let sample_rate = self.sample_rate;
 
         // 两栏并排。
@@ -1716,30 +1720,39 @@ impl App {
         // 设备回调周期还短」的地方 —— 这种配置必然欠载,而且原因很不直观:水位
         // 用自己的数字看着挺正常,实际却薄于设备一次回调的间隔。
         //
-        // 没运行过就没有实测值,那就只留上面滑动条提示里的经验值(10 ms 一块)。
-        // 放在 Grid 外面是为了让它按栏宽折行,不至于把表格撑宽。
+        // 这一行**永远渲染**:没实测值时也要占着一行。引擎设置钉在顶部的面板里,
+        // 面板高度跟着内容走 —— 提示时有时无,试运行一启动整块布局就会跳一下。
+        //
+        // 文字一律 `.truncate()` 截成单行:警告文案长了会折成两行,同样会让
+        // 面板高度随内容变化。完整的意思留给悬停提示。
         let block_frames = self
             .last_stats
             .iter()
             .map(|s| s.device_frames)
             .max()
             .unwrap_or(0);
-        if block_frames > 0 {
+        ui.add_space(6.0);
+        // 没实测值时**隐形占位**:不画任何东西,但留出和正文一行完全等高的空隙。
+        // 这一行时有时无的话,试运行一启动面板就被顶高,整块布局跟着跳。
+        // `text_style_height` 正是 Label 实际用的行高,量它而不是猜一个数。
+        let line = ui.text_style_height(&egui::TextStyle::Body);
+        if block_frames == 0 {
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), line), egui::Sense::hover());
+        } else {
             let sample_rate = self.sample_rate.max(1) as f64;
             let block_ms = block_frames as f64 / sample_rate * 1000.0;
-            ui.add_space(6.0);
             if self.watermark_ms < block_ms {
                 let label = ui.add(
                     egui::Label::new(
                         egui::RichText::new(format!(
-                            "⚠ 水位 {:.0} ms 比实测设备块 {block_ms:.0} ms({block_frames} 帧)\
-                             还薄 —— 余量不足一块设备缓冲,随时可能欠载,建议至少调到 {:.0} ms",
+                            "⚠ 水位 {:.0} ms 薄于实测设备块 {block_ms:.0} ms({block_frames} 帧),\
+                             建议至少 {:.0} ms",
                             self.watermark_ms,
                             (block_ms * 1.5).ceil(),
                         ))
                         .color(egui::Color32::from_rgb(220, 160, 60)),
                     )
-                    .wrap(),
+                    .truncate(),
                 );
                 label.on_hover_text(
                     "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频引擎\
@@ -1756,12 +1769,44 @@ impl App {
                         ))
                         .weak(),
                     )
-                    .wrap(),
+                    .truncate(),
                 );
             }
         }
     }
 
+    /// 设备列表的标题行。
+    ///
+    /// 单独拎出来是因为它必须画在**滚动区外面**:放在里面的话,设备一多
+    /// 标题就跟着滚没了,而"这张表是输入还是输出"是读它的前提。
+    fn draw_streams_header(&mut self, ui: &mut egui::Ui, kind: StreamKind) {
+        let is_input = kind == StreamKind::Input;
+        let count = if is_input {
+            self.inputs.len()
+        } else {
+            self.outputs.len()
+        };
+        ui.horizontal(|ui| {
+            ui.heading(format!("{}设备", kind.as_str()));
+            ui.label(egui::RichText::new(format!("共 {count} 路")).weak());
+            if ui.button("+ 添加").clicked() {
+                let edit = StreamEdit {
+                    clock_master: false,
+                    ..StreamEdit::default()
+                };
+                if is_input {
+                    self.inputs.push(edit);
+                } else {
+                    self.outputs.push(edit);
+                }
+            }
+        });
+        // 标题行整行都算标题的一部分,所以留白加在它后面。
+        ui.add_space(theme::HEADING_GAP);
+    }
+
+    /// 设备列表本体。标题由调用方先画(见 [`Self::draw_streams_header`]),
+    /// 这一部分才放进滚动区。
     fn draw_streams(&mut self, ui: &mut egui::Ui, kind: StreamKind) {
         let is_input = kind == StreamKind::Input;
         let device_names = if is_input {
@@ -1775,17 +1820,6 @@ impl App {
             &mut self.outputs
         };
         let mut remove: Option<usize> = None;
-
-        ui.horizontal(|ui| {
-            ui.heading(format!("{}设备", kind.as_str()));
-            ui.label(egui::RichText::new(format!("共 {} 路", streams.len())).weak());
-            if ui.button("+ 添加").clicked() {
-                streams.push(StreamEdit {
-                    clock_master: false,
-                    ..StreamEdit::default()
-                });
-            }
-        });
 
         // 逐条累加,算出每条流占用的 ASIO 通道区间。这是理解多设备
         // 通道映射最直观的方式,所以直接标在界面上。
@@ -1944,19 +1978,22 @@ impl App {
 
     fn draw_runner_status(&mut self, ui: &mut egui::Ui) {
         let Some(runner) = self.runner.as_ref() else {
-            ui.heading("实时状态");
-            if let Some(job) = self.runner_job.as_ref() {
-                ui.label(job.hint());
-            } else {
-                ui.label(
-                    egui::RichText::new(
-                        "点上面的「试运行」启动引擎,就能在这里看到各流的缓冲水位和\
-                         漂移补偿量。试运行不会发出声音,适合在打开 DAW 之前先确认\
-                         多设备是否同步。",
-                    )
-                    .weak(),
-                );
-            }
+            theme::section_heading(ui, "实时状态");
+            // 空闲时内容区同样要撑满 —— 见 `runner_scroll`。
+            runner_scroll(ui, |ui| {
+                if let Some(job) = self.runner_job.as_ref() {
+                    ui.label(job.hint());
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "点上面的「试运行」启动引擎,就能在这里看到各流的缓冲水位和\
+                             漂移补偿量。试运行不会发出声音,适合在打开 DAW 之前先确认\
+                             多设备是否同步。",
+                        )
+                        .weak(),
+                    );
+                }
+            });
             return;
         };
 
@@ -2003,6 +2040,9 @@ impl App {
             }
         });
 
+        // 内容区滚动的只是表格 —— 标题、峰值、表头一律钉住。
+        ui.add_space(theme::HEADING_GAP);
+
         if status.input_channels > 0 {
             // 数值放在条**外面**。
             //
@@ -2017,84 +2057,163 @@ impl App {
             });
         }
 
-        ui.add_space(4.0);
-        egui::Grid::new("runner_streams")
-            .num_columns(7)
-            .striped(true)
-            .spacing([14.0, 4.0])
-            .show(ui, |ui| {
+        // 表格本体:表头由 TableBuilder 画在同一套列模型里并钉在滚动区外,
+        // 表体滚动 —— 列对齐是框架保证的,不再需要手工钉宽度。
+        stream_table(ui, stats);
+    }
+}
+
+/// 实时状态的流统计表。
+///
+/// 用 [`TableBuilder`] 而不是 Grid:表头要**钉在滚动区外**,表体在里面滚 ——
+/// 用 Grid 就得画两个表、再靠手工钉列宽让它们对上。上一版就是这么写的,
+/// 结果表头和表体错位:两个 Grid 各算各的列宽,滚动条占位、内容宽度,任何
+/// 一处差一点就歪。Table 的表头和表体在**同一套列模型**里量出来,对齐是
+/// 框架保证的,列还能拖。
+fn stream_table(ui: &mut egui::Ui, stats: &[StreamStatusSnapshot]) {
+    TableBuilder::new(ui)
+        .id_salt("runner_streams")
+        .striped(true)
+        .vscroll(true)
+        .auto_shrink([false, false])
+        // 滚动表格默认带 200px 的最小高度。不关掉的话,试运行一启动表格就
+        // 把「实时状态」面板顶到 ~300px,而且 90..300 之间的拖动全被这股
+        // 最小高度顶回去 —— 面板高度该由用户拖分界线决定,内容只负责填满。
+        .min_scrolled_height(0.0)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .header(22.0, |mut header| {
+            header.col(|ui| {
                 ui.strong("方向");
+            });
+            header.col(|ui| {
                 ui.strong("设备");
+            });
+            header.col(|ui| {
                 ui.strong("水位(帧)");
+            });
+            header.col(|ui| {
                 // 设备侧的真实块大小,逐流列出 —— 汇总成一个数看不出是谁慢。
                 ui.strong("块(帧)").on_hover_text(
                     "这块声卡的回调实际每块送来多少帧。它是量出来的,由系统\
-                         音频引擎决定,和我们报给 ASIO 宿主的「缓冲区」不是一回事。\
-                         整条链路的水位得能装下最大的一块,所以这个数最大的那条\
-                         设备决定了延迟下限。",
+                     音频引擎决定,和我们报给 ASIO 宿主的「缓冲区」不是一回事。\
+                     整条链路的水位得能装下最大的一块,所以这个数最大的那条\
+                     设备决定了延迟下限。",
                 );
+            });
+            header.col(|ui| {
                 ui.strong("漂移(ppm)");
+            });
+            header.col(|ui| {
                 // 累计写进 ring / 读走的帧数。存量(水位)只能说明"满了",
                 // 这两个才能指出是生产太快还是消费太慢 —— 盯着看几秒,跑在前
                 // 面的那一侧就是问题所在。
                 ui.strong("写/读(k帧)").on_hover_text(
                     "累计写进环形缓冲、和从环形缓冲读走的帧数(单位千帧)。\
-                         正常时两者同步增长;若「写」持续跑在前面,说明生产快于消费,\
-                         缓冲会一路积到容量上限。\n\n\
-                         两侧分别由持有那一半端的线程记数:输入方向是设备写、ASIO 读,\
-                         输出方向反过来。",
+                     正常时两者同步增长;若「写」持续跑在前面,说明生产快于消费,\
+                     缓冲会一路积到容量上限。\n\n\
+                     两侧分别由持有那一半端的线程记数:输入方向是设备写、ASIO 读,\
+                     输出方向反过来。",
                 );
+            });
+            header.col(|ui| {
                 ui.strong("状态");
-                ui.end_row();
-
-                for s in stats {
-                    let snap = &s.stats;
-                    ui.label(s.kind.as_str());
-                    // 标出时钟基准:它不做重采样,其余流都跟着它走。
-                    ui.horizontal(|ui| {
-                        ui.label(elide(&s.device_name, 34));
-                        if s.is_clock_master {
-                            ui.label(egui::RichText::new("· 主时钟").small().weak());
-                        }
+            });
+        })
+        .body(|mut body| {
+            if stats.is_empty() {
+                body.row(20.0, |mut row| {
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new("暂时读不到统计(音频回调正忙),稍后会自动刷新。")
+                                .weak(),
+                        );
                     });
-                    ui.label(snap.queued_frames.to_string());
-                    if s.device_frames > 0 {
-                        ui.label(s.device_frames.to_string());
-                    } else {
-                        ui.label("-");
-                    }
-                    ui.label(format!("{:+.0}", snap.drift_ppm));
-                    ui.label(format!(
-                        "{:.0}k/{:.0}k",
-                        snap.written_frames as f64 / 1000.0,
-                        snap.read_frames as f64 / 1000.0
-                    ));
-                    if snap.is_healthy() {
-                        ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
-                    } else {
-                        // 欠载几乎总是水位不够厚,而水位现在完全由用户说了算,
-                        // 所以直接把调整方向写在这儿 —— 不然只能对着数字猜。
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 160, 60),
-                            format!(
-                                "欠载 {} / 溢出 {}",
-                                snap.underflow_frames, snap.overflow_frames
-                            ),
-                        )
-                        .on_hover_text(
-                            "欠载是环形缓冲被读空了 —— 水位不够厚。可以试着把\
+                });
+                return;
+            }
+            for s in stats {
+                let snap = &s.stats;
+                body.row(20.0, |mut row| {
+                    row.col(|ui| {
+                        ui.label(s.kind.as_str());
+                    });
+                    // 标出时钟基准:它不做重采样,其余流都跟着它走。
+                    row.col(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(elide(&s.device_name, 34));
+                            if s.is_clock_master {
+                                ui.label(egui::RichText::new("· 主时钟").small().weak());
+                            }
+                        });
+                    });
+                    row.col(|ui| {
+                        ui.label(snap.queued_frames.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(if s.device_frames > 0 {
+                            s.device_frames.to_string()
+                        } else {
+                            "-".into()
+                        });
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{:+.0}", snap.drift_ppm));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!(
+                            "{:.0}k/{:.0}k",
+                            snap.written_frames as f64 / 1000.0,
+                            snap.read_frames as f64 / 1000.0
+                        ));
+                    });
+                    row.col(|ui| {
+                        if snap.is_healthy() {
+                            ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
+                        } else {
+                            // 欠载几乎总是水位不够厚,而水位现在完全由用户说了算,
+                            // 所以直接把调整方向写在这儿 —— 不然只能对着数字猜。
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 160, 60),
+                                format!(
+                                    "欠载 {} / 溢出 {}",
+                                    snap.underflow_frames, snap.overflow_frames
+                                ),
+                            )
+                            .on_hover_text(
+                                "欠载是环形缓冲被读空了 —— 水位不够厚。可以试着把\
                                  「缓冲目标水位」调大;溢出的方向相反,那是水位偏大\
                                  或设备时钟偏慢。",
-                        );
-                    }
-                    ui.end_row();
-                }
-            });
+                            );
+                        }
+                    });
+                });
+            }
+        });
+}
 
-        if stats.is_empty() {
-            ui.label(egui::RichText::new("暂时读不到统计(音频回调正忙),稍后会自动刷新。").weak());
-        }
-    }
+/// 「实时状态」的内容区。
+///
+/// 刻意做成自由函数而不是方法:它不能碰 `self`。调用方常常正拿着
+/// `self.runner` / `self.last_stats` 的借用当参数传进来,再借一次 `self`
+/// 会打架。
+///
+/// `auto_shrink([false, false])` 是这里的重点:内容区**始终占满面板剩下的
+/// 高度**,里面有没有东西都占着。先前它只在"引擎在跑"那条分支里创建,于是
+/// 空闲时整块区域缩成标题那么高,面板里空出一大片 —— 而这块区域的默认高度
+/// 正是用户拖动分界线时看到的基准。
+fn runner_scroll<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::ScrollArea::vertical()
+        .id_salt("runner_scroll")
+        .auto_shrink([false, false])
+        .show(ui, body)
+        .inner
 }
 
 /// 缓冲区大小可选值,单位采样帧。
