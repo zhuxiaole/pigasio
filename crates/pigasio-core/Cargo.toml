@@ -15,5 +15,4 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 rtrb = { workspace = true }
 log = { workspace = true }
-regex = { workspace = true }
 audio_thread_priority = { workspace = true }

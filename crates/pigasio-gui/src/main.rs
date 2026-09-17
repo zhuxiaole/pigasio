@@ -620,7 +620,6 @@ impl StreamEdit {
             DeviceRef::Default => (String::new(), true),
             DeviceRef::None => (NO_DEVICE.to_string(), false),
             DeviceRef::Substring(s) => (s.clone(), false),
-            DeviceRef::Regex(r) => (format!("/{r}/"), false),
         };
         let (channel_mode, channel_count, channels_text) = match &cfg.channels {
             ChannelSelection::Count(n) => (ChannelMode::Count, *n, "0, 1".to_string()),
@@ -1190,9 +1189,6 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
                 DeviceRef::None => out.push_str("device = \"none\"\n"),
                 DeviceRef::Substring(name) => {
                     let _ = writeln!(out, "device = {}", toml_string(name));
-                }
-                DeviceRef::Regex(r) => {
-                    let _ = writeln!(out, "device_regex = {}", toml_string(r));
                 }
             }
             match &s.channels {

@@ -1830,7 +1830,6 @@ dependencies = [
  "cpal",
  "log",
  "parking_lot",
- "regex",
  "rtrb",
  "rubato",
  "serde",

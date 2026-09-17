@@ -133,7 +133,6 @@ pub fn default_device(kind: StreamKind) -> Result<DeviceInfo> {
 /// 匹配规则(与 FlexASIO 的语义保持一致):
 /// * `Default` —— 系统默认设备;
 /// * `Substring` —— 名字包含该片段,忽略大小写;
-/// * `Regex` —— 名字匹配该正则(部分匹配);
 /// * `None` —— 调用方应该在调用前过滤掉,这里会返回错误。
 ///
 /// 匹配到多个设备时取第一个并记一条警告 —— 宁可可用也不要因为歧义
@@ -154,17 +153,6 @@ pub fn resolve(reference: &DeviceRef, kind: StreamKind) -> Result<DeviceInfo> {
                 .cloned()
                 .collect();
             pick(&matches, needle, kind, &candidates)
-        }
-        DeviceRef::Regex(pattern) => {
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| Error::Config(format!("无效的设备正则 “{pattern}”:{e}")))?;
-            let candidates = enumerate(kind)?;
-            let matches: Vec<_> = candidates
-                .iter()
-                .filter(|d| re.is_match(&d.name))
-                .cloned()
-                .collect();
-            pick(&matches, pattern, kind, &candidates)
         }
     }
 }

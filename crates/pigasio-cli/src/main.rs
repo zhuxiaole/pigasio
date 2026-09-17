@@ -93,8 +93,7 @@ fn cmd_devices() -> Result<(), String> {
     let listing = pigasio_core::devices::describe_all().map_err(|e| format!("枚举设备失败:{e}"))?;
     print!("{listing}");
 
-    println!("提示:在 PigASIO.toml 里用 device = \"名字的一部分\" 来指定设备,");
-    println!("      也可以用 device_regex 做正则匹配。");
+    println!("提示:在 PigASIO.toml 里用 device = \"名字的一部分\" 来指定设备。");
     Ok(())
 }
 
@@ -195,7 +194,6 @@ channel_count = 2
 #
 # [[input]]
 # device = "USB Audio"
-# device_regex = "^麦克风"    # 与 device 二选一,正则匹配设备名
 # channels = [2, 3]          # 挑该声卡上特定的两个物理输入
 # gain_db = 6.0              # 提升 6 dB
 

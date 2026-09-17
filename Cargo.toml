@@ -20,7 +20,6 @@ thiserror = "1"
 parking_lot = "0.12"
 rtrb = "0.3"
 log = "0.4"
-regex = "1"
 # 把音频回调线程提升到实时优先级(Windows 上走 MMCSS 的 "Pro Audio")。
 audio_thread_priority = "0.37"
 

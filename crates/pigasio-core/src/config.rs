@@ -133,9 +133,10 @@ pub enum DeviceRef {
     /// 显式声明不使用该方向的设备。
     None,
     /// 名字包含该子串的设备,大小写不敏感。
+    ///
+    /// 这是唯一的「按名字找设备」方式 —— 正则匹配已经移除。原因见下方
+    /// `RawStream::finish` 的说明。
     Substring(String),
-    /// 名字匹配该正则表达式的设备。
-    Regex(String),
 }
 
 impl fmt::Display for DeviceRef {
@@ -144,7 +145,6 @@ impl fmt::Display for DeviceRef {
             DeviceRef::Default => f.write_str("default"),
             DeviceRef::None => f.write_str("none"),
             DeviceRef::Substring(s) => write!(f, "{s}"),
-            DeviceRef::Regex(r) => write!(f, "/{r}/"),
         }
     }
 }
@@ -469,10 +469,6 @@ impl Config {
                 if !s.gain_db.is_finite() {
                     return Err(Error::Config(format!("{label} 的 gain_db 不是有限数值")));
                 }
-                if let DeviceRef::Regex(pattern) = &s.device {
-                    regex::Regex::new(pattern)
-                        .map_err(|e| Error::Config(format!("{label} 的 device_regex 无效:{e}")))?;
-                }
             }
         }
 
@@ -566,7 +562,6 @@ struct RawEngine {
 #[serde(deny_unknown_fields)]
 struct RawStream {
     device: Option<String>,
-    device_regex: Option<String>,
 
     channels: Option<RawChannels>,
     channel_count: Option<usize>,
@@ -697,7 +692,6 @@ impl RawStream {
     fn clone(&self) -> Self {
         RawStream {
             device: self.device.clone(),
-            device_regex: self.device_regex.clone(),
             channels: self.channels.as_ref().map(|c| match c {
                 RawChannels::Count(n) => RawChannels::Count(*n),
                 RawChannels::List(v) => RawChannels::List(v.clone()),
@@ -715,23 +709,18 @@ impl RawStream {
     }
 
     fn finish(self, kind: StreamKind) -> Result<StreamConfig> {
-        let device = match (self.device.as_deref(), self.device_regex.as_deref()) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Config(
-                    "同一个设备条目里不能同时写 device 和 device_regex".into(),
-                ))
-            }
-            (None, Some(pattern)) => {
-                regex::Regex::new(pattern)
-                    .map_err(|e| Error::Config(format!("device_regex “{pattern}” 无效:{e}")))?;
-                DeviceRef::Regex(pattern.to_string())
-            }
-            (Some(name), None) => match name.trim().to_ascii_lowercase().as_str() {
+        // `device` 是唯一的设备选择字段。早先还有一个 `device_regex`
+        // 与它二选一,但控制面板只认识字符串:载入时把正则渲染成
+        // `"^麦克风"`,保存时又当成普通子串写回去,匹配语义被悄悄换掉,
+        // 用户直到设备打不开才发现。与其维护一个两边对不齐的功能,
+        // 不如只留子串匹配 —— 多设备场景里它够用,而且行为可预期。
+        let device = match self.device.as_deref() {
+            Some(name) => match name.trim().to_ascii_lowercase().as_str() {
                 "default" | "" => DeviceRef::Default,
                 "none" | "null" | "disabled" => DeviceRef::None,
                 _ => DeviceRef::Substring(name.to_string()),
             },
-            (None, None) => DeviceRef::Default,
+            None => DeviceRef::Default,
         };
 
         let channels = match (self.channels, self.channel_count) {

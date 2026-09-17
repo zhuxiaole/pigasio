@@ -241,7 +241,7 @@ device = "麦克风 (AB13X"
 channel_count = 1              # 单声道麦克风
 
 [[input]]
-device_regex = "^Line 1"       # 也可以用正则匹配
+device = "Line 1"              # 子串匹配,忽略大小写
 channels = [0, 1]
 ```
 
@@ -269,12 +269,17 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `engine.watermark_ms` | `30.0` | 缓冲目标水位,**单位毫秒**;直接加在延迟上 |
 | `engine.use_non_ascii_channel_names` | `true` | 通道名是否允许中文;显示乱码时设为 `false` |
 | `[[input]]` / `[[output]].device` | `"default"` | 设备名片段;`"default"` 用系统默认设备,`"none"` 禁用 |
-| `...device_regex` | — | 与 `device` 二选一,正则匹配设备名 |
 | `...channels` | — | 指定通道,如 `[0, 3]` |
 | `...channel_count` | `2` | 取前 N 个通道;与 `channels` 二选一 |
 | `...gain_db` | `0.0` | 该设备所有通道的增益 |
 | `...latency` | — | 建议延迟(秒) |
 | `...clock_master` | `false` | 是否作为时钟主设备,全配置最多一个 |
+
+> **`device_regex` 已移除。** 设备只能用 `device` 做名字子串匹配(忽略
+> 大小写)。早先支持正则,但控制面板在配置往返时会把正则渲染成普通字符串
+> 再写回文件,匹配语义被悄悄换掉 —— 用户直到设备打不开才发现。与其维护
+> 一个两边对不齐的功能,不如只留行为可预期的子串匹配。含 `device_regex`
+> 的旧配置现在会因未知字段而报错,删掉该行、改用 `device` 即可。
 
 ## 命令行工具
 
