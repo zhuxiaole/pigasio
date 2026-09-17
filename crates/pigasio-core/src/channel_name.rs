@@ -38,14 +38,19 @@ const NAME_BUDGET: usize = 31;
 
 /// 标签部分的字节预算(即去掉 `OUT 12 (` 和 `)` 之后剩下多少)。
 ///
-/// 前缀最坏情况是双位通道号:`OUT 12 (` 是 8 字节,加收尾的 `)` 共 9 字节。
-/// 31 - 9 = 22。
+/// 前缀长度取决于通道号的位数,而 ASIO 通道总数在多设备下可能上百,所以
+/// 按四位通道号留足:`OUT 9999 (` 是 10 字节,加收尾的 `)` 共 11。
+/// 31 - 11 = 20。
+///
+/// 这只是**预分配**,用来保证标签在分级去重时不会被截得太狠;真正写出去
+/// 之前 [`build_for`] 还会按实际前缀再截一次,所以哪怕通道号超过四位,
+/// 也不会生成超过 ASIO 上限的名字。
 ///
 /// 早先的实现按**字符数**限制(18 个字符),那对纯 ASCII 名字是浪费
 /// —— 18 个字符只占 18 字节,明明还能再放 4 个;对中文名字又可能超,
 /// 因为一个汉字在 GBK 下是 2 字节,18 个汉字要 36 字节。按字节算才对得上
 /// ASIO 真正的约束。
-const LABEL_BUDGET: usize = NAME_BUDGET - 9;
+const LABEL_BUDGET: usize = NAME_BUDGET - 11;
 
 /// 一个字符在 UTF-8 下占几个字节:ASCII 1 个,汉字 3 个,再往上的符号 4 个。
 ///
@@ -148,10 +153,17 @@ fn build_for(kind: StreamKind, streams: &[StreamInfo], allow_non_ascii: bool) ->
     let mut names = Vec::new();
     for (device, label) in devices.iter().zip(labels.iter()) {
         for local in 0..device.channel_count {
-            let name = format!("{prefix} {} ({label})", local + 1);
-            // 开发期保险:名字必须放得进 ASIO 的字节预算。真超了会被
-            // `set_name` 那层截断,而那里可能把一个汉字切成两半 ——
-            // 与其让用户在机架里看到乱码,不如在测试里就炸出来。
+            // 前缀长度随通道号位数变化(`OUT 9 (` 比 `OUT 10 (` 短一字节),
+            // 所以按**实际**前缀再截一次标签。`labels_for` 用的是四位数的
+            // 保守预算,这一步则保证不管通道号多少位,写出去的名字都不会
+            // 超过 ASIO 的 31 字节 —— 超了会被 `set_name` 截断,那会把结尾
+            // 的 `)` 削掉。
+            let head = format!("{prefix} {} (", local + 1);
+            let budget = NAME_BUDGET.saturating_sub(encoded_bytes(&head) + 1);
+            let label = truncate_to_bytes(label, budget);
+            let name = format!("{head}{label})");
+            // 开发期保险:上面两步都截过,这里不该再超 —— 真超了说明
+            // 预算算错了,该在测试里炸出来,而不是等用户在机架里看到乱码。
             debug_assert!(
                 encoded_bytes(&name) <= NAME_BUDGET,
                 "通道名 “{name}” 占 {} 字节,超过 ASIO 的 {NAME_BUDGET} 字节上限",
@@ -203,8 +215,14 @@ fn labels_for(devices: &[&StreamInfo], allow_non_ascii: bool) -> Vec<String> {
                 // 先给 " #N" 留出位置再截断。直接拼上序号再截断的话,
                 // 序号本身会被截掉,两个标签还是长得一模一样 ——
                 // 这个坑是测试逼出来的。
-                let base = truncate_to_bytes(label.as_str(), LABEL_BUDGET.saturating_sub(3));
-                *label = format!("{base} #{nth}");
+                //
+                // 预留量按**实际**序号长度算:` #9` 是 3 字节,` #10` 是 4,
+                // ` #100` 是 5 —— 写死 3 的话,同型号设备凑到 10 块就会
+                // 超出标签预算。
+                let suffix = format!(" #{nth}");
+                let base =
+                    truncate_to_bytes(label.as_str(), LABEL_BUDGET.saturating_sub(suffix.len()));
+                *label = format!("{base}{suffix}");
             }
         }
     }
@@ -410,8 +428,9 @@ mod tests {
 
     #[test]
     fn 纯_ascii_名字用满字节预算() {
-        // 22 个 ASCII 字符 = 22 字节,正好是标签的全部预算。
-        // 早先按"字符数"限制成 18,白白浪费了 4 个字符的位置。
+        // ASCII 字符一字节一个,所以字符串长度就是字节数。`name` 比预算长,
+        // 应当被截到整整 LABEL_BUDGET 个字符 —— 早先按"字符数"限制成 18,
+        // 白白浪费了位置。
         let name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let streams = vec![device(StreamKind::Output, name, 0, 1)];
         let names = ChannelNames::build(&config_with_non_ascii(true), &streams);
@@ -421,7 +440,33 @@ mod tests {
             format!("OUT 1 ({})", &name[..LABEL_BUDGET]).as_str(),
             "ASCII 名字没有用满预算"
         );
-        assert_eq!(encoded_bytes(got), NAME_BUDGET - 9 + 8);
+        // "OUT 1 (" 是 7 字节,收尾的 ")" 是 1 字节。
+        assert_eq!(encoded_bytes(got), LABEL_BUDGET + 8);
+    }
+
+    #[test]
+    fn 三位通道号也不超出字节预算() {
+        // 通道号到 100 以上时前缀多一个字节(`OUT 100 (`),预算算窄了就会
+        // 写出超过 31 字节的名字,再被 `set_name` 截掉结尾的 `)`。
+        let name = "这是一个非常非常长的中文设备名称用来测试截断行为";
+        let streams = vec![device(StreamKind::Output, name, 0, 120)];
+        let names = ChannelNames::build(&config_with_non_ascii(true), &streams);
+        assert_eq!(names.outputs().len(), 120);
+        for (i, got) in names.outputs().iter().enumerate() {
+            let used = encoded_bytes(got);
+            assert!(
+                used <= NAME_BUDGET,
+                "第 {} 个通道名 “{got}” 占 {used} 字节,超过 {NAME_BUDGET}",
+                i + 1
+            );
+            assert!(
+                got.ends_with(')'),
+                "第 {} 个通道名的结尾被截掉了:{got}",
+                i + 1
+            );
+        }
+        // 三位数前缀确实出现了,否则这个测试没测到点子上。
+        assert!(names.outputs()[99].starts_with("OUT 100 ("));
     }
 
     #[test]

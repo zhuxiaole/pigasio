@@ -97,6 +97,12 @@ pub struct DriverObject {
     sample_rate: AtomicU32,
     /// 是否正在运行。
     running: AtomicBool,
+    /// `ASIOStart()` 那一刻的系统时间(自 UNIX 纪元起的纳秒)。
+    ///
+    /// 规范要求 `getSamplePosition()` 的时间戳是「采样位置被锁存时的系统
+    /// 时间」,而且首块 `bufferSwitch` 里要指向流启动的那一刻 —— 从 0 开始
+    /// 会被宿主当成无效时间。这里存下启动时刻,之后按采样位置线性外推。
+    start_time_nanos: AtomicU64,
     /// 查询类接口需要的只读信息,`init()` 时一次性发布。见 [`EngineSnapshot`]。
     snapshot: OnceLock<EngineSnapshot>,
     /// 当前生效的缓冲区帧数。`init()` 和 `createBuffers()` 更新。
@@ -156,6 +162,7 @@ impl DriverObject {
             sample_position: Arc::new(AtomicU64::new(0)),
             sample_rate: AtomicU32::new(0),
             running: AtomicBool::new(false),
+            start_time_nanos: AtomicU64::new(0),
             snapshot: OnceLock::new(),
             buffer_size: AtomicUsize::new(0),
             latency_frames: AtomicUsize::new(0),
@@ -321,6 +328,17 @@ fn fail(code: ASIOError, message: impl Into<String>) -> Failure {
     (code, message.into())
 }
 
+/// 当前系统时间,自 UNIX 纪元起的纳秒。
+///
+/// ASIO 的时间戳没有规定纪元,只要求是「系统时间」、宿主能拿它做差。用
+/// UNIX 纳秒是常见做法,也便于和日志里的时间对上。
+fn system_time_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// 统一的进入/退出包装:记录日志,并把错误写进 `last_error`
 /// 以便 `getErrorMessage()` 能把它交给宿主显示。
 fn enter<F>(context: &str, state: &mut DriverState, f: F) -> ASIOError
@@ -389,7 +407,8 @@ unsafe extern "system" fn vt_query_interface(
         }
         *ppv = core::ptr::null_mut();
         if riid.is_null() {
-            return E_INVALIDARG;
+            // COM 规范:除输出参数以外的空指针一律返回 E_POINTER。
+            return E_POINTER;
         }
         let iid = *riid;
 
@@ -535,6 +554,9 @@ unsafe extern "system" fn vt_start(this: *mut core::ffi::c_void) -> ASIOError {
         // 拿到 INVALID_MODE;`sample_position` 也可能先被回调累加、随后才被
         // 这里清零,白白丢掉一整块的位置。
         obj.sample_position.store(0, Ordering::Relaxed);
+        // 时间戳基准:规范要求首块 bufferSwitch 的时间戳指向"流启动的那一刻"。
+        obj.start_time_nanos
+            .store(system_time_nanos(), Ordering::Relaxed);
         obj.running.store(true, Ordering::Release);
 
         let code = enter("start", &mut state, |st| {
@@ -583,7 +605,7 @@ unsafe extern "system" fn vt_get_channels(
 ) -> ASIOError {
     guard("getChannels", ase::HW_MALFUNCTION, || {
         if num_input.is_null() || num_output.is_null() {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。见
@@ -608,7 +630,7 @@ unsafe extern "system" fn vt_get_latencies(
 ) -> ASIOError {
     guard("getLatencies", ase::HW_MALFUNCTION, || {
         if input_latency.is_null() || output_latency.is_null() {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。数值由
@@ -639,7 +661,7 @@ unsafe extern "system" fn vt_get_buffer_size(
             || preferred_size.is_null()
             || granularity.is_null()
         {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         // 无锁,理由同 getChannels。只承诺一个缓冲大小,所以四个出参同值。
@@ -667,7 +689,8 @@ unsafe extern "system" fn vt_can_sample_rate(
         let obj = object(this);
         let current = obj.sample_rate.load(Ordering::Relaxed);
         if current == 0 {
-            return ase::INVALID_MODE;
+            // 还没 init,也就谈不上有什么设备 —— 规范里这种情形报 ASE_NotPresent。
+            return ase::NOT_PRESENT;
         }
         // 采样率由配置文件决定,不支持宿主动态切换:设备是按配置里的
         // 采样率打开的,嘴上答应切到 96 kHz 而实际还在 48 kHz 跑,
@@ -687,12 +710,15 @@ unsafe extern "system" fn vt_get_sample_rate(
 ) -> ASIOError {
     guard("getSampleRate", ase::HW_MALFUNCTION, || {
         if sample_rate.is_null() {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         let current = obj.sample_rate.load(Ordering::Relaxed);
         if current == 0 {
-            return ase::INVALID_MODE;
+            // 规范:采样率未知时把 *currentRate 写 0 并返回 ASE_NoClock。
+            // 只返回错误码而不动出参的话,宿主可能读到一个没初始化的值。
+            unsafe { *sample_rate = 0.0 };
+            return ase::NO_CLOCK;
         }
         unsafe { *sample_rate = current as f64 };
         ase::OK
@@ -730,7 +756,7 @@ unsafe extern "system" fn vt_get_clock_sources(
 ) -> ASIOError {
     guard("getClockSources", ase::HW_MALFUNCTION, || {
         if clocks.is_null() || num_sources.is_null() || unsafe { *num_sources } < 1 {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let _ = object(this);
         // 多设备场景下时间基准是「时钟主设备」的硬件时钟,宿主没法直接
@@ -773,7 +799,7 @@ unsafe extern "system" fn vt_get_sample_position(
 ) -> ASIOError {
     guard("getSamplePosition", ase::HW_MALFUNCTION, || {
         if s_pos.is_null() || t_stamp.is_null() {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         // 这个函数可能从宿主的 bufferSwitch 处理里被调用,而那时主锁
@@ -783,12 +809,17 @@ unsafe extern "system" fn vt_get_sample_position(
             return ase::INVALID_MODE;
         }
         let position = obj.sample_position.load(Ordering::Relaxed);
-        // 时间戳按 ASIO 约定是纳秒。用采样率换算而不是读系统时钟,
-        // 这样即使系统时间被调整,两者也不会互相打架。
-        let nanos = (position as f64 / rate as f64 * 1e9) as u64;
+        // 时间戳是「采样位置被锁存时的系统时间」,单位纳秒(ASIO 的约定)。
+        // 以 ASIOStart 那一刻为基准、按采样数线性外推 —— 用采样率换算而不是
+        // 现读系统时钟,这样即使系统时间被调整,位置和时间戳也不会互相打架。
+        let elapsed = (position as f64 / rate as f64 * 1e9) as u64;
+        let stamp = obj
+            .start_time_nanos
+            .load(Ordering::Relaxed)
+            .wrapping_add(elapsed);
         unsafe {
             *s_pos = ASIOSamples::from_u64(position);
-            *t_stamp = ASIOTimeStamp::from_u64(nanos);
+            *t_stamp = ASIOTimeStamp::from_u64(stamp);
         }
         ase::OK
     })
@@ -800,7 +831,7 @@ unsafe extern "system" fn vt_get_channel_info(
 ) -> ASIOError {
     guard("getChannelInfo", ase::HW_MALFUNCTION, || {
         if info.is_null() {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。见
@@ -869,7 +900,7 @@ unsafe extern "system" fn vt_create_buffers(
 ) -> ASIOError {
     guard("createBuffers", ase::HW_MALFUNCTION, || {
         if buffer_infos.is_null() || callbacks.is_null() || num_channels <= 0 || buffer_size <= 0 {
-            return E_INVALIDARG;
+            return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
         let mut state = obj.state.lock();
@@ -880,7 +911,11 @@ unsafe extern "system" fn vt_create_buffers(
             if st.prepared {
                 return Err(fail(ase::INVALID_MODE, "缓冲区已经创建过了"));
             }
-            st.callbacks = unsafe { *callbacks };
+            // 用 `read_unaligned` 按值读:SDK 的 `#pragma pack(4)` 让宿主
+            // 那边的 `ASIOCallbacks` 可能只按 4 字节对齐,而这个含函数指针的
+            // 结构体在 Rust 里自然对齐是 8 —— 直接解引用会有对齐问题。
+            // 见 `abi.rs` 里 `ASIOBufferInfo` 的说明。
+            st.callbacks = unsafe { callbacks.read_unaligned() };
 
             // 宿主可能在自己的缓冲处理里回头调用 getSamplePosition,
             // 所以采样位置由回调直接累加到原子量上,不走引擎的锁。
@@ -915,8 +950,9 @@ unsafe extern "system" fn vt_create_buffers(
             // 通道号是宿主给的输入,越界完全可能,所以校验必须发生在
             // 任何有副作用的调用之前。
             for i in 0..num_channels as isize {
-                // 只读:这一步不碰宿主的缓冲区指针。
-                let info = unsafe { &*buffer_infos.offset(i) };
+                // 只读,而且按值读:这个数组可能只按 4 字节对齐,对它取引用
+                // 是 UB(见 `ASIOBufferInfo` 的说明)。
+                let info = unsafe { buffer_infos.offset(i).read_unaligned() };
                 let is_input = info.is_input != 0;
                 let chan = info.channel_num;
                 if chan < 0 {
@@ -951,12 +987,14 @@ unsafe extern "system" fn vt_create_buffers(
             // 把内部缓冲的地址交给宿主。这些指针在 disposeBuffers 之前
             // 一直有效 —— 引擎内部不会再重新分配它们。
             for i in 0..num_channels as isize {
-                let info = unsafe { &mut *buffer_infos.offset(i) };
+                let mut info = unsafe { buffer_infos.offset(i).read_unaligned() };
                 let is_input = info.is_input != 0;
                 // 上面的循环已经校验过范围,这里可以安全地取回同一个值。
                 let chan = info.channel_num as usize;
                 info.buffers[0] = engine.buffer_ptr(is_input, chan, 0) as *mut core::ffi::c_void;
                 info.buffers[1] = engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
+                // 写回也用未对齐写,理由同上面读的时候。
+                unsafe { buffer_infos.offset(i).write_unaligned(info) };
             }
 
             // prepare 成功了才发布:通道启用位、缓冲大小、延迟。这些都得在

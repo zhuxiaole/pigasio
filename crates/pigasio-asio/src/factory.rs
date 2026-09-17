@@ -67,7 +67,8 @@ unsafe extern "system" fn vt_query_interface(
     }
     *ppv = core::ptr::null_mut();
     if riid.is_null() {
-        return E_INVALIDARG;
+        // COM 规范:除输出参数以外的空指针一律返回 E_POINTER。
+        return E_POINTER;
     }
     let iid = *riid;
     if iid == IID_IUNKNOWN || iid == IID_ICLASS_FACTORY {
@@ -108,12 +109,13 @@ unsafe extern "system" fn vt_create_instance(
 
     // ASIO 会把 CLSID 当 IID 传进来。它不关心返回值以外的东西,
     // 但为了严谨我们还是校验一下,免得被别的代码误用。
-    if !riid.is_null() {
-        let iid = *riid;
-        if iid != CLSID_PIGASIO && iid != IID_IUNKNOWN {
-            log::debug!("CreateInstance 收到未实现的 IID {iid:?}");
-            return E_NOINTERFACE;
-        }
+    if riid.is_null() {
+        return E_POINTER;
+    }
+    let iid = *riid;
+    if iid != CLSID_PIGASIO && iid != IID_IUNKNOWN {
+        log::debug!("CreateInstance 收到未实现的 IID {iid:?}");
+        return E_NOINTERFACE;
     }
 
     let object = DriverObject::create();

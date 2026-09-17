@@ -218,13 +218,25 @@ impl FrameReader {
     ///
     /// `planes` 的每个元素对应一个通道,不足的帧数保持原样(调用方负责补静音)。
     /// 返回实际读出的帧数。
+    ///
+    /// 数据不够时**有多少读多少**,而不是一帧不读:ring 里已经攒下的数据
+    /// 不该白白作废 —— 否则设备侧稍微抖一下,输出就整块变成静音,欠载计数
+    /// 还会按整块记,比实际缺口大得多。
     pub fn read_into_planar(&mut self, planes: &mut [Vec<f32>], frames: usize) -> usize {
         let ch = self.channels.min(planes.len());
         if ch == 0 || frames == 0 {
             return 0;
         }
-        let want_samples = frames * self.channels;
+        // 先按实际可读量申请 chunk:`read_chunk` 要求整块可用,直接按
+        // `frames` 申请的话差一帧就整个失败。
+        let available = self.available_frames().min(frames);
+        if available == 0 {
+            self.underflow_frames += frames as u64;
+            return 0;
+        }
+        let want_samples = available * self.channels;
         let Ok(chunk) = self.inner.read_chunk(want_samples) else {
+            // 理论上走不到:available 就是按 slots 算出来的。
             self.underflow_frames += frames as u64;
             return 0;
         };
@@ -442,5 +454,30 @@ mod tests {
         assert_eq!(r.read_interleaved(&mut dst, 2), 2);
         assert_eq!(dst, vec![3.0, 4.0]);
         assert_eq!(r.dropped_frames(), 3);
+    }
+
+    #[test]
+    fn 数据不足时读到多少算多少() {
+        let (mut w, mut r) = ring_buffer(2, 8);
+        // 只写 2 帧,却要读 4 帧。
+        w.write_interleaved(&[1.0, 2.0, 3.0, 4.0], 2);
+
+        let mut planes = vec![vec![0.0f32; 4], vec![0.0f32; 4]];
+        assert_eq!(
+            r.read_into_planar(&mut planes, 4),
+            2,
+            "ring 里已有的 2 帧该被读走,不该整块作废"
+        );
+        assert_eq!(planes[0][..2], [1.0, 3.0]);
+        assert_eq!(planes[1][..2], [2.0, 4.0]);
+        assert_eq!(r.underflow_frames(), 2, "只该记缺的那 2 帧");
+    }
+
+    #[test]
+    fn 完全读空时记满欠载() {
+        let (_w, mut r) = ring_buffer(1, 8);
+        let mut planes = vec![vec![0.0f32; 4]];
+        assert_eq!(r.read_into_planar(&mut planes, 4), 0);
+        assert_eq!(r.underflow_frames(), 4);
     }
 }

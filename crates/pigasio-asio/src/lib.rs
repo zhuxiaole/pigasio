@@ -222,7 +222,11 @@ pub unsafe extern "system" fn DllGetClassObject(
         return CLASS_E_CLASSNOTAVAILABLE;
     }
 
-    if !riid.is_null() && *riid != IID_ICLASS_FACTORY && *riid != IID_IUNKNOWN {
+    if riid.is_null() {
+        // COM 规范:除输出参数以外的空指针一律返回 E_POINTER。
+        return E_POINTER;
+    }
+    if *riid != IID_ICLASS_FACTORY && *riid != IID_IUNKNOWN {
         return E_NOINTERFACE;
     }
 

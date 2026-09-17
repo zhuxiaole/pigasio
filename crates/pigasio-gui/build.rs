@@ -9,10 +9,28 @@
 /// 版本号本来就只有 `Cargo.toml` 一个出处(Inno 的预处理器读不了 TOML),
 /// 与其让人在安装脚本里再抄一遍、抄漏了还没人发现,不如构建时顺手生成一份
 /// 给 `installer/PigASIO.iss` 包含。
+///
+/// # 位置为什么钉在**工作区的** `target/` 下
+///
+/// 用 `CARGO_MANIFEST_DIR` 拼绝对路径,而不是 `../../target/...` 这种相对
+/// 路径 —— 后者要依赖"构建脚本的当前目录恰好是 crate 目录"这条约定,换个
+/// 构建方式(或从别处调用 cargo)就可能写偏,而写偏了只是少一个文件,
+/// 不报错。
+///
+/// 也没有跟着 `CARGO_TARGET_DIR` / `OUT_DIR` 走:`installer/PigASIO.iss` 里
+/// 是 `#include "..\target\version.iss"`,相对安装脚本指向工作区的
+/// `target/`。两处必须落在同一个地方,而那个地方由安装脚本钉死 ——
+/// 所以这里也钉死,并在两边都写清楚。
 fn write_version_for_installer() {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    let path = std::path::Path::new("../../target/version.iss");
+    // CARGO_MANIFEST_DIR 是 `<工作区>/crates/pigasio-gui`,上溯两级到工作区。
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let Some(workspace) = manifest_dir.parent().and_then(|crates| crates.parent()) else {
+        println!("cargo:warning=从 {manifest_dir:?} 推不出工作区目录,跳过 version.iss");
+        return;
+    };
+    let path = workspace.join("target").join("version.iss");
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -23,8 +41,8 @@ fn write_version_for_installer() {
          #define AppVer \"{VERSION}\"\n"
     );
 
-    if let Err(e) = std::fs::write(path, body) {
-        println!("cargo:warning=写 target/version.iss 失败:{e}");
+    if let Err(e) = std::fs::write(&path, body) {
+        println!("cargo:warning=写 {} 失败:{e}", path.display());
     }
 }
 

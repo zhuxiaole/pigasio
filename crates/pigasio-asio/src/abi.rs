@@ -139,6 +139,17 @@ pub mod sample_type {
 ///
 /// * 输入时:`is_input` 指明方向,`channel_num` 指明通道号。
 /// * 输出时:驱动把 double buffer 的两个地址写进 `buffers[0..2]`。
+///
+/// # 对齐:只能按未对齐方式访问
+///
+/// SDK 的 `asio.h` 全局带 `#pragma pack(4)`,所以 C 侧这个结构体的 `alignof`
+/// 是 4;而它含指针,在 Rust 里 `align_of == 8`。宿主传进来的数组因此可能
+/// 只按 4 字节对齐,对元素取 `&mut` 引用属于 UB。
+///
+/// 所以驱动侧一律用 `read_unaligned` / `write_unaligned` 按值读写、不取
+/// 引用 —— 见 `driver::vt_create_buffers`。[`ASIOCallbacks`] 同理。本文件
+/// 其余面向宿主的结构体(如 [`ASIOChannelInfo`]、[`ASIOClockSource`])不含
+/// 指针,两侧对齐都是 4,可以直接取引用。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ASIOBufferInfo {
@@ -262,6 +273,9 @@ impl Default for ASIOClockSource {
 /// `ASIOCallbacks` —— 宿主交给驱动的回调表。
 ///
 /// 全部是函数指针,所以整个结构体是 `Copy + Send + Sync`。
+///
+/// 和 [`ASIOBufferInfo`] 一样,它在 `#pragma pack(4)` 下只有 4 字节对齐,
+/// 而 Rust 这边是 8 —— 所以读取时要用 `read_unaligned`,不能直接解引用。
 ///
 /// PigASIO 只使用 `bufferSwitch`。`bufferSwitchTimeInfo` 需要构造
 /// `ASIOTime`,而那个结构体在 `#pragma pack(4)` 下的布局与 Rust 的

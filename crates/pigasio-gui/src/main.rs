@@ -1471,7 +1471,12 @@ impl eframe::App for App {
                                 PathBuf::from(home).join(pigasio_core::config::CONFIG_FILE_NAME);
                             self.save_to(&p);
                         } else {
-                            self.set_error("无法确定用户目录,请先用「另存为」指定路径".into());
+                            // 界面上没有"另存为"这类对话框,所以别把用户引到
+                            // 一个不存在的按钮上 —— 直接说该往哪儿放文件。
+                            self.set_error(format!(
+                                "无法确定用户目录,保存不了。请手动把配置放到宿主目录,或运行 `pigasio init` 生成一份 {}。",
+                                pigasio_core::config::CONFIG_FILE_NAME
+                            ));
                         }
                     }
                 }
@@ -1945,23 +1950,32 @@ impl App {
         let mut new_clock_master: Option<usize> = None;
 
         for (i, stream) in streams.iter_mut().enumerate() {
-            let channel_count = match stream.channel_mode {
-                ChannelMode::Count => stream.channel_count.max(1),
-                ChannelMode::List => stream
-                    .channels_text
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<usize>().ok())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    .max(1),
-            };
-            let start = asio_offset + 1;
-            let end = asio_offset + channel_count;
-            let range_text = if channel_count == 1 {
-                format!("{start}")
+            // 禁用的流在引擎里根本不占 ASIO 通道,所以既不该参与累加,
+            // 也不该显示区间 —— 否则它后面每一条流显示的通道号都会偏大。
+            let disabled = !stream.opens_device();
+            let channel_count = if disabled {
+                0
             } else {
-                format!("{start}–{end}")
+                match stream.channel_mode {
+                    ChannelMode::Count => stream.channel_count.max(1),
+                    ChannelMode::List => stream
+                        .channels_text
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<usize>().ok())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        .max(1),
+                }
             };
+            let range_text = (!disabled).then(|| {
+                let start = asio_offset + 1;
+                let end = asio_offset + channel_count;
+                if channel_count == 1 {
+                    format!("{start}")
+                } else {
+                    format!("{start}–{end}")
+                }
+            });
             asio_offset += channel_count;
 
             theme::card_frame(ui, true).show(ui, |ui| {
@@ -2011,11 +2025,13 @@ impl App {
 
                 // ASIO 通道映射单独占一行。放在下拉框右边时会被挤成
                 // 一两个字,不如让它自己一行说清楚。
-                ui.label(
-                    egui::RichText::new(format!("→ ASIO {} 通道 {range_text}", kind.as_str()))
-                        .small()
-                        .weak(),
-                );
+                if let Some(range_text) = &range_text {
+                    ui.label(
+                        egui::RichText::new(format!("→ ASIO {} 通道 {range_text}", kind.as_str()))
+                            .small()
+                            .weak(),
+                    );
+                }
 
                 // 用 horizontal_wrapped:分栏之后每列只有半屏宽,
                 // 通道/增益/时钟主设备这一行放不下时会自动折到下一行。
