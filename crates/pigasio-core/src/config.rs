@@ -32,6 +32,18 @@ use crate::error::{Error, Result, StreamKind};
 /// 配置文件的默认文件名。
 pub const CONFIG_FILE_NAME: &str = "PigASIO.toml";
 
+/// 单个设备最多能选多少通道。
+///
+/// 真实声卡最多几十路(MADI 常见 64),256 已经很宽裕 —— 这个上界挡的是
+/// **畸形配置**,不是硬件,理由见 [`Config::validate`]。
+const MAX_CHANNELS_PER_STREAM: usize = 256;
+
+/// 单个设备的增益上下限,单位 dB。
+///
+/// 120 dB 是 10^6 倍,远超任何实际用途,同时保证 `10^(x / 20)` 不会溢出
+/// 成 `inf`(f32 要到约 ±770 dB 才会溢出)。理由见 [`Config::validate`]。
+const MAX_GAIN_DB: f32 = 120.0;
+
 /// 一帧里单个通道的采样类型。决定 ASIO 侧 `getChannelInfo()` 返回的格式。
 ///
 /// # 目前只有 `Float32` 可用
@@ -453,6 +465,17 @@ impl Config {
                         "{label} 的通道选择为空;请用 channels = [0, 1] 或 channel_count = 2"
                     )));
                 }
+                // 通道数上限。挡的是畸形配置:`ChannelSelection::Count(n)` 会
+                // 在下面展开成 `(0..n)` 的 Vec,若 n 写成 10^12,光是校验就会
+                // 申请 8 TB 内存、把宿主进程直接 abort —— 驱动跑在宿主里,那
+                // 等于连用户没保存的工程一起带走。`len()` 不分配,所以这道
+                // 检查本身是安全的,必须发生在 `expand()` 之前。
+                if s.channels.len() > MAX_CHANNELS_PER_STREAM {
+                    return Err(Error::Config(format!(
+                        "{label} 选了 {} 个通道,超过单设备上限 {MAX_CHANNELS_PER_STREAM}",
+                        s.channels.len()
+                    )));
+                }
                 let mut seen = std::collections::HashSet::new();
                 for ch in s.channels.expand() {
                     if !seen.insert(ch) {
@@ -466,8 +489,15 @@ impl Config {
                         )));
                     }
                 }
-                if !s.gain_db.is_finite() {
-                    return Err(Error::Config(format!("{label} 的 gain_db 不是有限数值")));
+                // 既要有限,也要在范围内。上界挡的是 `10^(gain_db / 20)` 的
+                // 溢出:`gain_db = 1000` 是有限值,但线性增益算出来是 `+inf`,
+                // 乘到音频上会得到 `inf`,而静音样本 `0.0 * inf` 是 `NaN` ——
+                // 两个都不是能听的东西,而且不出任何错。
+                if !s.gain_db.is_finite() || s.gain_db.abs() > MAX_GAIN_DB {
+                    return Err(Error::Config(format!(
+                        "{label} 的 gain_db = {} 超出范围(±{MAX_GAIN_DB} dB)",
+                        s.gain_db
+                    )));
                 }
             }
         }
@@ -920,6 +950,51 @@ mod tests {
                     "{bad} 的错误信息应点明是哪一项:{e}"
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn 通道数超上限会被拒绝而不是撑爆内存() {
+        // channel_count 写成一个天文数字。如果 validate() 先 expand 再检查,
+        // 这里会申请 TB 级内存、直接 abort,测试根本跑不完 —— 能拿到 Err
+        // 就说明检查发生在分配之前。
+        let text = "[[output]]\ndevice = \"default\"\nchannel_count = 1000000000000\n";
+        let err = Config::from_toml_str(text).unwrap_err();
+        assert!(err.to_string().contains("上限"), "{err}");
+
+        // channels 列表按长度受同样的约束。
+        let list = (0..MAX_CHANNELS_PER_STREAM + 1)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = format!("[[output]]\ndevice = \"default\"\nchannels = [{list}]\n");
+        let err = Config::from_toml_str(&text).unwrap_err();
+        assert!(err.to_string().contains("上限"), "{err}");
+
+        // 上限本身仍然合法。
+        let text = format!(
+            "[[output]]\ndevice = \"default\"\nchannel_count = {MAX_CHANNELS_PER_STREAM}\n"
+        );
+        assert!(Config::from_toml_str(&text).is_ok());
+    }
+
+    #[test]
+    fn 增益超出范围会被拒绝() {
+        // 有限但过大:`10^(1000/20)` 溢出成 inf,乘到音频上会得到 inf,而
+        // 静音样本 `0.0 * inf` 是 NaN。nan/inf 本身也不是有限值,同样要拒。
+        for bad in ["1000.0", "-1000.0", "121.0", "nan", "inf", "-inf"] {
+            let text = format!("[[output]]\ndevice = \"default\"\ngain_db = {bad}\n");
+            match Config::from_toml_str(&text) {
+                Ok(_) => panic!("gain_db = {bad} 本该被拒绝,却解析成功了"),
+                Err(e) => assert!(e.to_string().contains("gain_db"), "{bad}: {e}"),
+            }
+        }
+
+        // 边界值本身合法,而且算出来的线性增益必须是有限的。
+        for ok in ["0.0", "120.0", "-120.0", "6.0"] {
+            let text = format!("[[output]]\ndevice = \"default\"\ngain_db = {ok}\n");
+            let cfg = Config::from_toml_str(&text).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert!(cfg.outputs[0].linear_gain().is_finite(), "{ok} 的增益算出了非有限值");
         }
     }
 }

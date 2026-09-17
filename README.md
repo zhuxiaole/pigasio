@@ -270,8 +270,8 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `engine.use_non_ascii_channel_names` | `true` | 通道名是否允许中文;显示乱码时设为 `false` |
 | `[[input]]` / `[[output]].device` | `"default"` | 设备名片段;`"default"` 用系统默认设备,`"none"` 禁用 |
 | `...channels` | — | 指定通道,如 `[0, 3]` |
-| `...channel_count` | `2` | 取前 N 个通道;与 `channels` 二选一 |
-| `...gain_db` | `0.0` | 该设备所有通道的增益 |
+| `...channel_count` | `2` | 取前 N 个通道(上限 256);与 `channels` 二选一 |
+| `...gain_db` | `0.0` | 该设备所有通道的增益,范围 ±120 dB |
 | `...latency` | — | 建议延迟(秒) |
 | `...clock_master` | `false` | 是否作为时钟主设备,全配置最多一个 |
 
