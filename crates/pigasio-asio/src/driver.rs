@@ -753,17 +753,22 @@ unsafe extern "system" fn vt_create_buffers(
                 .as_mut()
                 .ok_or_else(|| fail(ase::INVALID_MODE, "引擎未初始化"))?;
 
-            engine
-                .prepare(chunk, switch_callback)
-                .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
+            let input_limit = engine.input_channel_count();
+            let output_limit = engine.output_channel_count();
+            let mut active_inputs = vec![false; input_limit];
+            let mut active_outputs = vec![false; output_limit];
 
-            // 把内部缓冲的地址交给宿主。这些指针在 disposeBuffers 之前
-            // 一直有效 —— 引擎内部不会再重新分配它们。
-            let mut active_inputs = vec![false; engine.input_channel_count()];
-            let mut active_outputs = vec![false; engine.output_channel_count()];
-
+            // 先把所有通道号校验一遍,**再**打开设备流。顺序不能反:
+            // `prepare()` 一旦成功,引擎就打开了设备流、并把内部状态标记为
+            // "已准备"。此时若再因为某个通道越界而返回错误,宿主就卡住了 ——
+            // 再调 createBuffers 会被引擎挡回("缓冲区已经创建过了"),而
+            // disposeBuffers 又因为驱动这边的 `st.prepared` 还是 false 直接
+            // 报 INVALID_MODE,设备句柄只能等到对象 Release 才释放。
+            // 通道号是宿主给的输入,越界完全可能,所以校验必须发生在
+            // 任何有副作用的调用之前。
             for i in 0..num_channels as isize {
-                let info = unsafe { &mut *buffer_infos.offset(i) };
+                // 只读:这一步不碰宿主的缓冲区指针。
+                let info = unsafe { &*buffer_infos.offset(i) };
                 let is_input = info.is_input != 0;
                 let chan = info.channel_num;
                 if chan < 0 {
@@ -773,11 +778,7 @@ unsafe extern "system" fn vt_create_buffers(
                     ));
                 }
                 let chan = chan as usize;
-                let limit = if is_input {
-                    active_inputs.len()
-                } else {
-                    active_outputs.len()
-                };
+                let limit = if is_input { input_limit } else { output_limit };
                 if chan >= limit {
                     return Err(fail(
                         ase::INVALID_PARAMETER,
@@ -787,15 +788,27 @@ unsafe extern "system" fn vt_create_buffers(
                         ),
                     ));
                 }
-
-                info.buffers[0] = engine.buffer_ptr(is_input, chan, 0) as *mut core::ffi::c_void;
-                info.buffers[1] = engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
-
                 if is_input {
                     active_inputs[chan] = true;
                 } else {
                     active_outputs[chan] = true;
                 }
+            }
+
+            // 到这里所有输入都是合法的,再开设备流。
+            engine
+                .prepare(chunk, switch_callback)
+                .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
+
+            // 把内部缓冲的地址交给宿主。这些指针在 disposeBuffers 之前
+            // 一直有效 —— 引擎内部不会再重新分配它们。
+            for i in 0..num_channels as isize {
+                let info = unsafe { &mut *buffer_infos.offset(i) };
+                let is_input = info.is_input != 0;
+                // 上面的循环已经校验过范围,这里可以安全地取回同一个值。
+                let chan = info.channel_num as usize;
+                info.buffers[0] = engine.buffer_ptr(is_input, chan, 0) as *mut core::ffi::c_void;
+                info.buffers[1] = engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
             }
 
             st.active_inputs = active_inputs;

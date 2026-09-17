@@ -948,7 +948,19 @@ impl App {
         self.message_is_error = false;
     }
 
+    /// 引擎正在运行,或者正在启动 / 停止。
+    fn runner_is_busy(&self) -> bool {
+        self.runner.is_some() || self.runner_job.is_some()
+    }
+
     fn load_from(&mut self, path: &std::path::Path) {
+        // 试运行跑的是**启动那一刻**的配置快照,而界面上的字段是另外一份。
+        // 这时载入新配置,旁边那块实时统计还是旧引擎的,用户会以为新配置
+        // 正在跑。与其猜他想要哪个,不如先请他停下。
+        if self.runner_is_busy() {
+            self.set_error("请先停止试运行,再载入配置。".into());
+            return;
+        }
         match Config::from_file(path) {
             Ok(config) => {
                 self.apply_config(&config);
@@ -1012,6 +1024,12 @@ impl App {
     }
 
     fn save_to(&mut self, path: &std::path::Path) {
+        // 同 load_from:运行中保存会把"界面这一份"写进文件,而真正在跑的
+        // 是启动时的快照 —— 两者未必一致,存下来的可能不是用户在听的配置。
+        if self.runner_is_busy() {
+            self.set_error("请先停止试运行,再保存配置。".into());
+            return;
+        }
         let config = self.build_config();
         if let Err(e) = config.validate() {
             self.set_error(format!("配置有误,未保存:{e}"));
@@ -1219,7 +1237,27 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
         }
     }
 
-    std::fs::write(path, out)
+    // 原子替换:先写同目录下的临时文件,落盘后再 rename 覆盖目标。
+    //
+    // 直接原地截断写的话,写到一半崩溃 / 断电会留下一份半截的 TOML ——
+    // 而这是用户唯一的配置,下次启动直接解析失败。临时文件必须和目标
+    // **同目录**,rename 只有在同一文件系统内才是原子的;Windows 上
+    // `std::fs::rename` 会覆盖已存在的目标(底层是 `MoveFileExW` 加
+    // `MOVEFILE_REPLACE_EXISTING`),所以不必先删旧文件。
+    let tmp = path.with_extension("toml.tmp");
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        use std::io::Write as _;
+        file.write_all(out.as_bytes())?;
+        // 数据真的落盘之后再 rename —— 否则断电时 rename 可能先于数据生效,
+        // 目标文件反而成了空的。
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        // 别把半截的临时文件留在用户目录里。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// 把字符串转成合法的 TOML 基本字符串字面量。
@@ -1322,7 +1360,10 @@ impl eframe::App for App {
                 {
                     self.refresh_devices();
                 }
-                if ui.button("重新载入").clicked() {
+                if ui
+                    .add_enabled(!self.runner_is_busy(), egui::Button::new("重新载入"))
+                    .clicked()
+                {
                     if let Some(p) = self.config_path.clone() {
                         self.load_from(&p);
                     }
@@ -1345,7 +1386,10 @@ impl eframe::App for App {
                         update_ui_prefs(|prefs| prefs.theme = Some(mode.as_str().to_string()));
                     }
                 }
-                if ui.button("保存").clicked() {
+                if ui
+                    .add_enabled(!self.runner_is_busy(), egui::Button::new("保存"))
+                    .clicked()
+                {
                     if let Some(p) = self.config_path.clone() {
                         self.save_to(&p);
                     } else {

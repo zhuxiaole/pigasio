@@ -689,6 +689,16 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         return Err(format!("找不到 {}", dll.display()));
     }
 
+    // 写 HKLM\SOFTWARE\ASIO 必须有管理员权限。先问一句,比让用户对着
+    // ERROR_ACCESS_DENIED(5) 猜要直接。`None` 表示查不出来 —— 那就照常
+    // 往下走,让真正的注册去报错,不凭一次失败的探测就把人拦住。
+    if pigasio_asio::registry::is_elevated() == Some(false) {
+        return Err("注册 ASIO 驱动需要管理员权限。\n\
+                    宿主靠 HKLM\\SOFTWARE\\ASIO 枚举驱动,写那里必须提升权限。\n\
+                    请以管理员身份重新运行本命令。"
+            .into());
+    }
+
     println!("正在注册 ASIO 驱动");
     println!("  DLL:{}", dll.display());
     println!();
@@ -700,13 +710,19 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     println!("  2. 在它的 ASIO 驱动列表里选择 “PigASIO”;");
     println!("  3. 在用户目录或宿主目录放一份 PigASIO.toml 配置多设备");
     println!("     (可以先用 `pigasio init` 生成模板)。");
-    println!();
-    println!("如果宿主列表里看不到 PigASIO,多半是这次命令没有以管理员身份运行 ——");
-    println!(r"写 HKLM\SOFTWARE\ASIO 需要管理员权限。");
     Ok(())
 }
 
 fn cmd_uninstall() -> Result<(), String> {
+    // 同 install:先确认权限。`unregister_server` 自己也会在真删不掉时报错,
+    // 但提前说一句能省掉一次注定失败的尝试。
+    if pigasio_asio::registry::is_elevated() == Some(false) {
+        return Err("注销 ASIO 驱动需要管理员权限。\n\
+                    要删除 HKLM\\SOFTWARE\\ASIO\\PigASIO,必须提升权限。\n\
+                    请以管理员身份重新运行本命令。"
+            .into());
+    }
+
     println!("正在注销 ASIO 驱动…");
     pigasio_asio::registry::unregister_server()?;
     println!("注销完成。重启宿主后它就不再出现在驱动列表里。");

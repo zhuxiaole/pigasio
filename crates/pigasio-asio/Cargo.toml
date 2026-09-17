@@ -24,6 +24,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Diagnostics_Debug",
     "Win32_Globalization",
+    # `registry::is_elevated()` 要用 OpenProcessToken / GetCurrentProcess
+    # 去查自己的令牌是否提升。
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(not(windows))'.dependencies]

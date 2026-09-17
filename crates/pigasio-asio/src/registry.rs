@@ -29,13 +29,27 @@ pub fn unregister_server() -> RegResult {
     platform::unregister_server()
 }
 
+/// 当前进程是否以管理员权限(elevated)运行。
+///
+/// `None` 表示查不出来(拿不到自己的进程令牌)—— 调用方这时应当**放行**,
+/// 让真正的注册 / 注销去报错,而不是凭一次失败的探测就把用户拦住。
+///
+/// 注册要写 `HKLM\SOFTWARE\ASIO`,没有管理员权限必然失败,错误码是
+/// `ERROR_ACCESS_DENIED`(5)。先问一句能给用户更直接的提示,省得他对着
+/// 一个错误码猜。
+pub fn is_elevated() -> Option<bool> {
+    platform::is_elevated()
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+    };
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CLASSES_ROOT,
         HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -68,7 +82,7 @@ mod platform {
         if status != ERROR_SUCCESS {
             return Err(format!(
                 "创建注册表键 HK…\\{subkey} 失败(错误码 {status});\
-                 注册 ASIO 驱动需要管理员权限,请以管理员身份运行 regsvr32"
+                 注册 ASIO 驱动需要写 HKLM,请以管理员身份重新运行本命令"
             ));
         }
         Ok(handle)
@@ -158,8 +172,8 @@ mod platform {
         let clsid = CLSID_PIGASIO.to_registry_string();
         log::info!("注销 PigASIO 驱动(CLSID = {clsid})");
 
+        let mut failures: Vec<String> = Vec::new();
         unsafe {
-            // 删除失败不算致命错误 —— 可能本来就不存在。
             for (root, path) in [
                 (HKEY_CLASSES_ROOT, format!("CLSID\\{clsid}")),
                 (HKEY_CLASSES_ROOT, "PigASIO.PigASIO.1".to_string()),
@@ -170,14 +184,61 @@ mod platform {
             ] {
                 let wide_path = wide(&path);
                 let status = RegDeleteTreeW(root, wide_path.as_ptr());
-                if status != ERROR_SUCCESS {
-                    log::debug!("删除注册表键 {path} 返回错误码 {status}(可能本就不存在)");
+                // "不存在"正是卸载想要的终态,不算失败 —— 重复卸载、
+                // 或者注册本来就只成功了一半,都会走到这里。
+                if status != ERROR_SUCCESS
+                    && status != ERROR_FILE_NOT_FOUND
+                    && status != ERROR_PATH_NOT_FOUND
+                {
+                    log::warn!("删除注册表键 {path} 失败(错误码 {status})");
+                    failures.push(format!("{path}(错误码 {status})"));
                 }
             }
         }
 
-        log::info!("注销完成");
-        Ok(())
+        // 这里以前把失败全吞了、恒返回 Ok,于是没有管理员权限时 CLI 会打印
+        // "注销完成"、退出码 0,而 HKLM\SOFTWARE\ASIO\PigASIO 还在原地 ——
+        // 宿主列表里驱动依旧在,用户却以为已经卸掉了。
+        if failures.is_empty() {
+            log::info!("注销完成");
+            Ok(())
+        } else {
+            Err(format!(
+                "以下注册表项删除失败:{}\
+                 删除 HKLM 下的项需要管理员权限,请以管理员身份重新运行本命令",
+                failures.join("、")
+            ))
+        }
+    }
+
+    pub(super) fn is_elevated() -> Option<bool> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token: HANDLE = core::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return None;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut returned = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                core::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            );
+            let _ = CloseHandle(token);
+            if ok == 0 {
+                None
+            } else {
+                Some(elevation.TokenIsElevated != 0)
+            }
+        }
     }
 }
 
@@ -191,6 +252,10 @@ mod platform {
 
     pub(super) fn unregister_server() -> RegResult {
         Err("PigASIO 的 ASIO 驱动只能在 Windows 上注册".into())
+    }
+
+    pub(super) fn is_elevated() -> Option<bool> {
+        None
     }
 }
 
@@ -218,5 +283,24 @@ mod tests {
         assert_eq!(parts[2].len(), 4);
         assert_eq!(parts[3].len(), 4);
         assert_eq!(parts[4].len(), 12);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn 能查到自己的提升状态() {
+        // 当前进程的令牌一定打得开,所以这里不该是 None —— 是 None 就说明
+        // `GetTokenInformation` 那一串调用写错了。至于具体是 true 还是
+        // false 取决于跑测试的人是不是用了管理员终端,两种都合法。
+        assert!(
+            is_elevated().is_some(),
+            "查不到本进程的提升状态,权限探测实现有问题"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn 非_windows_上查不到提升状态() {
+        // 桩实现:CLI 看到 None 会放行,由后续的注册调用去报平台错误。
+        assert_eq!(is_elevated(), None);
     }
 }
