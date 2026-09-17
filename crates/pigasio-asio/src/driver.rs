@@ -15,18 +15,36 @@
 //!
 //! # 死锁红线
 //!
-//! `state` 的锁会被音频回调在 `bufferSwitch` 期间持有。宿主完全可能在
-//! 自己的 `bufferSwitch` 处理里回头调用 `getSamplePosition()` 或
-//! `outputReady()` —— 这两个接口因此**绝不能**去碰那把锁。
-//! 它们读的是 `DriverObject` 上的原子字段,由音频回调直接维护。
+//! 音频回调在 `bufferSwitch` 期间持有引擎的核心锁,而宿主完全可能在
+//! 自己的 `bufferSwitch` 处理里回头调用本驱动的接口。与此同时,
+//! `stop()` / `disposeBuffers()` / `release()` 走的是反方向:先持
+//! `state` 锁、再进引擎等核心锁。两条路一碰就是 ABBA 死锁。
+//!
+//! 所以**任何可能在回调里被调用的接口都不能碰 `state` 锁**。目前这一类
+//! 接口是 `getSamplePosition()`、`outputReady()`,以及四个查询接口
+//! `getChannels()` / `getBufferSize()` / `getLatencies()` /
+//! `getChannelInfo()` —— 它们读的全是 `DriverObject` 上的原子字段和
+//! [`EngineSnapshot`],不碰那把锁。
+//!
+//! 往这个类里加接口时,先想清楚它要的数据该怎么无锁地拿到,别顺手
+//! `state.lock()`。其余接口(`start` / `stop` / `createBuffers` /
+//! `disposeBuffers` / `release` / `controlPanel` / `setSampleRate` /
+//! `getErrorMessage` …)仍然用 `state` 锁 —— 它们在回调里被调用是不合理的,
+//! 宿主不该在实时线程里开控制面板或改采样率。
+//!
+//! 还有一条:**这一类接口里不要打日志**。`log::*` 最终要写文件,而落盘是
+//! 阻塞的,落在实时线程上会让缓冲区欠载 —— 引擎的数据回调对这点很克制
+//! (见 `engine.rs` 里那些"只记数不打印"的注释),驱动这边同理。
+//! 成功路径的信息在 `init()` / `prepare` 时已经记过;异常路径(比如宿主
+//! 请求了不存在的通道)只报**第一次**,见 `DriverObject::channel_info_warned`。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
 use pigasio_core::engine::BufferSwitchCallback;
-use pigasio_core::{Engine, Error as CoreError, StreamKind};
+use pigasio_core::{ChannelNames, Engine, Error as CoreError, StreamKind};
 
 use crate::abi::*;
 
@@ -72,15 +90,53 @@ pub struct DriverObject {
     vtbl: *const IAsioVtbl,
     ref_count: AtomicU32,
 
-    // ---- 以下三个字段专门服务于「不能加锁」的接口 ----
+    // ---- 以下字段专门服务于「不能加锁」的接口 ----
     /// 已处理的采样帧数,由音频回调直接累加。
     sample_position: Arc<AtomicU64>,
     /// 当前采样率(Hz)。0 表示尚未初始化。
     sample_rate: AtomicU32,
     /// 是否正在运行。
     running: AtomicBool,
+    /// 查询类接口需要的只读信息,`init()` 时一次性发布。见 [`EngineSnapshot`]。
+    snapshot: OnceLock<EngineSnapshot>,
+    /// 当前生效的缓冲区帧数。`init()` 和 `createBuffers()` 更新。
+    buffer_size: AtomicUsize,
+    /// 报给宿主的延迟(帧),随 `buffer_size` 一起更新。0 表示尚未初始化。
+    latency_frames: AtomicUsize,
+    /// 每个通道是否被 `createBuffers()` 启用过。
+    ///
+    /// 长度在 `init()` 时按通道数定下、之后不变,于是每个元素用一个原子量
+    /// 就够无锁读写。放进 `state` 会让 `getChannelInfo()` —— 一个可能在
+    /// `bufferSwitch` 回调里被调用的接口 —— 去拿那把锁。
+    active_inputs: OnceLock<Vec<AtomicBool>>,
+    active_outputs: OnceLock<Vec<AtomicBool>>,
+    /// `getChannelInfo()` 的异常提示是否已经报过。
+    ///
+    /// 那个接口可能在音频回调里被调用,而 `log::warn!` 最终要写文件 ——
+    /// 落盘是阻塞的。宿主真有 bug 时日志里留一条就够,不能让它每块回调
+    /// 都刷一次(既刷屏又可能让缓冲区欠载)。
+    channel_info_warned: AtomicBool,
 
     state: Mutex<DriverState>,
+}
+
+/// 查询类接口需要的只读信息,在 `init()` 时一次性发布。
+///
+/// # 为什么要单独存一份
+///
+/// `getChannels()` / `getBufferSize()` / `getLatencies()` / `getChannelInfo()`
+/// 都可能被宿主在 `bufferSwitch` 回调里调用 —— 而那时音频线程正持有引擎的
+/// 核心锁(`AudioCore`)。它们若去拿 `state` 锁,就会和 `stop()` /
+/// `disposeBuffers()` / `release()` 那条「先持 `state` 锁、再等核心锁」的
+/// 路径构成经典的 ABBA 死锁。所以这些值在启动阶段就摊平到本对象上,
+/// 之后全程无锁只读。
+///
+/// 内容全部来自配置和 `Engine::new`,在 `init()` 之后不再变化。
+struct EngineSnapshot {
+    channels_in: usize,
+    channels_out: usize,
+    channel_names: ChannelNames,
+    sample_type_code: i32,
 }
 
 // 安全性论证:
@@ -100,6 +156,12 @@ impl DriverObject {
             sample_position: Arc::new(AtomicU64::new(0)),
             sample_rate: AtomicU32::new(0),
             running: AtomicBool::new(false),
+            snapshot: OnceLock::new(),
+            buffer_size: AtomicUsize::new(0),
+            latency_frames: AtomicUsize::new(0),
+            active_inputs: OnceLock::new(),
+            active_outputs: OnceLock::new(),
+            channel_info_warned: AtomicBool::new(false),
             state: Mutex::new(DriverState::new()),
         });
         Box::into_raw(obj)
@@ -108,6 +170,90 @@ impl DriverObject {
     /// 采样位置的无锁句柄,交给音频回调去累加。
     fn position_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.sample_position)
+    }
+
+    /// 发布查询类接口需要的只读信息。
+    ///
+    /// 只在 `init()` 里调用:通道数、通道名、采样类型都由配置和
+    /// `Engine::new` 定下,之后不会再变。会变的那两项(缓冲大小、通道启用位)
+    /// 由 [`Self::update_sizes`] 和 [`Self::set_active`] 单独更新。
+    fn publish_snapshot(&self, engine: &Engine) {
+        // 重复 init 会被 `vt_init` 挡掉,所以这里的 `set` 不该失败;
+        // 万一失败也只是保留先前那份,不影响可用性。
+        let _ = self.snapshot.set(EngineSnapshot {
+            channels_in: engine.input_channel_count(),
+            channels_out: engine.output_channel_count(),
+            channel_names: engine.channel_names().clone(),
+            sample_type_code: engine.config().asio_sample_type.asio_code(),
+        });
+        let _ = self.active_inputs.set(
+            (0..engine.input_channel_count())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+        );
+        let _ = self.active_outputs.set(
+            (0..engine.output_channel_count())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+        );
+        self.update_sizes(engine);
+    }
+
+    /// 刷新缓冲大小与延迟两项。
+    ///
+    /// 这两个值在 `createBuffers()` 时会随宿主的实际请求变化,所以不能像
+    /// 其余快照那样一次发完就不管。
+    fn update_sizes(&self, engine: &Engine) {
+        let buffer_size = engine.buffer_size();
+        self.buffer_size.store(buffer_size, Ordering::Relaxed);
+        // ASIO 的延迟定义是「bufferSwitch 到声音真正进出」的时间。多设备
+        // 驱动里它由环形缓冲维持的水位决定,所以是「水位 + 一个 ASIO
+        // 缓冲区」。报大了只是让宿主的对齐补偿多留余量,报小了才会让录音
+        // 对不齐,所以这里不做任何"乐观"的缩减。
+        let watermark =
+            engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
+        let frames = (watermark.round() as i32).saturating_add(buffer_size as i32);
+        self.latency_frames
+            .store(frames.max(0) as usize, Ordering::Relaxed);
+    }
+
+    /// 标记某个通道被启用。越界或快照尚未建立时静默忽略 —— 调用方
+    /// (`createBuffers`)已经校验过范围。
+    fn set_active(&self, is_input: bool, channel: usize) {
+        if let Some(flag) = self.active_flags(is_input).and_then(|f| f.get(channel)) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 清掉所有通道的启用标记(`disposeBuffers`)。
+    fn clear_active(&self) {
+        for flags in [
+            self.active_inputs.get(),
+            self.active_outputs.get(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for flag in flags {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 某个通道是否被启用。`getChannelInfo()` 用,全程无锁。
+    fn is_active(&self, is_input: bool, channel: usize) -> bool {
+        self.active_flags(is_input)
+            .and_then(|f| f.get(channel))
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    fn active_flags(&self, is_input: bool) -> Option<&Vec<AtomicBool>> {
+        if is_input {
+            self.active_inputs.get()
+        } else {
+            self.active_outputs.get()
+        }
     }
 }
 
@@ -124,9 +270,6 @@ struct DriverState {
     last_error: String,
     /// 已经创建过缓冲区。
     prepared: bool,
-    /// 每个通道是否被 `createBuffers()` 启用过。
-    active_inputs: Vec<bool>,
-    active_outputs: Vec<bool>,
     /// 实际生效的配置文件路径。
     config_path: Option<std::path::PathBuf>,
 }
@@ -139,8 +282,6 @@ impl DriverState {
             sys_handle: 0,
             last_error: String::new(),
             prepared: false,
-            active_inputs: Vec::new(),
-            active_outputs: Vec::new(),
             config_path: None,
         }
     }
@@ -333,13 +474,13 @@ unsafe extern "system" fn vt_init(
                 engine.output_channel_count()
             );
 
-            // 发布无锁快照,给 getSamplePosition / outputReady 用。
+            // 发布无锁快照,给 getSamplePosition / outputReady 以及那几个
+            // 可能在 bufferSwitch 回调里被调用的查询接口用。
             obj.sample_rate
                 .store(engine.sample_rate(), Ordering::Relaxed);
             obj.sample_position.store(0, Ordering::Relaxed);
+            obj.publish_snapshot(&engine);
 
-            st.active_inputs = vec![false; engine.input_channel_count()];
-            st.active_outputs = vec![false; engine.output_channel_count()];
             st.engine = Some(engine);
             Ok(())
         });
@@ -445,19 +586,17 @@ unsafe extern "system" fn vt_get_channels(
             return E_INVALIDARG;
         }
         let obj = object(this);
-        let state = obj.state.lock();
-        let Some(engine) = state.engine.as_ref() else {
+        // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。见
+        // `EngineSnapshot` 的说明。
+        let Some(snap) = obj.snapshot.get() else {
             return ase::INVALID_MODE;
         };
         unsafe {
-            *num_input = engine.input_channel_count() as i32;
-            *num_output = engine.output_channel_count() as i32;
-            log::debug!(
-                "getChannels() -> {} 输入 / {} 输出",
-                *num_input,
-                *num_output
-            );
+            *num_input = snap.channels_in as i32;
+            *num_output = snap.channels_out as i32;
         }
+        // 这个路径上不打日志:接口可能被音频回调调用,而日志最终要写文件。
+        // 通道数在 `init()` 里已经用 info 记过一条,足够查了。
         ase::OK
     })
 }
@@ -472,22 +611,13 @@ unsafe extern "system" fn vt_get_latencies(
             return E_INVALIDARG;
         }
         let obj = object(this);
-        let state = obj.state.lock();
-        let Some(engine) = state.engine.as_ref() else {
+        // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。数值由
+        // `update_sizes()` 在 init / createBuffers 时算好 —— 口径是
+        // 「环形缓冲水位 + 一个 ASIO 缓冲区」,说明见那里。
+        let frames = obj.latency_frames.load(Ordering::Relaxed) as i32;
+        if frames == 0 {
             return ase::INVALID_MODE;
-        };
-        // ASIO 的延迟定义是「bufferSwitch 到声音真正进出」的时间。
-        //
-        // 多设备驱动里这个值由环形缓冲维持的水位决定 —— 数据要先在
-        // 环形缓冲里排队,然后才被重采样送进设备(输出方向)或者被宿主
-        // 读到(输入方向)。所以延迟是「水位 + 一个 ASIO 缓冲区」,而不是
-        // 一个缓冲区,也不是 `buffer_size × 水位`(那是水位还以缓冲区为
-        // 单位时的旧算法,数字偏大得多)。
-        //
-        // 报大了只是让宿主的对齐补偿多留一点余量;报小了才会让录音对不齐,
-        // 所以这里不做任何"乐观"的缩减。
-        let watermark = engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
-        let frames = (watermark.round() as i32).saturating_add(engine.buffer_size() as i32);
+        }
         unsafe {
             *input_latency = frames;
             *output_latency = frames;
@@ -512,18 +642,19 @@ unsafe extern "system" fn vt_get_buffer_size(
             return E_INVALIDARG;
         }
         let obj = object(this);
-        let state = obj.state.lock();
-        let Some(engine) = state.engine.as_ref() else {
+        // 无锁,理由同 getChannels。只承诺一个缓冲大小,所以四个出参同值。
+        let n = obj.buffer_size.load(Ordering::Relaxed) as i32;
+        if n == 0 {
             return ase::INVALID_MODE;
-        };
-        let (min, max, preferred, gran) = engine.buffer_size_range();
-        unsafe {
-            *min_size = min;
-            *max_size = max;
-            *preferred_size = preferred;
-            *granularity = gran;
         }
-        log::debug!("getBufferSize() -> {min}..{max}(首选 {preferred})");
+        unsafe {
+            *min_size = n;
+            *max_size = n;
+            *preferred_size = n;
+            *granularity = 0;
+        }
+        // 同 getChannels:不在这个路径上打日志。缓冲大小在引擎 `prepare`
+        // 时已经记过一条。
         ase::OK
     })
 }
@@ -672,8 +803,9 @@ unsafe extern "system" fn vt_get_channel_info(
             return E_INVALIDARG;
         }
         let obj = object(this);
-        let state = obj.state.lock();
-        let Some(engine) = state.engine.as_ref() else {
+        // 无锁:这个接口可能在宿主的 bufferSwitch 回调里被调用。见
+        // `EngineSnapshot` 的说明。
+        let Some(snap) = obj.snapshot.get() else {
             return ase::INVALID_MODE;
         };
 
@@ -685,23 +817,30 @@ unsafe extern "system" fn vt_get_channel_info(
         }
         let chan = chan as usize;
 
-        let (limit, active) = if is_input {
-            (engine.input_channel_count(), &state.active_inputs)
+        let limit = if is_input {
+            snap.channels_in
         } else {
-            (engine.output_channel_count(), &state.active_outputs)
+            snap.channels_out
         };
         if chan >= limit {
-            log::warn!("getChannelInfo 请求了不存在的通道 {chan}(上限 {limit})");
+            // 只在第一次落盘:`getChannelInfo` 可能被音频回调调用,而日志
+            // 要写文件 —— 阻塞 I/O 会让缓冲区欠载。宿主真有 bug 时日志里
+            // 留一条就够,不能让它每块回调都刷一次。
+            if !obj.channel_info_warned.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "getChannelInfo 请求了不存在的通道 {chan}(上限 {limit});后续同类提示不再记录"
+                );
+            }
             return ase::INVALID_PARAMETER;
         }
 
-        target.is_active = if active.get(chan).copied().unwrap_or(false) {
+        target.is_active = if obj.is_active(is_input, chan) {
             ASIO_TRUE
         } else {
             ASIO_FALSE
         };
         target.channel_group = 0;
-        target.r#type = engine.config().asio_sample_type.asio_code();
+        target.r#type = snap.sample_type_code;
 
         // 名字在引擎构造时就全部算好并保证了同方向内不重名
         // (见 pigasio_core::channel_name),这里只是查表。
@@ -710,11 +849,11 @@ unsafe extern "system" fn vt_get_channel_info(
         } else {
             StreamKind::Output
         };
-        if let Some(name) = engine.channel_name(kind, chan) {
+        if let Some(name) = snap.channel_names.get(kind, chan) {
             target.set_name(name);
-            log::debug!("getChannelInfo -> {name}(通道 {chan})");
-        } else {
-            // 走不到这里:上面的越界检查已经挡过了。
+        } else if !obj.channel_info_warned.swap(true, Ordering::Relaxed) {
+            // 走不到这里:上面的越界检查已经挡过了。真走到了说明通道表和
+            // 名字表对不上,值得报 —— 但同样只报一次,理由见上面。
             log::warn!("getChannelInfo 取不到通道 {chan} 的名字");
         }
         ase::OK
@@ -820,8 +959,21 @@ unsafe extern "system" fn vt_create_buffers(
                 info.buffers[1] = engine.buffer_ptr(is_input, chan, 1) as *mut core::ffi::c_void;
             }
 
-            st.active_inputs = active_inputs;
-            st.active_outputs = active_outputs;
+            // prepare 成功了才发布:通道启用位、缓冲大小、延迟。这些都得在
+            // 任何回调开始之前摆好 —— 宿主在 `start()` 之前还会读
+            // `getChannelInfo()`,而它在回调里也可能被调用。
+            for (ch, &on) in active_inputs.iter().enumerate() {
+                if on {
+                    obj.set_active(true, ch);
+                }
+            }
+            for (ch, &on) in active_outputs.iter().enumerate() {
+                if on {
+                    obj.set_active(false, ch);
+                }
+            }
+            obj.update_sizes(engine);
+
             st.prepared = true;
             log::info!("已创建 {num_channels} 个通道的缓冲区,每块 {buffer_size} 帧");
             Ok(())
@@ -848,8 +1000,7 @@ unsafe extern "system" fn vt_dispose_buffers(this: *mut core::ffi::c_void) -> AS
                 .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
 
             st.prepared = false;
-            st.active_inputs.iter_mut().for_each(|v| *v = false);
-            st.active_outputs.iter_mut().for_each(|v| *v = false);
+            obj.clear_active();
             st.callbacks = ASIOCallbacks::default();
             Ok(())
         })
@@ -1008,5 +1159,39 @@ mod tests {
             map_core_error(&CoreError::AlreadyRunning),
             ase::INVALID_MODE
         );
+    }
+
+    #[test]
+    fn 通道启用位可以无锁读写且不怕越界() {
+        // 这个位图是 `getChannelInfo()` 的数据来源 —— 那个接口可能在宿主的
+        // `bufferSwitch` 回调里被调用,所以它绝不能靠 `state` 锁来保护。
+        let obj = DriverObject::create();
+        // SAFETY: 引用计数为 1,下面用完显式 Release 掉。
+        unsafe {
+            let o = &*obj;
+
+            // 还没发布快照(init 之前):保守当作未启用,而且不 panic。
+            assert!(!o.is_active(true, 0));
+            o.set_active(true, 0);
+            assert!(!o.is_active(true, 0));
+            o.clear_active();
+
+            // 模拟 init 之后:两个输入通道。
+            let _ = o
+                .active_inputs
+                .set(vec![AtomicBool::new(false), AtomicBool::new(false)]);
+            o.set_active(true, 1);
+            assert!(o.is_active(true, 1));
+            assert!(!o.is_active(true, 0));
+
+            // 越界查询和写入都不能 panic —— 通道号来自宿主,越界是可能的。
+            assert!(!o.is_active(true, 99));
+            o.set_active(true, 99);
+
+            o.clear_active();
+            assert!(!o.is_active(true, 1));
+
+            vt_release(obj as *mut core::ffi::c_void);
+        }
     }
 }
