@@ -28,6 +28,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 
 use windows::core::Interface;
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioClient, IAudioClient3, IMMDevice, IMMDeviceEnumerator,
@@ -144,9 +145,10 @@ struct WasapiDevice {
 }
 
 // `IMMDevice` 在 windows crate 里没被标成 `Send + Sync`(它内部是裸指针),
-// 但 `IMMDevice` 是 agile 的 COM 对象:它可以在 MTA 下的任意线程使用。
-// 后端的 `DeviceHandle` 要求 `Send + Sync`,因为 `DeviceInfo` 会被克隆、
-// 跨线程传递(引擎在宿主线程解析设备,在专用线程打开流)。
+// 但它是 **agile** 的 COM 对象:无论所在线程是 MTA 还是 STA,都可以自由地
+// 跨线程使用它,不需要 marshal。后端的 `DeviceHandle` 要求 `Send + Sync`,
+// 因为 `DeviceInfo` 会被克隆、跨线程传递(引擎在宿主线程解析设备,在专用
+// 线程打开流)。
 unsafe impl Send for WasapiDevice {}
 unsafe impl Sync for WasapiDevice {}
 
@@ -240,12 +242,24 @@ pub(super) fn ensure_com() -> Result<()> {
                 Err(Error::Backend("COM 初始化失败".into()))
             };
         }
-        let ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+
+        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // `RPC_E_CHANGED_MODE` **不是失败**:它的意思是"这个线程已经用别的
+        // apartment 模式初始化过 COM 了"。COM 本身可用,只是模式不同 ——
+        // 而 WASAPI 的接口都是 agile(free-threaded)的,在 STA 上照样能用。
+        //
+        // 控制面板的 UI 线程必然走到这条路:winit 创建窗口时会用
+        // `OleInitialize` 把线程设成 STA。把它当失败处理的话,控制面板里
+        // 永远枚举不出设备。
+        let ok = result.is_ok() || result == RPC_E_CHANGED_MODE;
         state.set(Some(ok));
         if ok {
             Ok(())
         } else {
-            Err(Error::Backend("COM 初始化失败".into()))
+            Err(Error::Backend(format!(
+                "COM 初始化失败(0x{:08X})",
+                result.0 as u32
+            )))
         }
     })
 }
@@ -441,5 +455,29 @@ mod tests {
         assert_eq!(align_up(0, 128), 0);
         // 基本单位为 0 时不该除零,原样返回。
         assert_eq!(align_up(300, 0), 300);
+    }
+
+    #[test]
+    fn 线程已经是_sta_时_com_依然可用() {
+        // 控制面板的 UI 线程就是这个状态:winit 创建窗口时用 `OleInitialize`
+        // 把它设成了 STA,我们再请求 MTA 会拿到 `RPC_E_CHANGED_MODE`。
+        //
+        // 曾经把这个返回值当失败,后果是**控制面板里永远枚举不出设备**,而
+        // 命令行工具一切正常(它的主线程没被别人初始化过)—— 这种"只在 GUI
+        // 里坏"的 bug 光看 CLI 是发现不了的。
+        let init = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            )
+        };
+        // 测试线程可能已经是别的模式了(线程池复用),那不碍事 —— 要验证的是
+        // `ensure_com()` 不该因为模式不匹配而失败。
+        let _ = init;
+
+        assert!(
+            super::ensure_com().is_ok(),
+            "线程已经在 STA 上初始化过 COM 时,ensure_com 不该报失败"
+        );
     }
 }
