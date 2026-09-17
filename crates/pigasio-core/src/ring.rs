@@ -101,10 +101,14 @@ impl FrameWriter {
         let written = pushed.len() / self.channels;
         if written < want {
             self.overflow_frames += (want - written) as u64;
-            log::debug!(
-                "环形缓冲写满:请求 {want} 帧,实际写入 {written} 帧(累计溢出 {} 帧)",
-                self.overflow_frames
-            );
+            // 这里**刻意不打日志**。本函数跑在音频线程上(输出方向由 `drain()`
+            // 调用,输入方向由设备回调调用),而日志最终要落盘 —— 一次磁盘 I/O
+            // 就够让缓冲区欠载。更糟的是溢出会让后续调用更频繁地走到这里,落盘
+            // 又把实时线程拖得更慢,形成恶性循环。
+            //
+            // 计数已经够了:控制面板的实时状态和 `pigasio monitor` 都会显示它
+            // (`had_glitch` 也因此变红)。这和引擎里对丢帧、重采样失败的处理
+            // 一致 —— 实时线程只记数,要不要落盘由非实时路径决定。
         }
         written
     }

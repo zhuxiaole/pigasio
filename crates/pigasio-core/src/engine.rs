@@ -773,9 +773,16 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         }
     });
 
+    let mut err_logged = false;
     let on_error: ErrorCallback = Box::new(move |e: String| {
         err_flag.store(true, Ordering::Release);
-        log::error!("输入设备 “{err_name}” 报错:{e}");
+        // 只在第一次落盘。这个回调跑在后端的音频线程上,而设备一旦出错
+        // (被拔掉、被独占)往往会**每次回调都报**——日志要写文件,不能
+        // 每次都记。`err_flag` 本身是给界面看的,它照样每次都置位。
+        if !err_logged {
+            err_logged = true;
+            log::error!("输入设备 “{err_name}” 报错:{e}");
+        }
     });
 
     device.open_input(&format, on_data, on_error)
@@ -871,9 +878,14 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         }
     });
 
+    let mut err_logged = false;
     let on_error: ErrorCallback = Box::new(move |e: String| {
         err_flag.store(true, Ordering::Release);
-        log::error!("输出设备 “{err_name}” 报错:{e}");
+        // 同输入侧:只在第一次落盘,理由见那里。
+        if !err_logged {
+            err_logged = true;
+            log::error!("输出设备 “{err_name}” 报错:{e}");
+        }
     });
 
     device.open_output(&format, on_data, on_error)
