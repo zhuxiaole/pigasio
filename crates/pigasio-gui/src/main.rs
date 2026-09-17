@@ -387,6 +387,18 @@ const NO_DEVICE: &str = "(禁用)";
 /// `version`),不用手工维护。
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
+/// 两次采样之间至少隔多久才重新计算欠载/溢出速率(秒)。
+///
+/// 差值来自两个累计计数相减,间隔太短时噪声很大 —— 相邻两帧只隔十几毫秒,
+/// 差一帧就能算出"60 帧/秒"这种吓人的数字。半秒的窗口既够灵敏,也让读数稳定。
+const RATE_SAMPLE_INTERVAL: f64 = 0.5;
+
+/// 速率低于这个值就当"已经稳住了"(帧/秒)。
+///
+/// 半秒里少于半帧,基本就是偶发抖动而不是持续故障 —— 那种情况下显示速率只会
+/// 让人盯着一个跳来跳去的数字,不如直接报"正常"。
+const RATE_NOISE_FLOOR: f64 = 0.5;
+
 /// 窗口标题。带上版本号,任务栏和 Alt+Tab 里也看得见。
 ///
 /// 它同时还是"按标题找窗口"的依据(`find_main_window`),所以只能有这一个
@@ -849,6 +861,15 @@ struct App {
     /// 反复跳高度 —— 而 egui 在内容变矮时会把滚动位置夹回顶部,表现正是
     /// "刷新一下又滑回顶上了"。所以留一份上次的结果兜着。
     last_stats: Vec<StreamStatusSnapshot>,
+    /// 上一次采样时各流的累计 `(欠载, 溢出)` 帧数,顺序与 `last_stats` 一致。
+    ///
+    /// 那两个累计值只增不减,所以单看它们分不出"启动时欠过一下就再没欠"和
+    /// "一直在欠" —— 只有拿两次采样做差才看得出来。
+    stats_baseline: Vec<(u64, u64)>,
+    /// 上面那份基线是什么时候采的。
+    stats_baseline_at: Option<Instant>,
+    /// 最近一次算出的新增速率,按流索引:`(欠载帧/秒, 溢出帧/秒)`。
+    glitch_rate: Vec<(f64, f64)>,
     /// 窗口左上角,每帧跟着实际位置更新,退出时写进界面偏好。
     window_pos: Option<egui::Pos2>,
     /// 窗口客户区大小,同上。
@@ -914,6 +935,9 @@ impl App {
             runner_job: None,
             devices_job: None,
             last_stats: Vec::new(),
+            stats_baseline: Vec::new(),
+            stats_baseline_at: None,
+            glitch_rate: Vec::new(),
             window_pos: None,
             window_size: None,
             // 恢复最大化时先当它已经最大化了:要等 `ViewportInfo` 回来才知道
@@ -974,6 +998,51 @@ impl App {
     fn set_error(&mut self, message: String) {
         self.message = message;
         self.message_is_error = true;
+    }
+
+    /// 丢掉上一次试运行留下的统计。
+    ///
+    /// 速率基线也要一起丢 —— 只清 `last_stats` 的话,下一轮第一次采样会拿旧
+    /// 基线做差,算出一个荒唐的速率(比如"欠载 3000 帧/秒")。
+    fn clear_stats(&mut self) {
+        self.last_stats.clear();
+        self.stats_baseline.clear();
+        self.stats_baseline_at = None;
+        self.glitch_rate.clear();
+    }
+
+    /// 采样一次,算出各流**最近**的欠载 / 溢出速率(帧/秒)。
+    ///
+    /// 那两个累计计数只增不减,所以"现在还在不在欠"只能靠两次采样的差。
+    /// 采样间隔太短时差值噪声很大(相邻两帧只隔十几毫秒),所以隔半秒以上才
+    /// 重新算一次,中间沿用上次的结果。
+    fn sample_glitch_rates(&mut self, stats: &[StreamStatusSnapshot]) {
+        let now = Instant::now();
+        let dt = self
+            .stats_baseline_at
+            .map(|at| now.duration_since(at).as_secs_f64())
+            .unwrap_or(0.0);
+
+        // 流的数量/顺序在运行期不变,所以按索引对齐;对不上说明是新的一轮
+        // 运行,重新建立基线。
+        let fresh = self.stats_baseline.len() != stats.len() || dt <= 0.0;
+        if !fresh && dt < RATE_SAMPLE_INTERVAL {
+            return;
+        }
+
+        if fresh {
+            // 第一轮没有可比的对象 —— 之前那些欠载属于"启动期",速率从下一轮
+            // 开始才有意义。
+            self.glitch_rate = vec![(0.0, 0.0); stats.len()];
+        } else {
+            self.glitch_rate = glitch_rates(stats, &self.stats_baseline, dt);
+        }
+
+        self.stats_baseline = stats
+            .iter()
+            .map(|s| (s.stats.underflow_frames, s.stats.overflow_frames))
+            .collect();
+        self.stats_baseline_at = Some(now);
     }
 
     fn set_info(&mut self, message: String) {
@@ -1099,7 +1168,7 @@ impl App {
             });
             self.runner_job = Some(RunnerJob::Stopping(rx));
             // 统计是跟着这一次运行走的,别留给下一次。
-            self.last_stats.clear();
+            self.clear_stats();
             self.set_info("正在停止引擎…".into());
             return;
         }
@@ -2285,6 +2354,9 @@ impl App {
 
         // 这次没读到就沿用上一次的,别让表格忽高忽低(见 `last_stats`)。
         if !status.stream_stats.is_empty() {
+            // 速率的基线必须在**覆盖 `last_stats` 之前**采样 —— 它拿上一轮的
+            // 累计值当参照。
+            self.sample_glitch_rates(&status.stream_stats);
             self.last_stats = status.stream_stats.clone();
         }
         let stats: &[StreamStatusSnapshot] = if status.stream_stats.is_empty() {
@@ -2341,8 +2413,34 @@ impl App {
 
         // 表格本体:表头由 TableBuilder 画在同一套列模型里并钉在滚动区外,
         // 表体滚动 —— 列对齐是框架保证的,不再需要手工钉宽度。
-        stream_table(ui, stats);
+        stream_table(ui, stats, &self.glitch_rate);
     }
+}
+
+/// 由两次采样算出各流的新增速率:`(欠载帧/秒, 溢出帧/秒)`。
+///
+/// 抽成自由函数是为了能单测 —— 它没有任何状态,就是"累计值的差 ÷ 时间"。
+/// 长度对不上(换了配置、或者新的一轮运行)时一律给 0:与其拿错位的基线去
+/// 相减算出荒唐的数字,不如先不报。
+fn glitch_rates(
+    stats: &[StreamStatusSnapshot],
+    baseline: &[(u64, u64)],
+    dt: f64,
+) -> Vec<(f64, f64)> {
+    if dt <= 0.0 || baseline.len() != stats.len() {
+        return vec![(0.0, 0.0); stats.len()];
+    }
+    stats
+        .iter()
+        .zip(baseline)
+        .map(|(s, (underflow, overflow))| {
+            // `saturating_sub`:累计值本来只会增长,但万一引擎侧重置了计数器,
+            // 这里也不该算出负数速率。
+            let new_underflow = s.stats.underflow_frames.saturating_sub(*underflow) as f64;
+            let new_overflow = s.stats.overflow_frames.saturating_sub(*overflow) as f64;
+            (new_underflow / dt, new_overflow / dt)
+        })
+        .collect()
 }
 
 /// 实时状态的流统计表。
@@ -2352,7 +2450,7 @@ impl App {
 /// 结果表头和表体错位:两个 Grid 各算各的列宽,滚动条占位、内容宽度,任何
 /// 一处差一点就歪。Table 的表头和表体在**同一套列模型**里量出来,对齐是
 /// 框架保证的,列还能拖。
-fn stream_table(ui: &mut egui::Ui, stats: &[StreamStatusSnapshot]) {
+fn stream_table(ui: &mut egui::Ui, stats: &[StreamStatusSnapshot], glitch_rate: &[(f64, f64)]) {
     TableBuilder::new(ui)
         .id_salt("runner_streams")
         .striped(true)
@@ -2420,8 +2518,10 @@ fn stream_table(ui: &mut egui::Ui, stats: &[StreamStatusSnapshot]) {
                 });
                 return;
             }
-            for s in stats {
+            for (index, s) in stats.iter().enumerate() {
                 let snap = &s.stats;
+                let (underflow_rate, overflow_rate) =
+                    glitch_rate.get(index).copied().unwrap_or((0.0, 0.0));
                 body.row(20.0, |mut row| {
                     row.col(|ui| {
                         ui.label(s.kind.as_str());
@@ -2456,22 +2556,56 @@ fn stream_table(ui: &mut egui::Ui, stats: &[StreamStatusSnapshot]) {
                         ));
                     });
                     row.col(|ui| {
-                        if snap.is_healthy() {
-                            ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
-                        } else {
-                            // 欠载几乎总是水位不够厚,而水位现在完全由用户说了算,
-                            // 所以直接把调整方向写在这儿 —— 不然只能对着数字猜。
+                        // 这一格回答的是"**现在**好不好",所以看的是最近的新增速率
+                        // 而不是累计值 —— 累计值只增不减,启动时欠过一下就会永远
+                        // 显示不正常,分不出"早就稳了"和"还在欠"。
+                        if underflow_rate > RATE_NOISE_FLOOR {
+                            // 欠载几乎总是水位不够厚,而水位完全由用户说了算,
+                            // 所以直接把调整方向写在这儿。
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 160, 60),
-                                format!(
-                                    "欠载 {} / 溢出 {}",
-                                    snap.underflow_frames, snap.overflow_frames
-                                ),
+                                format!("欠载 {underflow_rate:.0} 帧/秒"),
                             )
                             .on_hover_text(
-                                "欠载是环形缓冲被读空了 —— 水位不够厚。可以试着把\
-                                 「缓冲目标水位」调大;溢出的方向相反,那是水位偏大\
-                                 或设备时钟偏慢。",
+                                "**还在**欠:环形缓冲被读空。水位不够厚,可以试着把\
+                                 「缓冲目标水位」调大。\n\n\
+                                 这里报的是最近半秒的新增速率,不是累计量 —— 稳定下来\
+                                 之后它会变回「正常」。",
+                            );
+                        } else if overflow_rate > RATE_NOISE_FLOOR {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 160, 60),
+                                format!("溢出 {overflow_rate:.0} 帧/秒"),
+                            )
+                            .on_hover_text(
+                                "**还在**溢出:数据写不进环形缓冲。方向与欠载相反 ——\
+                                 要么水位偏大、设备消化不掉,要么设备时钟偏慢。\n\n\
+                                 如果同时开着「设备周期」,先把它去掉试试:某些虚拟\
+                                 声卡在小周期下产出速率会偏离标称,导致持续溢出。",
+                            );
+                        } else if snap.is_healthy() {
+                            ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
+                        } else {
+                            // 曾经出过问题、现在已经稳住了:报「正常」,但把本次
+                            // 运行的累计量留在旁边的小字里 —— 它是历史账,不该
+                            // 继续冒充"当前状态"。
+                            ui.horizontal(|ui| {
+                                ui.colored_label(egui::Color32::from_rgb(90, 180, 90), "正常");
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "曾欠载 {} / 溢出 {}",
+                                        snap.underflow_frames, snap.overflow_frames
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            })
+                            .response
+                            .on_hover_text(
+                                "最近半秒没有新的欠载/溢出,所以现在是正常的。\n\n\
+                                 后面那个小字是**本次运行以来的累计量** —— 启动阶段\
+                                 或偶发被系统抢占都会记进去,它不再增长就说明实际已经\
+                                 稳住了,不必因为它非零而去调参数。",
                             );
                         }
                     });
@@ -2720,6 +2854,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 速率来自两次采样的差() {
+        fn snap(underflow: u64, overflow: u64) -> StreamStatusSnapshot {
+            StreamStatusSnapshot {
+                kind: StreamKind::Output,
+                index: 0,
+                device_name: "测试设备".into(),
+                channel_count: 2,
+                is_clock_master: false,
+                device_frames: 480,
+                drift_ppm: 0.0,
+                had_glitch: false,
+                stats: pigasio_core::ring::RingStatsSnapshot {
+                    underflow_frames: underflow,
+                    overflow_frames: overflow,
+                    ..Default::default()
+                },
+            }
+        }
+
+        let baseline = vec![(100u64, 20u64)];
+
+        // 半秒里新增 6 帧欠载、3 帧溢出 → 12 / 6 帧每秒。
+        let stats = vec![snap(106, 23)];
+        let rates = glitch_rates(&stats, &baseline, 0.5);
+        assert_eq!(rates[0], (12.0, 6.0));
+
+        // 没有新增 → 0:这正是"曾经欠过、现在已经稳了"的判据。
+        let stationary = vec![snap(100, 20)];
+        assert_eq!(glitch_rates(&stationary, &baseline, 0.5)[0], (0.0, 0.0));
+
+        // 累计值万一被重置(比基线小),也该给 0 而不是负数。
+        let reset = vec![snap(5, 0)];
+        assert_eq!(glitch_rates(&reset, &baseline, 0.5)[0], (0.0, 0.0));
+
+        // 长度对不上(换了配置 / 新的一轮运行):不拿错位的基线去减。
+        assert_eq!(glitch_rates(&stats, &[], 0.5), vec![(0.0, 0.0)]);
+        // 间隔为 0 时不做除法。
+        assert_eq!(glitch_rates(&stats, &baseline, 0.0), vec![(0.0, 0.0)]);
     }
 
     #[test]
