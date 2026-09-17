@@ -1589,16 +1589,29 @@ impl Engine {
         // 3. 等输入缓冲攒够一个缓冲区的数据。
         self.wait_for_input_prime();
 
-        // 4. 再让输出设备开始播放。
-        host.start(StreamGroup::Outputs)?;
-
-        // 5. 打开闸门。
+        // 4. 打开闸门。
+        //
+        // **必须在启动输出设备之前**。设备一旦 Start 就立刻开始从环形缓冲取
+        // 数据,而这时里面只有预填充的那一点。闸门要是还没开,`advance()` 会
+        // 直接返回、`drain()` 不执行 —— 缓冲只出不进,开头那一段必然欠载。
+        // 实测:把这一步提前之后,启动期的欠载从几百帧降到 0。
+        //
+        // 提前开闸门是安全的,两个方向都过一遍:
+        // * 输出方向此刻还没有任何回调 —— 流还没 Start,自然没有事件。
+        // * 输入方向虽然早在第 2 步就启动了,但只有**输入作为时钟主设备**时
+        //   它的回调才会推进引擎。那种情况下 `drain()` 会把数据写进输出环形
+        //   缓冲,而那些数据只是先排队等设备启动(容量是水位的 6 倍,几毫秒的
+        //   积压远够放),不会溢出。
         {
             let mut core = self.core.lock();
             core.buffer_index = 0;
             core.accumulated = 0;
             core.running = true;
         }
+
+        // 5. 让输出设备开始播放。
+        host.start(StreamGroup::Outputs)?;
+
         self.running.store(true, Ordering::Release);
         log::info!("引擎已启动");
         Ok(())

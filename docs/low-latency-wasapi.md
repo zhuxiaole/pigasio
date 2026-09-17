@@ -44,6 +44,34 @@ let hresult = audio_client.Initialize(share_mode, stream_flags, buffer_duration,
 | 3 | 接入 `IAudioClient3` 低延迟 period | 设备块变小 | check 报告里 `device_frames` 从 480 降到 128 |
 | 4 | 配置开关、回退策略、水位联动 | 可选特性 | 端到端 |
 
+## 实现进度
+
+**阶段 1、2 已完成。**
+
+- `backend/mod.rs`:三个 trait 与公共类型。
+- `backend/cpal_backend.rs`:原有 cpal 实现(默认后端)。
+- `backend/wasapi/`:`mod.rs` 是设备枚举与协商,`stream.rs` 是事件驱动的流。
+
+用环境变量切换后端(**默认仍是 cpal**):
+
+```cmd
+set PIGASIO_BACKEND=wasapi
+set PIGASIO_BACKEND=auto
+```
+
+阶段 2 的验收实测(同一份 3 进 3 出的配置,各跑 12 秒):
+
+| | cpal | wasapi |
+|---|---|---|
+| 设备块 | 480 帧(10 ms) | 480 帧(10 ms) |
+| 缓冲区交换偏差 | 0.00% | 0.01% |
+| 欠载 / 溢出 | 0 / 0 | 0 / 0 |
+
+顺带修掉一个**与后端无关**的启动期问题:调整了 `Engine::start()` 的顺序,
+把"打开闸门"提到"启动输出设备"之前。原来设备 Start 后会立刻从环形缓冲
+取数据,而闸门还没开、`drain()` 不执行,缓冲只出不进 —— WASAPI 后端下这会
+造成启动期几百帧的欠载,cpal 因为内部时序不同而没有暴露出来。
+
 **阶段 1 单独就有价值**:它把 `engine.rs` 从 cpal 的具体类型上摘下来,
 即使后面几阶段不做了,也让后端可替换。
 

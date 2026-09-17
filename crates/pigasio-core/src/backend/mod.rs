@@ -1,8 +1,13 @@
 //! 音频后端抽象。
 //!
 //! 引擎不直接依赖任何具体的音频 API:它只认这里的 [`Backend`] /
-//! [`DeviceHandle`] / [`StreamHandle`] 三个 trait。当前唯一的实现是 cpal
-//! (见 [`cpal_backend`])。
+//! [`DeviceHandle`] / [`StreamHandle`] 三个 trait。现有两个实现:
+//!
+//! * cpal(见 [`cpal_backend`])—— 默认,行为与改动前完全一致;
+//! * 直写 WASAPI(见 `wasapi`)—— 用 `PIGASIO_BACKEND=wasapi` 启用,
+//!   或者 `=auto` 让它自动挑。目前还只是"行为对齐 cpal"(默认 period),
+//!   切过去没有收益,所以默认不启用 —— 它的意义在于阶段 3 能把 period
+//!   降下来,见 `docs/low-latency-wasapi.md`。
 //!
 //! # 这一层为什么存在
 //!
@@ -24,7 +29,13 @@ use crate::error::{Result, StreamKind};
 
 mod cpal_backend;
 
+#[cfg(windows)]
+mod wasapi;
+
 pub use cpal_backend::CpalBackend;
+
+#[cfg(windows)]
+pub use wasapi::WasapiBackend;
 
 /// 设备端单个样本的格式。
 ///
@@ -137,9 +148,45 @@ pub trait Backend: Send + Sync {
 
 /// 当前使用的后端。
 ///
-/// 现阶段只有 cpal 一个实现。等直接的 WASAPI 后端做出来之后,这里会按配置
-/// 在两者之间挑 —— 见 `docs/low-latency-wasapi.md`。
+/// 选择规则:
+/// * `PIGASIO_BACKEND=cpal` 或 `=wasapi` —— 显式指定;
+/// * `PIGASIO_BACKEND=auto` —— 优先 WASAPI,它在这台机器上不可用时退回 cpal;
+/// * 不设置 —— **先用 cpal**。
+///
+/// 默认之所以还是 cpal:WASAPI 后端目前只做到"行为对齐 cpal"(默认 period),
+/// 切过去没有任何收益,却要承担一套新代码的风险。等阶段 3 把低延迟 period
+/// 接上、真机跑稳之后再改默认。见 `docs/low-latency-wasapi.md`。
 pub fn current() -> &'static dyn Backend {
-    static BACKEND: std::sync::OnceLock<CpalBackend> = std::sync::OnceLock::new();
-    BACKEND.get_or_init(CpalBackend::new)
+    static BACKEND: std::sync::OnceLock<Box<dyn Backend>> = std::sync::OnceLock::new();
+    // 注意要多解一层:`&Box<dyn Backend>` 不是 `&dyn Backend`(标准库没有给
+    // `Box<dyn Trait>` 实现 `Trait`)。
+    &**BACKEND.get_or_init(select_backend)
+}
+
+/// 按上面的规则挑一个后端。
+#[cfg(windows)]
+fn select_backend() -> Box<dyn Backend> {
+    match std::env::var("PIGASIO_BACKEND").as_deref() {
+        Ok("cpal") => Box::new(CpalBackend::new()),
+        Ok("wasapi") => {
+            log::info!("音频后端:wasapi(由 PIGASIO_BACKEND 指定)");
+            Box::new(WasapiBackend::new())
+        }
+        Ok("auto") => {
+            let wasapi = WasapiBackend::new();
+            if wasapi.available() {
+                log::info!("音频后端:wasapi(自动选择)");
+                Box::new(wasapi)
+            } else {
+                log::warn!("WASAPI 后端在这台机器上不可用,退回 cpal");
+                Box::new(CpalBackend::new())
+            }
+        }
+        _ => Box::new(CpalBackend::new()),
+    }
+}
+
+#[cfg(not(windows))]
+fn select_backend() -> Box<dyn Backend> {
+    Box::new(CpalBackend::new())
 }
