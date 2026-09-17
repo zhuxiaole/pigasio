@@ -1792,6 +1792,22 @@ impl eframe::App for App {
 impl App {
     fn draw_engine_settings(&mut self, ui: &mut egui::Ui) {
         theme::section_heading(ui, "引擎设置");
+
+        // 这段总述放在控件**之前**。
+        //
+        // 早先它在两栏下面,而右栏末尾还有一行「实测最大设备块…」提示 —— 于是这
+        // 句小字被推到了整个面板的最底部,离它描述的控件隔着整整一片,看着像一句
+        // 悬空的注释。放在标题下面,它才是"这一节在讲什么"的开场白。
+        ui.label(
+            egui::RichText::new(
+                "采样率和缓冲区大小由所有设备共用。设备不支持该采样率时,引擎会自动\
+                 重采样,所以不同声卡可以混用。",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+
         let sample_rate = self.sample_rate;
 
         // 两栏并排。
@@ -1809,22 +1825,6 @@ impl App {
             self.engine_settings_right(&mut cols[1]);
         });
 
-        // 说明文字紧跟着两栏,不再额外加间距。
-        //
-        // 这里加过 2.0 甚至 8.0,结果和右栏末尾那行「实测最大设备块…」提示之间
-        // 空出明显一段 —— 两行都是 `.small().weak()` 的小字,本该看着像同一段
-        // 补充说明,拉开反而像分属两处。
-        //
-        // 剩下的一点缝隙来自 egui 的 `item_spacing`,那是全局行距,留着才不至于
-        // 和上一行黏成一行。
-        ui.label(
-            egui::RichText::new(
-                "采样率和缓冲区大小由所有设备共用。设备不支持该采样率时,引擎会自动\
-                 重采样,所以不同声卡可以混用。",
-            )
-            .small()
-            .weak(),
-        );
         let _ = self.asio_sample_type;
     }
 
