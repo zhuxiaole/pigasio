@@ -1248,13 +1248,33 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "[engine] 不是一个表")
         })?;
+
+    // 先清掉**我们管理的**键,再逐个写回去 —— 和 `update_stream` 的做法一致。
+    //
+    // 不能只靠"赋值覆盖":有些键是**条件写入**的(比如 `period_frames` 只在
+    // 非 0 时才写),那样"把值设回默认"就变成了"这次什么都不写",旧值会原封
+    // 不动地赖在文件里 —— 用户清空之后重开面板,会看到它又回来了。
+    //
+    // 只删这几个键,用户手写的其他内容(注释、我们不认识的键)照旧留着。
+    for key in [
+        "resample_quality",
+        "drift_correction",
+        "max_drift_ppm",
+        "use_non_ascii_channel_names",
+        "watermark_ms",
+        "backend",
+        "period_frames",
+    ] {
+        engine.remove(key);
+    }
+
     engine["resample_quality"] = value(quality_name(config.engine.resample_quality));
     engine["drift_correction"] = value(config.engine.drift_correction);
     engine["max_drift_ppm"] = value(config.engine.max_drift_ppm);
     engine["use_non_ascii_channel_names"] = value(config.engine.use_non_ascii_channel_names);
     engine["watermark_ms"] = value(config.engine.watermark_ms);
     engine["backend"] = value(config.engine.backend.as_str());
-    // 只有显式指定了才写出去 —— 不写就是用设备允许的最短周期。
+    // 0(不写)表示"保持设备默认的周期",此时上面已经把这个键删掉了。
     if let Some(frames) = config.engine.period_frames {
         engine["period_frames"] = value(frames as i64);
     }
@@ -2620,6 +2640,49 @@ mod tests {
         assert_eq!(v2.window_pos, Some([10.0, 20.0]));
         assert!(v2.window_size.is_none());
         assert!(v2.maximized.is_none());
+    }
+
+    #[test]
+    fn 把设备周期设回默认会删掉那个键() {
+        // 只写不改的话,旧值会赖在文件里 —— 用户把周期设回 0、保存、重开面板,
+        // 会看到 256 又回来了。
+        let dir = std::env::temp_dir().join(format!("pigasio-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("PigASIO.toml");
+        std::fs::write(
+            &path,
+            "sample_rate = 48000\n\n[engine]\nbackend = \"wasapi\"\nperiod_frames = 256\n",
+        )
+        .expect("写初始文件");
+
+        // 模拟用户在界面上把周期设回 0(即"保持设备默认")。
+        let config = Config {
+            sample_rate: 48000,
+            buffer_size_samples: 1024,
+            outputs: vec![StreamConfig::default()],
+            engine: EngineConfig {
+                backend: BackendKind::Wasapi,
+                period_frames: None,
+                ..EngineConfig::default()
+            },
+            ..Config::default()
+        };
+        write_config(&path, &config).expect("保存");
+
+        let text = std::fs::read_to_string(&path).expect("读回");
+        assert!(
+            !text.contains("period_frames"),
+            "旧的设备周期没被删掉:\n{text}"
+        );
+        assert_eq!(
+            Config::from_file(&path).expect("重新载入").engine.period_frames,
+            None,
+            "重新载入后设备周期又冒出来了:\n{text}"
+        );
+        // 同一张表里其他键该留的还得留。
+        assert!(text.contains("backend = \"wasapi\""), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
