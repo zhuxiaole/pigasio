@@ -1916,36 +1916,64 @@ impl App {
         } else {
             let sample_rate = self.sample_rate.max(1) as f64;
             let block_ms = block_frames as f64 / sample_rate * 1000.0;
-            if self.watermark_ms < block_ms {
-                let label = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "⚠ 水位 {:.0} ms 薄于实测设备块 {block_ms:.0} ms({block_frames} 帧),\
-                             建议至少 {:.0} ms",
-                            self.watermark_ms,
-                            (block_ms * 1.5).ceil(),
-                        ))
-                        .color(egui::Color32::from_rgb(220, 160, 60)),
-                    )
-                    .truncate(),
-                );
-                label.on_hover_text(
-                    "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频引擎\
-                     决定,和 ASIO 缓冲区大小无关。两块设备回调之间环形缓冲没有新数据\
-                     补充,所以水位得比这个时间长,否则宿主来取数据时缓冲里是空的。",
-                );
-            } else {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "实测最大设备块 {block_ms:.0} ms({block_frames} 帧),\
-                             水位比它厚 {:.1} 倍",
-                            self.watermark_ms / block_ms
-                        ))
-                        .weak(),
-                    )
-                    .truncate(),
-                );
+            let floor_ms = watermark_floor_ms(block_ms);
+            match watermark_verdict(self.watermark_ms, block_ms) {
+                WatermarkVerdict::TooThin => {
+                    let label = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "⚠ 水位 {:.0} ms 薄于实测设备块 {block_ms:.0} ms({block_frames} 帧),\
+                                 建议至少 {floor_ms:.0} ms",
+                                self.watermark_ms,
+                            ))
+                            .color(egui::Color32::from_rgb(220, 160, 60)),
+                        )
+                        .truncate(),
+                    );
+                    label.on_hover_text(
+                        "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频\
+                         引擎决定,和 ASIO 缓冲区大小无关。两块设备回调之间环形缓冲没有\
+                         新数据补充,所以水位得比这个时间长,否则宿主来取数据时缓冲里\
+                         是空的。",
+                    );
+                }
+                WatermarkVerdict::TooThick => {
+                    // 反方向的问题:水位厚到这份上,多出来的部分全是在白等。
+                    // 典型症状是"切到了低延迟后端、设备块也降下来了,却感觉延迟
+                    // 没变" —— 设备块小了,水位没跟着降。
+                    let saved = self.watermark_ms - floor_ms;
+                    let label = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "↓ 水位 {:.0} ms,实测设备块 {block_ms:.1} ms —— \
+                                 可降到约 {floor_ms:.0} ms,省 {saved:.0} ms 延迟",
+                                self.watermark_ms,
+                            ))
+                            .color(egui::Color32::from_rgb(110, 170, 220)),
+                        )
+                        .truncate(),
+                    );
+                    label.on_hover_text(
+                        "水位是延迟的主要组成部分,而它只需要盖过**约两块**设备回调\
+                         就够稳 —— 水位按平均值维持,波谷会比均值低将近一整块设备回调。\n\n\
+                         设备块小的时候,现在的水位有一大半是白等的:调小它不会让抗\
+                         抖动能力变差,只是把余量收回到合理范围。\n\n\
+                         改完跑一次试运行,确认「欠载」还是 0;有欠载就往回调一点。",
+                    );
+                }
+                WatermarkVerdict::Ok => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "实测最大设备块 {block_ms:.0} ms({block_frames} 帧),\
+                                 水位比它厚 {:.1} 倍",
+                                self.watermark_ms / block_ms
+                            ))
+                            .weak(),
+                        )
+                        .truncate(),
+                    );
+                }
             }
         }
     }
@@ -2450,6 +2478,39 @@ fn backend_label(kind: BackendKind) -> &'static str {
     }
 }
 
+/// 水位(毫秒)相对于实测设备块的健康状况。
+///
+/// 两个方向都有问题:太薄必然欠载,太厚则是在白等延迟。中间那段才是想要的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkVerdict {
+    /// 比一块设备回调还薄 —— 两块回调之间缓冲会被取空,必然欠载。
+    TooThin,
+    /// 厚到"够用值"的两倍以上 —— 多出来的部分纯粹是延迟。
+    TooThick,
+    /// 合理。
+    Ok,
+}
+
+/// 水位的推荐下限(毫秒)。
+///
+/// 水位按平均值维持,而波谷会比均值低将近一整块设备回调,所以至少得盖过两块;
+/// 2.3 倍(即两块再加 15% 余量)出自 README 里那段实测结论:设备块 10 ms 的
+/// 机器上 20 ms 会持续欠载、22 ms 才开始干净。
+fn watermark_floor_ms(block_ms: f64) -> f64 {
+    block_ms * 2.3
+}
+
+fn watermark_verdict(watermark_ms: f64, block_ms: f64) -> WatermarkVerdict {
+    if watermark_ms < block_ms {
+        WatermarkVerdict::TooThin
+    } else if watermark_ms > watermark_floor_ms(block_ms) * 2.0 {
+        // 留出一倍宽裕再提示:边界附近来回跳的提示比没有还烦人。
+        WatermarkVerdict::TooThick
+    } else {
+        WatermarkVerdict::Ok
+    }
+}
+
 /// 把过长的设备名截短,给界面省点横向空间。
 fn elide(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -2521,6 +2582,27 @@ mod tests {
         assert_eq!(v2.window_pos, Some([10.0, 20.0]));
         assert!(v2.window_size.is_none());
         assert!(v2.maximized.is_none());
+    }
+
+    #[test]
+    fn 水位诊断分三档() {
+        // 10 ms 设备块 → 推荐下限约 23 ms。
+        assert_eq!(watermark_verdict(5.0, 10.0), WatermarkVerdict::TooThin);
+        assert_eq!(watermark_verdict(10.0, 10.0), WatermarkVerdict::Ok);
+        assert_eq!(watermark_verdict(23.0, 10.0), WatermarkVerdict::Ok);
+        // 超过下限两倍(46 ms)才算偏厚 —— 边界附近不来回跳提示。
+        assert_eq!(watermark_verdict(46.0, 10.0), WatermarkVerdict::Ok);
+        assert_eq!(watermark_verdict(47.0, 10.0), WatermarkVerdict::TooThick);
+
+        // 低延迟设备块(128 帧 @ 48 kHz ≈ 2.67 ms)→ 推荐下限约 6.1 ms。
+        // 默认的 30 ms 在这里就是明显的浪费,这正是要提示的场景。
+        assert_eq!(watermark_verdict(30.0, 2.67), WatermarkVerdict::TooThick);
+        assert_eq!(watermark_verdict(6.1, 2.67), WatermarkVerdict::Ok);
+        assert_eq!(watermark_verdict(2.0, 2.67), WatermarkVerdict::TooThin);
+
+        // 推荐下限的两个性质:总在两块设备回调之上,且随设备块线性变化。
+        assert!(watermark_floor_ms(10.0) > 20.0);
+        assert!((watermark_floor_ms(20.0) - watermark_floor_ms(10.0) * 2.0).abs() < 1e-9);
     }
 
     #[test]
