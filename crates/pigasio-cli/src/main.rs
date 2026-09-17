@@ -287,6 +287,22 @@ fn parse_run_options(args: &[String], default_seconds: f64) -> Result<RunOptions
     Ok(opts)
 }
 
+/// 所有流的 `(累计欠载, 累计溢出)` 之和。
+///
+/// 只看总量看不出欠载是"刚启动时抖了一下"还是"一直在欠" —— 那要靠两次采样的
+/// 差(`cmd_check` 每秒采一次)。
+fn glitch_totals(status: &pigasio_core::EngineStatus) -> (u64, u64) {
+    status
+        .stream_stats
+        .iter()
+        .fold((0u64, 0u64), |(underflow, overflow), s| {
+            (
+                underflow + s.stats.underflow_frames,
+                overflow + s.stats.overflow_frames,
+            )
+        })
+}
+
 /// 按配置来源优先级载入配置。
 fn load_config(explicit: Option<&PathBuf>) -> Result<Config, String> {
     let path = match explicit {
@@ -453,6 +469,11 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     println!("[4/5] 运行 {:.1} 秒…", opts.seconds);
     let started = Instant::now();
     let mut last_report = Instant::now();
+    // 每秒采一次「所有流的累计欠载/溢出之和」,两次相减就是**最后一秒的新增**。
+    // 结束时报的累计值非零不等于现在有问题 —— 启动阶段抖一下也会记进去,所以
+    // 要靠这个增量区分"抖过一次"和"一直在欠"。
+    let mut previous_glitch = (0u64, 0u64);
+    let mut recent_glitch = (0u64, 0u64);
     while started.elapsed() < Duration::from_secs_f64(opts.seconds) {
         std::thread::sleep(Duration::from_millis(500));
         if last_report.elapsed() >= Duration::from_secs(1) {
@@ -466,6 +487,13 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             );
             use std::io::Write;
             let _ = std::io::stdout().flush();
+
+            let totals = glitch_totals(&engine.status());
+            recent_glitch = (
+                totals.0.saturating_sub(previous_glitch.0),
+                totals.1.saturating_sub(previous_glitch.1),
+            );
+            previous_glitch = totals;
         }
     }
     println!();
@@ -507,6 +535,20 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     if non_finite > 0 {
         println!("⚠ 异常样本    : {non_finite} 个非有限值(NaN/Inf)");
     }
+    // 逐流列出的欠载/溢出是**累计**值,非零很可能只是启动阶段抖了一下。这一行
+    // 单独回答"**现在**还在不在欠" —— 那才是判断配置好不好的依据。
+    let still_glitching = recent_glitch != (0, 0);
+    println!(
+        "稳态检查      : {}",
+        if still_glitching {
+            format!(
+                "⚠ 最后 1 秒仍有新增(欠载 {} 帧 / 溢出 {} 帧)",
+                recent_glitch.0, recent_glitch.1
+            )
+        } else {
+            "最后 1 秒无新增欠载 / 溢出".to_string()
+        }
+    );
     // 引擎级的丢帧:不属于哪条流,所以单列一行。正常恒为 0。
     if status.dropped_frames > 0 {
         println!(
@@ -584,10 +626,20 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         .filter(|s| s.had_glitch)
         .map(|s| format!("{} “{}”", s.kind.as_str(), s.device_name))
         .collect();
-    if !glitchy.is_empty() {
+    // 累计值非零**不等于**现在有问题:启动阶段抖一下就会被记进来,而那是正常的
+    // (README 里也写着"一启动就爆一下,之后正常")。所以只有**最后 1 秒还在新增**
+    // 才当成问题 —— 否则 `check` 会对一台完全正常的机器报失败、退出码还非零,
+    // 在脚本或 CI 里就是误报。
+    if !glitchy.is_empty() && still_glitching {
         problems.push(format!(
-            "以下流出现过欠载或溢出:{}。欠载说明缓冲水位不够厚,可以调大 \
+            "以下流仍在欠载或溢出:{}。欠载说明缓冲水位不够厚,可以调大 \
              engine.watermark_ms(单位毫秒);溢出则相反,是水位偏大、设备消化不掉",
+            glitchy.join("、")
+        ));
+    } else if !glitchy.is_empty() {
+        hints.push(format!(
+            "以下流在启动阶段出现过欠载/溢出:{};最后 1 秒没有新增,说明已经稳定,\
+             不影响结论",
             glitchy.join("、")
         ));
     }
