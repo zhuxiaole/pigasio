@@ -16,6 +16,7 @@ log = { workspace = true }
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
 toml = { workspace = true }
+toml_edit = { workspace = true }
 # 界面偏好(主题)单独存一份,见 `UiPrefs` 的说明。
 serde = { workspace = true }
 egui_extras = { version = "0.29", default-features = false }

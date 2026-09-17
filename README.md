@@ -272,7 +272,6 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `...channels` | — | 指定通道,如 `[0, 3]` |
 | `...channel_count` | `2` | 取前 N 个通道(上限 256);与 `channels` 二选一 |
 | `...gain_db` | `0.0` | 该设备所有通道的增益,范围 ±120 dB |
-| `...latency` | — | 建议延迟(秒) |
 | `...clock_master` | `false` | 是否作为时钟主设备,全配置最多一个 |
 
 > **`device_regex` 已移除。** 设备只能用 `device` 做名字子串匹配(忽略

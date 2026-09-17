@@ -28,9 +28,10 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use pigasio_core::config::{
     AsioSampleType, ChannelSelection, Config, DeviceRef, EngineConfig, ResampleQuality,
-    StreamConfig, WasapiOptions,
+    StreamConfig,
 };
 use pigasio_core::{AsioBufferSet, Engine, Result as CoreResult, StreamKind, StreamStatusSnapshot};
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
 mod theme;
 use theme::ThemeMode;
@@ -186,22 +187,29 @@ fn install_ui_font(ctx: &egui::Context) {
 
     // 1. Latin:Segoe UI,Windows 11 的界面字体。
     if let Some((bytes, index, source)) = load_latin_font() {
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = index;
-        fonts.font_data.insert(LATIN_FONT_KEY.to_owned(), data);
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push(LATIN_FONT_KEY.to_owned());
+        if has_font_header(&bytes) {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = index;
+            fonts.font_data.insert(LATIN_FONT_KEY.to_owned(), data);
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push(LATIN_FONT_KEY.to_owned());
+            }
+            installed.push(source);
+        } else {
+            log::warn!(
+                "{} 不是可识别的字体文件,已忽略 —— 界面会回退到内置字体",
+                source.display()
+            );
         }
-        installed.push(source);
     }
 
     // 2. CJK:雅黑一类。放在后面,只接管拉丁字体没有的字形。
     match load_cjk_font() {
-        Some((bytes, index, source)) => {
+        Some((bytes, index, source)) if has_font_header(&bytes) => {
             let mut data = egui::FontData::from_owned(bytes);
             data.index = index;
             fonts.font_data.insert(CJK_FONT_KEY.to_owned(), data);
@@ -214,13 +222,26 @@ fn install_ui_font(ctx: &egui::Context) {
             }
             installed.push(source);
         }
+        Some((_, _, source)) => log::warn!(
+            "{} 不是可识别的字体文件,已忽略;界面上的中文可能显示成方框。",
+            source.display()
+        ),
         None => log::warn!(
             "系统里找不到可用的中文字体,界面上的中文会显示成方框。\
              可以用环境变量 PIGASIO_FONT 指定一个字体文件。"
         ),
     }
 
-    ctx.set_fonts(fonts);
+    // 兜底:文件头看着是字体、内部却损坏时,epaint 在解析字形时仍可能
+    // panic。控制面板不该因为一个环境变量就整个起不来 —— 捕获之后回退到
+    // 内置字体,至少窗口还在。
+    let fallback = fonts.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.set_fonts(fonts))).is_err() {
+        log::error!("加载界面字体时出错,回退到内置字体");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.set_fonts(fallback);
+        }));
+    }
     if !installed.is_empty() {
         let names: Vec<_> = installed.iter().map(|p| p.display().to_string()).collect();
         log::info!("界面字体:{}", names.join(" + "));
@@ -274,6 +295,18 @@ fn load_cjk_font() -> Option<(Vec<u8>, u32, PathBuf)> {
         }
     }
     None
+}
+
+/// 文件头是不是 ab_glyph 认得的字体格式。
+///
+/// epaint 解析字体失败时会**直接 panic**,而 `PIGASIO_FONT` /
+/// `PIGASIO_LATIN_FONT` 完全可能指向一个根本不是字体的文件(路径写错了、
+/// 指到了目录下的别的文件)。与其等到解析字形时炸掉,不如先看一眼文件头:
+/// TrueType(`00 01 00 00` 或 `true`)、OpenType(`OTTO`)、
+/// TrueType 集合(`ttcf`)。
+fn has_font_header(bytes: &[u8]) -> bool {
+    const HEADERS: [&[u8]; 4] = [b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf"];
+    HEADERS.iter().any(|header| bytes.starts_with(header))
 }
 
 /// 解析 `路径` 或 `路径#序号` 形式的字体指定,并读出字节。
@@ -583,8 +616,6 @@ struct StreamEdit {
     /// 指定通道时用户输入的原文,例如 `0, 3`。
     channels_text: String,
     gain_db: f32,
-    latency_ms: Option<f32>,
-    wasapi_exclusive: bool,
     clock_master: bool,
 }
 
@@ -597,8 +628,6 @@ impl Default for StreamEdit {
             channel_count: 2,
             channels_text: "0, 1".into(),
             gain_db: 0.0,
-            latency_ms: None,
-            wasapi_exclusive: false,
             clock_master: false,
         }
     }
@@ -639,8 +668,6 @@ impl StreamEdit {
             channel_count,
             channels_text,
             gain_db: cfg.gain_db,
-            latency_ms: cfg.latency_seconds.map(|s| (s * 1000.0) as f32),
-            wasapi_exclusive: cfg.wasapi.exclusive,
             clock_master: cfg.clock_master,
         }
     }
@@ -676,12 +703,7 @@ impl StreamEdit {
         StreamConfig {
             device,
             channels,
-            latency_seconds: self.latency_ms.map(|ms| (ms / 1000.0) as f64),
             gain_db: self.gain_db,
-            wasapi: WasapiOptions {
-                exclusive: self.wasapi_exclusive,
-                auto_convert: true,
-            },
             clock_master: self.clock_master,
         }
     }
@@ -1168,86 +1190,155 @@ impl App {
     }
 }
 
-/// 把配置序列化成带注释的 TOML。
+/// 新配置文件的开头。只用于**首次**创建 —— 之后每次保存都是"读进来、
+/// 改键值、写回去",用户自己加的注释因此不会丢。
+const NEW_CONFIG_HEADER: &str = "\
+# PigASIO 配置文件 —— 由控制面板生成,也可以手工编辑。
+# 每个 [[input]] / [[output]] 对应一块独立设备,通道按书写顺序拼成
+# ASIO 的通道列表。
+";
+
+/// 把配置写回文件,**尽量保住用户原有的注释与排版**。
 ///
-/// 手写而不是直接 `toml::to_string`,是为了保留解释性注释 ——
-/// 用户最终是靠读这个文件来理解多设备配置的。
+/// 做法是"读-改-写":解析现有文件、只更新受影响的键,再原子替换。早先
+/// 这里是整份重新生成 —— 用户在手写配置里做的注释,只要在面板里点一次
+/// 保存就全没了。
+///
+/// 文件不存在时从 [`NEW_CONFIG_HEADER`] 起头。已存在的文件解析不了
+/// (多半是用户正在编辑、语法还没写完)则直接报错、不覆盖 —— 宁可保存
+/// 失败,也不能把人正在写的东西冲掉。
 fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> {
-    use std::fmt::Write as _;
-    let mut out = String::new();
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NEW_CONFIG_HEADER.to_string(),
+        Err(e) => return Err(e),
+    };
+    let mut doc = existing.parse::<DocumentMut>().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} 现在的语法有误,没有覆盖它:{e}", path.display()),
+        )
+    })?;
 
-    out.push_str("# PigASIO 配置文件 —— 由控制面板生成\n");
-    out.push_str("# 每个 [[input]] / [[output]] 对应一块独立设备,通道按书写顺序\n");
-    out.push_str("# 拼成 ASIO 的通道列表。\n\n");
-    let _ = writeln!(out, "sample_rate = {}", config.sample_rate);
-    let _ = writeln!(out, "buffer_size_samples = {}", config.buffer_size_samples);
-    let _ = writeln!(out, "asio_sample_type = \"{}\"", config.asio_sample_type);
+    doc["sample_rate"] = value(i64::from(config.sample_rate));
+    doc["buffer_size_samples"] = value(i64::from(config.buffer_size_samples));
+    doc["asio_sample_type"] = value(config.asio_sample_type.to_string());
 
-    out.push_str("\n[engine]\n");
-    let quality = match config.engine.resample_quality {
+    let engine = doc
+        .entry("engine")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "[engine] 不是一个表")
+        })?;
+    engine["resample_quality"] = value(quality_name(config.engine.resample_quality));
+    engine["drift_correction"] = value(config.engine.drift_correction);
+    engine["max_drift_ppm"] = value(config.engine.max_drift_ppm);
+    engine["use_non_ascii_channel_names"] = value(config.engine.use_non_ascii_channel_names);
+    engine["watermark_ms"] = value(config.engine.watermark_ms);
+
+    set_streams(&mut doc, "output", &config.outputs)?;
+    set_streams(&mut doc, "input", &config.inputs)?;
+
+    write_atomically(path, &doc.to_string())
+}
+
+fn quality_name(quality: ResampleQuality) -> &'static str {
+    match quality {
         ResampleQuality::None => "none",
         ResampleQuality::Fast => "fast",
         ResampleQuality::Sinc => "sinc",
-    };
-    let _ = writeln!(out, "resample_quality = \"{quality}\"");
-    let _ = writeln!(out, "drift_correction = {}", config.engine.drift_correction);
-    let _ = writeln!(out, "max_drift_ppm = {}", config.engine.max_drift_ppm);
-    let _ = writeln!(
-        out,
-        "use_non_ascii_channel_names = {}",
-        config.engine.use_non_ascii_channel_names
-    );
-    let _ = writeln!(out, "watermark_ms = {}", config.engine.watermark_ms);
+    }
+}
 
-    for (label, streams) in [("output", &config.outputs), ("input", &config.inputs)] {
-        for (i, s) in streams.iter().enumerate() {
-            out.push_str(&format!("\n# {label} #{}\n[[{label}]]\n", i + 1));
-            match &s.device {
-                DeviceRef::Default => out.push_str("device = \"default\"\n"),
-                DeviceRef::None => out.push_str("device = \"none\"\n"),
-                DeviceRef::Substring(name) => {
-                    let _ = writeln!(out, "device = {}", toml_string(name));
-                }
+/// 更新一组 `[[key]]` 数组表。
+///
+/// 按**下标**更新已有条目、不足的补、多余的删 —— 而不是整体重建。这样
+/// 每个条目自己的注释(比如"主板声卡接音箱"那一行)能留下来。
+fn set_streams(doc: &mut DocumentMut, key: &str, streams: &[StreamConfig]) -> std::io::Result<()> {
+    if !doc.get(key).map(Item::is_array_of_tables).unwrap_or(false) {
+        if doc.contains_key(key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{key} 存在但不是 [[{key}]] 数组表"),
+            ));
+        }
+        doc.insert(key, Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+
+    let tables = doc[key].as_array_of_tables_mut().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{key} 不是数组表"))
+    })?;
+    while tables.len() > streams.len() {
+        tables.remove(tables.len() - 1);
+    }
+    for (i, stream) in streams.iter().enumerate() {
+        if i >= tables.len() {
+            tables.push(Table::new());
+        }
+        let table = tables.get_mut(i).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "数组表下标失效")
+        })?;
+        update_stream(table, stream);
+    }
+    Ok(())
+}
+
+/// 把一条流写进它的表。
+///
+/// 先清掉条目专属的键再写:否则从 `channel_count` 改成 `channels`(或者
+/// 反过来)会让两个键并存,而配置层认为它们互斥、直接报错。
+fn update_stream(table: &mut Table, stream: &StreamConfig) {
+    for key in [
+        "device",
+        "channels",
+        "channel_count",
+        "gain_db",
+        "clock_master",
+    ] {
+        table.remove(key);
+    }
+
+    let device = match &stream.device {
+        DeviceRef::Default => "default".to_string(),
+        DeviceRef::None => "none".to_string(),
+        DeviceRef::Substring(name) => name.clone(),
+    };
+    table["device"] = value(device.as_str());
+
+    match &stream.channels {
+        ChannelSelection::Count(n) => {
+            table["channel_count"] = value(*n as i64);
+        }
+        ChannelSelection::List(list) => {
+            let mut array = Array::new();
+            for channel in list {
+                array.push(*channel as i64);
             }
-            match &s.channels {
-                ChannelSelection::Count(n) => {
-                    let _ = writeln!(out, "channel_count = {n}");
-                }
-                ChannelSelection::List(v) => {
-                    let list = v
-                        .iter()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let _ = writeln!(out, "channels = [{list}]");
-                }
-            }
-            if s.gain_db != 0.0 {
-                let _ = writeln!(out, "gain_db = {}", s.gain_db);
-            }
-            if let Some(lat) = s.latency_seconds {
-                let _ = writeln!(out, "latency = {lat}");
-            }
-            if s.clock_master {
-                out.push_str("clock_master = true\n");
-            }
-            if s.wasapi.exclusive {
-                let _ = writeln!(out, "\n[{label}.wasapi]\nexclusive = true");
-            }
+            table["channels"] = value(array);
         }
     }
 
-    // 原子替换:先写同目录下的临时文件,落盘后再 rename 覆盖目标。
-    //
-    // 直接原地截断写的话,写到一半崩溃 / 断电会留下一份半截的 TOML ——
-    // 而这是用户唯一的配置,下次启动直接解析失败。临时文件必须和目标
-    // **同目录**,rename 只有在同一文件系统内才是原子的;Windows 上
-    // `std::fs::rename` 会覆盖已存在的目标(底层是 `MoveFileExW` 加
-    // `MOVEFILE_REPLACE_EXISTING`),所以不必先删旧文件。
+    if stream.gain_db != 0.0 {
+        table["gain_db"] = value(f64::from(stream.gain_db));
+    }
+    if stream.clock_master {
+        table["clock_master"] = value(true);
+    }
+}
+
+/// 原子替换:先写同目录下的临时文件,落盘后再 rename 覆盖目标。
+///
+/// 直接原地截断写的话,写到一半崩溃 / 断电会留下一份半截的 TOML ——
+/// 而这是用户唯一的配置,下次启动直接解析失败。临时文件必须和目标
+/// **同目录**,rename 只有在同一文件系统内才是原子的;Windows 上
+/// `std::fs::rename` 会覆盖已存在的目标(底层是 `MoveFileExW` 加
+/// `MOVEFILE_REPLACE_EXISTING`),所以不必先删旧文件。
+fn write_atomically(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("toml.tmp");
     let written = std::fs::File::create(&tmp).and_then(|mut file| {
         use std::io::Write as _;
-        file.write_all(out.as_bytes())?;
+        file.write_all(text.as_bytes())?;
         // 数据真的落盘之后再 rename —— 否则断电时 rename 可能先于数据生效,
         // 目标文件反而成了空的。
         file.sync_all()
@@ -1258,27 +1349,6 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
         return Err(e);
     }
     std::fs::rename(&tmp, path)
-}
-
-/// 把字符串转成合法的 TOML 基本字符串字面量。
-fn toml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2375,12 +2445,74 @@ mod tests {
     }
 
     #[test]
-    fn 字符串转义为合法_toml() {
-        assert_eq!(toml_string("扬声器 (Realtek)"), "\"扬声器 (Realtek)\"");
-        assert_eq!(toml_string("a\"b"), "\"a\\\"b\"");
-        assert_eq!(toml_string("a\\b"), "\"a\\\\b\"");
-        // 控制字符必须转义,否则 TOML 解析会失败。
-        assert_eq!(toml_string("a\u{1}b"), "\"a\\u0001b\"");
+    fn 保存配置保留手写注释并更新键值() {
+        // 这是"读-改-写"的核心承诺:用户在手写配置里的注释不能因为点了
+        // 一次保存就没了,而键值必须被更新到界面上的当前值。
+        let dir = std::env::temp_dir().join(format!("pigasio-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("PigASIO.toml");
+        std::fs::write(
+            &path,
+            "# 我自己写的注释,别弄丢\n\
+             sample_rate = 44100\n\
+             \n\
+             # 主板声卡接音箱\n\
+             [[output]]\n\
+             device = \"Realtek\"\n\
+             channel_count = 2\n",
+        )
+        .expect("写初始文件");
+
+        let config = Config {
+            sample_rate: 48000,
+            buffer_size_samples: 512,
+            outputs: vec![StreamConfig {
+                device: DeviceRef::Substring("Realtek".into()),
+                channels: ChannelSelection::Count(2),
+                gain_db: -6.0,
+                clock_master: true,
+            }],
+            ..Config::default()
+        };
+        write_config(&path, &config).expect("保存");
+
+        let text = std::fs::read_to_string(&path).expect("读回");
+        assert!(text.contains("我自己写的注释,别弄丢"), "顶部注释丢了:\n{text}");
+        assert!(text.contains("主板声卡接音箱"), "条目注释丢了:\n{text}");
+        assert!(text.contains("sample_rate = 48000"), "键值没更新:\n{text}");
+        assert!(text.contains("gain_db = -6.0"), "新增的键没写上:\n{text}");
+
+        // 写出来的东西必须能被配置层原样读回来 —— 设备名里的引号、反斜杠
+        // 之类由 toml_edit 负责转义,这里验证往返不破。
+        let parsed = Config::from_file(&path).expect("读回并校验");
+        assert_eq!(parsed.sample_rate, 48000);
+        assert_eq!(parsed.buffer_size_samples, 512);
+        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.outputs[0].gain_db, -6.0);
+        assert!(parsed.outputs[0].clock_master);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 语法有误的配置文件不会被覆盖() {
+        // 用户可能正开着编辑器改它。宁可保存失败,也不能把人正在写的东西
+        // 冲掉。
+        let dir = std::env::temp_dir().join(format!("pigasio-badcfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("PigASIO.toml");
+        let broken = "sample_rate = 48000\n[[output]\ndevice = \"x\"\n";
+        std::fs::write(&path, broken).expect("写初始文件");
+
+        let err = write_config(&path, &Config::default()).expect_err("应当报错");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回"),
+            broken,
+            "原始内容被改动了"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2411,8 +2543,6 @@ mod tests {
             channel_mode: ChannelMode::List,
             channels_text: "1, 0".into(),
             gain_db: 3.5,
-            latency_ms: Some(20.0),
-            wasapi_exclusive: false,
             clock_master: true,
             ..StreamEdit::default()
         };
@@ -2420,7 +2550,6 @@ mod tests {
         assert_eq!(cfg.device, DeviceRef::Substring("Speakers (USB)".into()));
         assert_eq!(cfg.channels.expand(), vec![0, 1]);
         assert_eq!(cfg.gain_db, 3.5);
-        assert!((cfg.latency_seconds.unwrap() - 0.02).abs() < 1e-9);
         assert!(cfg.clock_master);
 
         let back = StreamEdit::from_config(&cfg);

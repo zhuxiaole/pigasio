@@ -1848,6 +1848,7 @@ dependencies = [
  "pigasio-core",
  "serde",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "windows-sys 0.61.2",
  "winresource",
 ]

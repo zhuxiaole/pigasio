@@ -198,29 +198,21 @@ impl ChannelSelection {
     }
 }
 
-/// WASAPI 相关的后端选项。当前 cpal 后端只能提供共享模式,
-/// 独占模式在 `docs/backends.md` 中说明了扩展方式。
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct WasapiOptions {
-    /// 是否请求独占模式。
-    pub exclusive: bool,
-    /// 共享模式下是否允许 Windows 音频引擎做采样率转换。
-    pub auto_convert: bool,
-}
-
 /// 单个输入或输出设备的配置。
+///
+/// 这里只放**真正会生效**的东西。早先还有 `latency_seconds` 和一组
+/// `wasapi` 选项(独占模式、自动重采样),但后端从来没有读过它们:
+/// 延迟实际由 `engine.watermark_ms` 和 `buffer_size_samples` 决定,而
+/// cpal 的 WASAPI 后端把共享模式写死了(见 README 的"关于独占模式")。
+/// 既然配了也不起作用,就删掉了 —— 留着只会让用户以为自己设过了。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
     /// 设备引用。
     pub device: DeviceRef,
     /// 选用哪些通道。
     pub channels: ChannelSelection,
-    /// 建议延迟(秒)。传给后端作为缓冲区的期望值。
-    pub latency_seconds: Option<f64>,
     /// 应用到该设备所有通道的增益,单位分贝。
     pub gain_db: f32,
-    /// WASAPI 选项。
-    pub wasapi: WasapiOptions,
     /// 该流是否参与时钟主设备选举。
     pub clock_master: bool,
 }
@@ -230,9 +222,7 @@ impl Default for StreamConfig {
         StreamConfig {
             device: DeviceRef::Default,
             channels: ChannelSelection::Count(2),
-            latency_seconds: None,
             gain_db: 0.0,
-            wasapi: WasapiOptions::default(),
             clock_master: false,
         }
     }
@@ -486,13 +476,6 @@ impl Config {
                         return Err(Error::Config(format!("{label} 的通道 {ch} 被重复选择")));
                     }
                 }
-                if let Some(lat) = s.latency_seconds {
-                    if !(0.0..=1.0).contains(&lat) {
-                        return Err(Error::Config(format!(
-                            "{label} 的 latency = {lat} 超出范围(0.0..=1.0 秒)"
-                        )));
-                    }
-                }
                 // 既要有限,也要在范围内。上界挡的是 `10^(gain_db / 20)` 的
                 // 溢出:`gain_db = 1000` 是有限值,但线性增益算出来是 `+inf`,
                 // 乘到音频上会得到 `inf`,而静音样本 `0.0 * inf` 是 `NaN` ——
@@ -600,19 +583,8 @@ struct RawStream {
     channels: Option<RawChannels>,
     channel_count: Option<usize>,
 
-    latency: Option<f64>,
-    latency_ms: Option<f64>,
     gain_db: Option<f32>,
     clock_master: Option<bool>,
-
-    wasapi: Option<RawWasapi>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWasapi {
-    exclusive: Option<bool>,
-    auto_convert: Option<bool>,
 }
 
 /// `channels = 2` 与 `channels = [0, 3]` 都合法。
@@ -731,14 +703,8 @@ impl RawStream {
                 RawChannels::List(v) => RawChannels::List(v.clone()),
             }),
             channel_count: self.channel_count,
-            latency: self.latency,
-            latency_ms: self.latency_ms,
             gain_db: self.gain_db,
             clock_master: self.clock_master,
-            wasapi: self.wasapi.as_ref().map(|w| RawWasapi {
-                exclusive: w.exclusive,
-                auto_convert: w.auto_convert,
-            }),
         }
     }
 
@@ -776,30 +742,12 @@ impl RawStream {
             (None, None) => ChannelSelection::Count(2),
         };
 
-        let latency_seconds = match (self.latency, self.latency_ms) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Config(
-                    "同一个设备条目里不能同时写 latency 和 latency_ms".into(),
-                ))
-            }
-            (Some(sec), None) => Some(sec),
-            (None, Some(ms)) => Some(ms / 1000.0),
-            (None, None) => None,
-        };
-
         let _ = kind; // 目前两个方向的解析规则一致,保留参数便于将来分化。
 
         Ok(StreamConfig {
             device,
             channels,
-            latency_seconds,
             gain_db: self.gain_db.unwrap_or(0.0),
-            wasapi: self
-                .wasapi
-                .map_or_else(WasapiOptions::default, |w| WasapiOptions {
-                    exclusive: w.exclusive.unwrap_or(false),
-                    auto_convert: w.auto_convert.unwrap_or(true),
-                }),
             clock_master: self.clock_master.unwrap_or(false),
         })
     }

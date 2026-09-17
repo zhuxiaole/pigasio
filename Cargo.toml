@@ -16,6 +16,8 @@ cpal = "0.15"
 rubato = "0.15"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# 控制面板保存配置时用它做"读-改-写",好保住用户手写的注释。
+toml_edit = "0.22"
 thiserror = "1"
 parking_lot = "0.12"
 rtrb = "0.3"
