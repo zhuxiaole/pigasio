@@ -41,19 +41,23 @@
 //!
 //! # 为什么设备流要放在专用线程上
 //!
-//! `cpal::Stream` 不是 `Send`(它内部按平台持有不可跨线程的句柄)。
-//! 而引擎必须能被宿主的任意线程访问。所以这里把「创建/启动/停止/销毁
-//! 设备流」全部收拢到一个专用线程,引擎本体只保留一个命令通道,
-//! 从而对宿主表现为完全线程安全。
+//! 底层的流句柄不是 `Send`(比如 `cpal::Stream` 内部按平台持有不可跨线程的
+//! 句柄),所以 [`crate::backend::StreamHandle`] 也刻意不带 `Send` 约束。
+//! 而引擎必须能被宿主的任意线程访问。于是这里把「创建/启动/停止/销毁设备流」
+//! 全部收拢到一个专用线程,引擎本体只保留一个命令通道,从而对宿主表现为
+//! 完全线程安全。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use cpal::traits::{DeviceTrait, StreamTrait};
 use parking_lot::Mutex;
 
+use crate::backend::{
+    DeviceHandle, ErrorCallback, InputCallback, OutputCallback, StreamFormat, StreamHandle,
+    StreamRequest,
+};
 use crate::channel_name::ChannelNames;
 use crate::config::{Config, ResampleQuality, StreamConfig as PigStreamConfig};
 use crate::devices::{self, DeviceInfo};
@@ -622,11 +626,13 @@ impl AudioCore {
 /// 销毁,所以准备工作也只能在线程内部完成。
 struct StreamSpec {
     kind: StreamKind,
-    device: cpal::Device,
+    /// 设备句柄。用 `Arc` 是因为 `DeviceInfo` 是可克隆的,而句柄本身由
+    /// 后端持有引用计数。
+    device: Arc<dyn DeviceHandle>,
     device_name: String,
-    config: cpal::StreamConfig,
-    sample_format: cpal::SampleFormat,
-    device_channels: usize,
+    /// 后端协商好的格式。设备原生格式到 f32 的转换在后端做,这里只关心
+    /// 采样率和通道数。
+    format: StreamFormat,
     /// ring 的第 i 个通道取自设备的第 `ch_map[i]` 个通道。
     ch_map: Vec<usize>,
     /// 输入流:设备回调持生产者。
@@ -639,8 +645,8 @@ struct StreamSpec {
     /// 报给实时优先级提升用的「每块缓冲多少帧」。
     ///
     /// MMCSS 拿它和采样率一起推算这条线程该怎么被调度。设备实际的缓冲
-    /// 大小问不出来(`config.buffer_size` 通常是 `Default`),所以拿引擎的
-    /// chunk 当代表 —— 同一个数量级就够它做判断了。
+    /// 大小问不出来(共享模式下由系统定),所以拿引擎的 chunk 当代表 ——
+    /// 同一个数量级就够它做判断了。
     frames_per_buffer: u32,
     /// 回调往里写自己实际收到的每块帧数。
     ///
@@ -652,26 +658,10 @@ struct StreamSpec {
 }
 
 impl StreamSpec {
-    fn build(self) -> Result<cpal::Stream> {
-        let kind = self.kind;
-        let format = self.sample_format;
-        let device_name = self.device_name.clone();
-
-        match (kind, format) {
-            (StreamKind::Input, cpal::SampleFormat::F32) => build_input::<f32>(self),
-            (StreamKind::Input, cpal::SampleFormat::I16) => build_input::<i16>(self),
-            (StreamKind::Input, cpal::SampleFormat::U16) => build_input::<u16>(self),
-            (StreamKind::Input, cpal::SampleFormat::I32) => build_input::<i32>(self),
-            (StreamKind::Output, cpal::SampleFormat::F32) => build_output::<f32>(self),
-            (StreamKind::Output, cpal::SampleFormat::I16) => build_output::<i16>(self),
-            (StreamKind::Output, cpal::SampleFormat::U16) => build_output::<u16>(self),
-            (StreamKind::Output, cpal::SampleFormat::I32) => build_output::<i32>(self),
-            _ => Err(Error::DeviceOpen {
-                name: device_name,
-                reason: format!(
-                    "{kind}流不支持采样格式 {format:?};PigASIO 目前支持 f32 / i16 / i32 / u16"
-                ),
-            }),
+    fn build(self) -> Result<Box<dyn StreamHandle>> {
+        match self.kind {
+            StreamKind::Input => build_input(self),
+            StreamKind::Output => build_output(self),
         }
     }
 }
@@ -679,7 +669,7 @@ impl StreamSpec {
 /// 把**当前线程**提升到实时音频优先级。
 ///
 /// 只在音频回调的第一次执行时调用。之所以非得在这里做:`audio_thread_priority`
-/// 提的是"当前线程",而音频回调跑在 cpal 自己创建的线程上 —— 别的线程替不了
+/// 提的是"当前线程",而音频回调跑在**后端自己创建的线程**上 —— 别的线程替不了
 /// 它,只有在回调内部才有机会。
 ///
 /// 提不上去不影响音频能不能跑,只是这条线程更容易被系统调度器抢走,表现就是
@@ -695,7 +685,7 @@ impl StreamSpec {
 ///   调用必须发生在当初提升的那条线程上。闭包析构时未必还在音频线程(流
 ///   销毁可能由别的线程发起),跨线程还回去是错上加错。
 /// * 而且 Windows 上这个句柄内部含裸指针,本身就不是 `Send`,根本塞不进
-///   cpal 要求 `Send` 的回调闭包 —— 想保存也保存不了。
+///   后端要求 `Send` 的回调闭包 —— 想保存也保存不了。
 ///
 /// 音频线程的寿命和流绑定:线程一结束,系统会把 MMCSS 特性连同线程一起回收,
 /// 用不着我们显式还。
@@ -716,16 +706,13 @@ fn promote_audio_thread(frames_per_buffer: u32, sample_rate: u32) {
 }
 
 /// 输入方向:设备回调把采集数据搬进 ring。
-fn build_input<T>(spec: StreamSpec) -> Result<cpal::Stream>
-where
-    T: cpal::SizedSample + cpal::Sample + Send + 'static,
-    f32: cpal::FromSample<T>,
-{
+///
+/// 设备原生格式到 `f32` 的转换已经在后端做完,所以这里没有泛型。
+fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     let StreamSpec {
         device,
         device_name,
-        config,
-        device_channels,
+        format,
         ch_map,
         input_writer,
         master_core,
@@ -736,90 +723,70 @@ where
         ..
     } = spec;
 
-    let sample_rate = config.sample_rate.0;
+    let sample_rate = format.sample_rate;
+    let device_channels = format.channels;
     let mut writer =
         input_writer.ok_or_else(|| Error::Internal("输入流缺少 ring 生产者".into()))?;
-    let mut scratch: Vec<f32> = Vec::new();
     let err_name = device_name.clone();
-    // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
-    use cpal::Sample as _;
 
-    // 音频回调跑在 cpal 建的线程上,实时优先级只能由那个线程自己申请 ——
-    // 参见 `promote_audio_thread`。这里只需要一个"做过了"的开关。
+    // 音频回调跑在后端建出来的线程上,实时优先级只能由**那条线程自己**申请
+    // —— 参见 `promote_audio_thread`。这里只需要一个"做过了"的开关。
     let rt_tried = Arc::new(AtomicBool::new(false));
 
-    let stream = device
-        .build_input_stream::<T, _, _>(
-            &config,
-            move |data: &[T], _info: &cpal::InputCallbackInfo| {
-                // 快速路径:提过了就直接过去。用原子标志而不是加锁 —— 这是
-                // 音频线程,每块缓冲都要跑一遍,不该为只做一次的活去争锁。
-                if !rt_tried.swap(true, Ordering::Relaxed) {
-                    promote_audio_thread(frames_per_buffer, sample_rate);
-                }
+    let on_data: InputCallback = Box::new(move |data: &[f32]| {
+        // 快速路径:提过了就直接过去。用原子标志而不是加锁 —— 这是音频线程,
+        // 每块缓冲都要跑一遍,不该为只做一次的活去争锁。
+        if !rt_tried.swap(true, Ordering::Relaxed) {
+            promote_audio_thread(frames_per_buffer, sample_rate);
+        }
 
-                let device_channels = device_channels.max(1);
-                let frames = data.len() / device_channels;
-                // 量下设备实际每块多少帧 —— 这是唯一能拿到真实缓冲大小的
-                // 办法(见 `Engine::device_frames_per_stream`)。`store` 无锁,
-                // 放在音频线程里是安全的。
-                device_frames.store(frames, Ordering::Relaxed);
-                let total = frames * device_channels;
-                if total == 0 {
-                    return;
-                }
-                if scratch.len() < total {
-                    scratch.resize(total, 0.0);
-                }
-                for (dst, src) in scratch[..total].iter_mut().zip(data[..total].iter()) {
-                    *dst = f32::from_sample(*src);
-                }
-                // 记下真正写进去多少(ring 满时会少于 `frames`)—— 和消费量
-                // 一比就知道积压在哪一侧。
-                let written =
-                    writer.write_selected(&scratch[..total], device_channels, &ch_map, frames);
-                stats
-                    .written_frames
-                    .fetch_add(written as u64, Ordering::Relaxed);
-                // 这一侧的溢出只能在这里上报。ring 的生产者半端就在本回调手里,
-                // 它的计数除了这里没有第二个人能读走 —— `InputStreamRuntime`
-                // 拿到的是消费者半端,只能看到欠载。少这一行,输入侧的溢出就
-                // 永远不会出现在界面上。
-                stats
-                    .overflow_frames
-                    .store(writer.overflow_frames(), Ordering::Relaxed);
+        let device_channels = device_channels.max(1);
+        let frames = data.len() / device_channels;
+        // 量下设备实际每块多少帧 —— 这是唯一能拿到真实缓冲大小的办法
+        // (见 `Engine::device_frames_per_stream`)。`store` 无锁,放在音频
+        // 线程里是安全的。
+        device_frames.store(frames, Ordering::Relaxed);
+        let total = frames * device_channels;
+        if total == 0 {
+            return;
+        }
 
-                // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
-                if let Some(core) = master_core.as_ref() {
-                    if let Some(mut core) = core.try_lock() {
-                        core.advance(frames);
-                    }
-                }
-            },
-            move |e| {
-                err_flag.store(true, Ordering::Release);
-                log::error!("输入设备 “{err_name}” 报错:{e}");
-            },
-            None,
-        )
-        .map_err(|e| Error::DeviceOpen {
-            name: device_name,
-            reason: e.to_string(),
-        })?;
+        // 记下真正写进去多少(ring 满时会少于 `frames`)—— 和消费量一比就
+        // 知道积压在哪一侧。
+        let written = writer.write_selected(&data[..total], device_channels, &ch_map, frames);
+        stats
+            .written_frames
+            .fetch_add(written as u64, Ordering::Relaxed);
+        // 这一侧的溢出只能在这里上报。ring 的生产者半端就在本回调手里,
+        // 它的计数除了这里没有第二个人能读走 —— `InputStreamRuntime` 拿到的是
+        // 消费者半端,只能看到欠载。少这一行,输入侧的溢出就永远不会出现在
+        // 界面上。
+        stats
+            .overflow_frames
+            .store(writer.overflow_frames(), Ordering::Relaxed);
 
-    Ok(stream)
+        // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
+        if let Some(core) = master_core.as_ref() {
+            if let Some(mut core) = core.try_lock() {
+                core.advance(frames);
+            }
+        }
+    });
+
+    let on_error: ErrorCallback = Box::new(move |e: String| {
+        err_flag.store(true, Ordering::Release);
+        log::error!("输入设备 “{err_name}” 报错:{e}");
+    });
+
+    device.open_input(&format, on_data, on_error)
 }
 
 /// 输出方向:从 ring 取数据交给设备播放。
-fn build_output<T>(spec: StreamSpec) -> Result<cpal::Stream>
-where
-    T: cpal::SizedSample + cpal::Sample + cpal::FromSample<f32> + Send + 'static,
-{
+fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     let StreamSpec {
         device,
         device_name,
-        config,
-        device_channels,
+        format,
         ch_map,
         output_reader,
         master_core,
@@ -830,98 +797,86 @@ where
         ..
     } = spec;
 
+    let sample_rate = format.sample_rate;
+    let device_channels = format.channels;
     let mut reader =
         output_reader.ok_or_else(|| Error::Internal("输出流缺少 ring 消费者".into()))?;
     let mut scratch: Vec<f32> = Vec::new();
     let err_name = device_name.clone();
-    // 引入 `from_sample`,用于设备原生格式与内部 f32 之间的转换。
 
-    let sample_rate = config.sample_rate.0;
     // 同输入侧:音频线程的实时优先级只能在回调内部申请。
     let rt_tried = Arc::new(AtomicBool::new(false));
 
-    let stream = device
-        .build_output_stream::<T, _, _>(
-            &config,
-            move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
-                if !rt_tried.swap(true, Ordering::Relaxed) {
-                    promote_audio_thread(frames_per_buffer, sample_rate);
-                }
+    let on_data: OutputCallback = Box::new(move |data: &mut [f32]| {
+        if !rt_tried.swap(true, Ordering::Relaxed) {
+            promote_audio_thread(frames_per_buffer, sample_rate);
+        }
 
-                let device_channels = device_channels.max(1);
-                let frames = data.len() / device_channels;
-                if frames == 0 {
-                    return;
-                }
-                // 同输入侧:量出设备实际的块大小。
-                device_frames.store(frames, Ordering::Relaxed);
-                let ring_channels = ch_map.len().max(1);
-                let ring_samples = frames * ring_channels;
-                if scratch.len() < ring_samples {
-                    scratch.resize(ring_samples, 0.0);
-                }
+        let device_channels = device_channels.max(1);
+        let frames = data.len() / device_channels;
+        if frames == 0 {
+            return;
+        }
+        // 同输入侧:量出设备实际的块大小。
+        device_frames.store(frames, Ordering::Relaxed);
+        let ring_channels = ch_map.len().max(1);
+        let ring_samples = frames * ring_channels;
+        if scratch.len() < ring_samples {
+            scratch.resize(ring_samples, 0.0);
+        }
 
-                // 先把本流自己的 ring 读出来 —— **不需要锁**。
-                //
-                // reader 半端由本回调独占;生产者半端只被 `advance()` 里的
-                // `drain()` 碰,而时钟推进就发生在这个回调里(`master_core`
-                // 那一支),所以两边其实是同一个线程。唯一的例外是启动时
-                // `prime_outputs()` 从控制线程写过一次,但那发生在输出设备
-                // 启动之前,不会有回调与它并发。
-                //
-                // 这里曾经整个包在 `try_lock` 里。代价是抢不到锁时这一整块
-                // 只能送静音,而且 `read_interleaved` 根本没被调用 —— 欠载
-                // 计数也不会增加,丢得无声无息。现在读和锁解耦,设备永远能
-                // 拿到 ring 里的数据,计数也永远准。
-                let got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
+        // 先把本流自己的 ring 读出来 —— **不需要锁**。
+        //
+        // reader 半端由本回调独占;生产者半端只被 `advance()` 里的 `drain()`
+        // 碰,而时钟推进就发生在这个回调里(`master_core` 那一支),所以两边
+        // 其实是同一个线程。唯一的例外是启动时 `prime_outputs()` 从控制线程
+        // 写过一次,但那发生在输出设备启动之前,不会有回调与它并发。
+        //
+        // 这里曾经整个包在 `try_lock` 里。代价是抢不到锁时这一整块只能送静音,
+        // 而且 `read_interleaved` 根本没被调用 —— 欠载计数也不会增加,丢得
+        // 无声无息。现在读和锁解耦,设备永远能拿到 ring 里的数据,计数也永远准。
+        let got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
 
-                // 这一侧的欠载只能在这里上报。ring 的消费者半端就在本回调手里,
-                // 它的计数除了这里没有第二个人能读走 —— `OutputStreamRuntime`
-                // 拿到的是生产者半端,只能看到溢出。少这一行,输出侧的欠载就
-                // 永远不会出现在界面上:水位掉到不足一块设备缓冲时,界面照样
-                // 显示「正常」。
-                stats
-                    .underflow_frames
-                    .store(reader.underflow_frames(), Ordering::Relaxed);
-                // 流量计数同样和输入侧对称:从 ring 里取走多少就在这里记多少。
-                stats.read_frames.fetch_add(got as u64, Ordering::Relaxed);
+        // 这一侧的欠载只能在这里上报。ring 的消费者半端就在本回调手里,
+        // 它的计数除了这里没有第二个人能读走 —— `OutputStreamRuntime` 拿到的是
+        // 生产者半端,只能看到溢出。少这一行,输出侧的欠载就永远不会出现在
+        // 界面上:水位掉到不足一块设备缓冲时,界面照样显示「正常」。
+        stats
+            .underflow_frames
+            .store(reader.underflow_frames(), Ordering::Relaxed);
+        // 流量计数同样和输入侧对称:从 ring 里取走多少就在这里记多少。
+        stats.read_frames.fetch_add(got as u64, Ordering::Relaxed);
 
-                // 时钟推进要碰所有流的另一半端,这才需要锁。抢不到就跳过这
-                // 一拍:数据没丢(上面已经读到手了),只是引擎时钟停一拍,
-                // 下一次回调会把欠的那部分一起补上。
-                if let Some(core) = master_core.as_ref() {
-                    if let Some(mut core) = core.try_lock() {
-                        core.advance(frames);
-                    }
+        // 时钟推进要碰所有流的另一半端,这才需要锁。抢不到就跳过这一拍:
+        // 数据没丢(上面已经读到手了),只是引擎时钟停一拍,下一次回调会把
+        // 欠的那部分一起补上。
+        if let Some(core) = master_core.as_ref() {
+            if let Some(mut core) = core.try_lock() {
+                core.advance(frames);
+            }
+        }
+
+        // 填数据放在锁外,尽量缩短持锁时间。
+        for s in data.iter_mut() {
+            *s = 0.0;
+        }
+        let usable = got.min(frames);
+        for f in 0..usable {
+            let base = f * ring_channels;
+            for (slot, &dev_ch) in ch_map.iter().enumerate() {
+                if dev_ch < device_channels && base + slot < scratch.len() {
+                    data[f * device_channels + dev_ch] = scratch[base + slot];
                 }
+            }
+        }
+    });
 
-                // 格式转换放在锁外,尽量缩短持锁时间。
-                for s in data.iter_mut() {
-                    *s = T::from_sample(0.0f32);
-                }
-                let usable = got.min(frames);
-                for f in 0..usable {
-                    let base = f * ring_channels;
-                    for (slot, &dev_ch) in ch_map.iter().enumerate() {
-                        if dev_ch < device_channels && base + slot < scratch.len() {
-                            data[f * device_channels + dev_ch] =
-                                T::from_sample(scratch[base + slot]);
-                        }
-                    }
-                }
-            },
-            move |e| {
-                err_flag.store(true, Ordering::Release);
-                log::error!("输出设备 “{err_name}” 报错:{e}");
-            },
-            None,
-        )
-        .map_err(|e| Error::DeviceOpen {
-            name: device_name,
-            reason: e.to_string(),
-        })?;
+    let on_error: ErrorCallback = Box::new(move |e: String| {
+        err_flag.store(true, Ordering::Release);
+        log::error!("输出设备 “{err_name}” 报错:{e}");
+    });
 
-    Ok(stream)
+    device.open_output(&format, on_data, on_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +899,7 @@ enum StreamCommand {
     Shutdown,
 }
 
-/// 持有 `cpal::Stream` 的线程句柄。
+/// 持有设备流的线程句柄。
 struct StreamHost {
     commands: mpsc::Sender<StreamCommand>,
     join: Option<JoinHandle<()>>,
@@ -961,8 +916,8 @@ impl StreamHost {
             .spawn(move || {
                 // 流必须在创建它的线程里启动和销毁,这是这个专用线程
                 // 存在的唯一理由。
-                let mut inputs: Vec<cpal::Stream> = Vec::new();
-                let mut outputs: Vec<cpal::Stream> = Vec::new();
+                let mut inputs: Vec<Box<dyn StreamHandle>> = Vec::new();
+                let mut outputs: Vec<Box<dyn StreamHandle>> = Vec::new();
                 let mut failure: Option<Error> = None;
 
                 for spec in specs {
@@ -993,10 +948,9 @@ impl StreamHost {
                     return;
                 }
 
-                fn play_group(list: &[cpal::Stream]) -> Result<()> {
+                fn play_group(list: &[Box<dyn StreamHandle>]) -> Result<()> {
                     for s in list {
-                        s.play()
-                            .map_err(|e| Error::Backend(format!("启动音频流失败:{e}")))?;
+                        s.play()?;
                     }
                     Ok(())
                 }
@@ -1422,8 +1376,9 @@ impl Engine {
             let info = &self.input_devices[i];
             let mapped = cfg.channels.expand();
             let ring_channels = mapped.len();
-            let (device_cfg, device_channels, sample_format) =
-                negotiate_config(&info.device, StreamKind::Input, sample_rate, &info.name)?;
+            let format = info
+                .handle
+                .negotiate(StreamKind::Input, &StreamRequest { sample_rate })?;
 
             let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);
@@ -1431,7 +1386,7 @@ impl Engine {
 
             // 标称比率 = 输出率 / 输入率。这里的“输入”是设备侧,
             // “输出”是 ASIO 侧。
-            let nominal = sample_rate as f64 / device_cfg.sample_rate.0.max(1) as f64;
+            let nominal = sample_rate as f64 / format.sample_rate.max(1) as f64;
             let is_master = self.clock_master == (StreamKind::Input, i);
             let resampler = FixedOutResampler::new(&ResamplerSpec {
                 quality: stream_quality(
@@ -1466,11 +1421,9 @@ impl Engine {
 
             specs.push(StreamSpec {
                 kind: StreamKind::Input,
-                device: info.device.clone(),
+                device: Arc::clone(&info.handle),
                 device_name: info.name.clone(),
-                config: device_cfg,
-                sample_format,
-                device_channels,
+                format,
                 ch_map: mapped,
                 input_writer: Some(writer),
                 output_reader: None,
@@ -1493,8 +1446,9 @@ impl Engine {
             let info = &self.output_devices[i];
             let mapped = cfg.channels.expand();
             let ring_channels = mapped.len();
-            let (device_cfg, device_channels, sample_format) =
-                negotiate_config(&info.device, StreamKind::Output, sample_rate, &info.name)?;
+            let format = info
+                .handle
+                .negotiate(StreamKind::Output, &StreamRequest { sample_rate })?;
 
             let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);
@@ -1502,7 +1456,7 @@ impl Engine {
 
             // 标称比率 = 输出率 / 输入率。这里的“输入”是 ASIO 侧,
             // “输出”是设备侧 —— 与输入流的方向恰好相反。
-            let nominal = device_cfg.sample_rate.0.max(1) as f64 / sample_rate as f64;
+            let nominal = format.sample_rate.max(1) as f64 / sample_rate as f64;
             let is_master = self.clock_master == (StreamKind::Output, i);
             let resampler = FixedInResampler::new(&ResamplerSpec {
                 quality: stream_quality(
@@ -1538,11 +1492,9 @@ impl Engine {
 
             specs.push(StreamSpec {
                 kind: StreamKind::Output,
-                device: info.device.clone(),
+                device: Arc::clone(&info.handle),
                 device_name: info.name.clone(),
-                config: device_cfg,
-                sample_format,
-                device_channels,
+                format,
                 ch_map: mapped,
                 input_writer: None,
                 output_reader: Some(reader),
@@ -1922,104 +1874,6 @@ fn take_resample_failures(device_name: &str, stats: &RingStats) -> Option<String
     (failures > 0).then(|| format!("设备 “{device_name}” 重采样失败 {failures} 次"))
 }
 
-/// 与设备协商出一个可用的流配置。
-///
-/// 优先找**原生 f32** 格式:那是 Windows 音频引擎内部用的格式,共享模式
-/// 下几乎总是可用,而且省掉一次格式转换。找不到就退回设备默认配置,
-/// 把它的采样格式报给调用方,由回调里的转换逻辑兜住。
-fn negotiate_config(
-    device: &cpal::Device,
-    kind: StreamKind,
-    target_rate: u32,
-    device_name: &str,
-) -> Result<(cpal::StreamConfig, usize, cpal::SampleFormat)> {
-    let target = cpal::SampleRate(target_rate);
-
-    let supported: Vec<_> = match kind {
-        StreamKind::Input => device
-            .supported_input_configs()
-            .map_err(|e| Error::DeviceOpen {
-                name: device_name.to_string(),
-                reason: format!("查询支持的输入格式失败:{e}"),
-            })?
-            .collect(),
-        StreamKind::Output => device
-            .supported_output_configs()
-            .map_err(|e| Error::DeviceOpen {
-                name: device_name.to_string(),
-                reason: format!("查询支持的输出格式失败:{e}"),
-            })?
-            .collect(),
-    };
-
-    let pick = supported
-        .iter()
-        .find(|r| {
-            r.sample_format() == cpal::SampleFormat::F32
-                && r.min_sample_rate() <= target
-                && target <= r.max_sample_rate()
-        })
-        .or_else(|| {
-            supported
-                .iter()
-                .find(|r| r.sample_format() == cpal::SampleFormat::F32)
-        });
-
-    if let Some(range) = pick {
-        let rate = clamp_rate(target, range.min_sample_rate(), range.max_sample_rate());
-        if rate.0 != target_rate {
-            log::warn!(
-                "设备 “{device_name}” 不支持 {target_rate} Hz,改用 {} Hz 并重采样",
-                rate.0
-            );
-        }
-        return Ok((
-            cpal::StreamConfig {
-                channels: range.channels(),
-                sample_rate: rate,
-                buffer_size: cpal::BufferSize::Default,
-            },
-            range.channels() as usize,
-            cpal::SampleFormat::F32,
-        ));
-    }
-
-    let default = match kind {
-        StreamKind::Input => device.default_input_config(),
-        StreamKind::Output => device.default_output_config(),
-    }
-    .map_err(|e| Error::DeviceOpen {
-        name: device_name.to_string(),
-        reason: format!("读取设备默认格式失败:{e}"),
-    })?;
-
-    let format = default.sample_format();
-    log::warn!("设备 “{device_name}” 没有可用的 f32 共享模式格式,改用 {format:?}");
-    Ok((
-        cpal::StreamConfig {
-            channels: default.channels(),
-            sample_rate: default.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
-        },
-        default.channels() as usize,
-        format,
-    ))
-}
-
-fn clamp_rate(
-    target: cpal::SampleRate,
-    min: cpal::SampleRate,
-    max: cpal::SampleRate,
-) -> cpal::SampleRate {
-    if target < min {
-        min
-    } else if target > max {
-        max
-    } else {
-        target
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2084,26 +1938,6 @@ mod tests {
         let c = b2.input_ptr(1, 0);
         assert_ne!(a, c);
         assert!(unsafe { a.offset_from(c) }.abs() >= 8);
-    }
-
-    #[test]
-    fn 采样率会被夹到设备支持范围内() {
-        assert_eq!(
-            clamp_rate(
-                cpal::SampleRate(96_000),
-                cpal::SampleRate(44_100),
-                cpal::SampleRate(48_000)
-            ),
-            cpal::SampleRate(48_000)
-        );
-        assert_eq!(
-            clamp_rate(
-                cpal::SampleRate(48_000),
-                cpal::SampleRate(44_100),
-                cpal::SampleRate(192_000)
-            ),
-            cpal::SampleRate(48_000)
-        );
     }
 
     #[test]

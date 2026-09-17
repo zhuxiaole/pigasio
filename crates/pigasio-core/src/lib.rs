@@ -20,6 +20,7 @@
 //!
 //! 时钟基准取“时钟主设备”的回调,其余设备通过调整重采样比率跟随它。
 
+pub mod backend;
 pub mod channel_name;
 pub mod config;
 pub mod devices;
@@ -30,6 +31,7 @@ pub mod log;
 pub mod resample;
 pub mod ring;
 
+pub use backend::DeviceInfo;
 pub use channel_name::ChannelNames;
 pub use config::{AsioSampleType, Config, DeviceRef, StreamConfig};
 pub use engine::{AsioBufferSet, Engine, EngineStatus, StreamInfo, StreamStatusSnapshot};

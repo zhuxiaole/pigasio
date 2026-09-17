@@ -103,48 +103,6 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<cpal::DevicesError> for Error {
-    fn from(e: cpal::DevicesError) -> Self {
-        Error::Backend(format!("枚举设备失败:{e}"))
-    }
-}
-
-impl From<cpal::DeviceNameError> for Error {
-    fn from(e: cpal::DeviceNameError) -> Self {
-        Error::Backend(format!("读取设备名称失败:{e}"))
-    }
-}
-
-impl From<cpal::SupportedStreamConfigsError> for Error {
-    fn from(e: cpal::SupportedStreamConfigsError) -> Self {
-        Error::Backend(format!("查询设备支持的格式失败:{e}"))
-    }
-}
-
-impl From<cpal::BuildStreamError> for Error {
-    fn from(e: cpal::BuildStreamError) -> Self {
-        Error::Backend(format!("创建音频流失败:{e}"))
-    }
-}
-
-impl From<cpal::PlayStreamError> for Error {
-    fn from(e: cpal::PlayStreamError) -> Self {
-        Error::Backend(format!("启动音频流失败:{e}"))
-    }
-}
-
-impl From<cpal::PauseStreamError> for Error {
-    fn from(e: cpal::PauseStreamError) -> Self {
-        Error::Backend(format!("暂停音频流失败:{e}"))
-    }
-}
-
-impl From<cpal::DefaultStreamConfigError> for Error {
-    fn from(e: cpal::DefaultStreamConfigError) -> Self {
-        Error::Backend(format!("读取设备默认格式失败:{e}"))
-    }
-}
-
 impl From<rubato::ResamplerConstructionError> for Error {
     fn from(e: rubato::ResamplerConstructionError) -> Self {
         Error::Resampler(e.to_string())
