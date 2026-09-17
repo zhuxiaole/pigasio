@@ -1135,6 +1135,9 @@ impl Engine {
     /// `createBuffers()` 再报错友好得多。
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
+        // 后端必须在打开任何设备之前定下来 —— 设备枚举走的就是它。控制面板
+        // 改了这一项之后,下一次建引擎就会换过去,不必重启。
+        crate::backend::select(config.engine.backend);
 
         let mut input_devices = Vec::new();
         for (i, cfg) in config.active_inputs() {

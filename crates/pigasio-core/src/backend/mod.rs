@@ -25,6 +25,8 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use crate::error::{Result, StreamKind};
 
 mod cpal_backend;
@@ -36,6 +38,45 @@ pub use cpal_backend::CpalBackend;
 
 #[cfg(windows)]
 pub use wasapi::WasapiBackend;
+
+/// 用哪个音频后端。
+///
+/// 只是"挑哪个实现"的名字,所以放在这里而不是配置模块里 —— 配置层引用它,
+/// 反过来不成立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    /// cpal(经它的 WASAPI 后端)。
+    ///
+    /// **这是默认值。** 直写 WASAPI 那个后端虽然已在真机上验证与它指标相当,
+    /// 但还没在真实宿主里长期跑过;等低延迟 period 接上之后再考虑改默认。
+    #[default]
+    Cpal,
+    /// 直写 WASAPI。将来低延迟 period 的收益只有它拿得到。
+    Wasapi,
+    /// 自动:优先 WASAPI,这台机器上不可用时退回 cpal。
+    Auto,
+}
+
+impl BackendKind {
+    /// 解析配置或环境变量里的写法。大小写和首尾空格都容忍 —— 手写的
+    /// 环境变量写歪是常事。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(BackendKind::Auto),
+            "cpal" => Some(BackendKind::Cpal),
+            "wasapi" => Some(BackendKind::Wasapi),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Auto => "auto",
+            BackendKind::Cpal => "cpal",
+            BackendKind::Wasapi => "wasapi",
+        }
+    }
+}
 
 /// 设备端单个样本的格式。
 ///
@@ -146,59 +187,90 @@ pub trait Backend: Send + Sync {
     fn default_device(&self, kind: StreamKind) -> Result<DeviceInfo>;
 }
 
-/// 当前使用的后端。
+/// 当前后端,以及它是按哪个选择造出来的。
 ///
-/// 选择规则:
-/// * `PIGASIO_BACKEND=cpal` 或 `=wasapi` —— 显式指定;
-/// * `PIGASIO_BACKEND=auto` —— 优先 WASAPI,它在这台机器上不可用时退回 cpal;
-/// * 不设置 —— **先用 cpal**。
-///
-/// 默认之所以还是 cpal:WASAPI 后端目前只做到"行为对齐 cpal"(默认 period),
-/// 切过去没有任何收益,却要承担一套新代码的风险。等阶段 3 把低延迟 period
-/// 接上、真机跑稳之后再改默认。见 `docs/low-latency-wasapi.md`。
-pub fn current() -> &'static dyn Backend {
-    static BACKEND: std::sync::OnceLock<Box<dyn Backend>> = std::sync::OnceLock::new();
-    // 注意要多解一层:`&Box<dyn Backend>` 不是 `&dyn Backend`(标准库没有给
-    // `Box<dyn Trait>` 实现 `Trait`)。
-    &**BACKEND.get_or_init(select_backend)
-}
+/// 用 `RwLock + Arc` 而不是 `OnceLock`:控制面板改了配置之后,下一次枚举设备
+/// 或打开流就该用新的后端,不必重启整个程序。读端拿的是 `Arc`,所以锁只会
+/// 在取指针的那一瞬间被持有 —— 不会挡在音频路径上。
+static BACKEND: RwLock<Option<(BackendKind, Arc<dyn Backend>)>> = RwLock::new(None);
 
-/// 按上面的规则挑一个后端。
-#[cfg(windows)]
-fn select_backend() -> Box<dyn Backend> {
-    // 顺手容忍大小写和首尾空格 —— 环境变量本来就容易写歪,没必要在这种
-    // 地方挑刺,写错了还给个明确的警告。
-    let requested = std::env::var("PIGASIO_BACKEND")
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
+/// 取当前后端。没人调过 [`select`] 时按环境变量或默认值确定。
+pub fn current() -> Arc<dyn Backend> {
+    if let Some((_, backend)) = BACKEND.read().as_ref() {
+        return Arc::clone(backend);
+    }
 
-    let backend: Box<dyn Backend> = match requested.as_str() {
-        "" | "cpal" => Box::new(CpalBackend::new()),
-        "wasapi" => Box::new(WasapiBackend::new()),
-        "auto" => {
-            let wasapi = WasapiBackend::new();
-            if wasapi.available() {
-                Box::new(wasapi)
-            } else {
-                log::warn!("WASAPI 后端在这台机器上不可用,退回 cpal");
-                Box::new(CpalBackend::new())
-            }
-        }
-        other => {
-            log::warn!(
-                "PIGASIO_BACKEND 的值 “{other}” 无法识别(可选 cpal / wasapi / auto),按 cpal 处理"
-            );
-            Box::new(CpalBackend::new())
-        }
-    };
-    // 无论走哪条分支都记一条 —— 排查"到底用的哪个后端"时,这条就是答案。
-    log::info!("音频后端:{}", backend.name());
+    let kind = env_override().unwrap_or_default();
+    let backend = build(kind);
+
+    let mut slot = BACKEND.write();
+    // 两个线程可能同时走到这里 —— 后到的用先到的那份,免得凭空多造一个后端
+    // (那会重复打日志,也让"当前后端是谁"变得含糊)。
+    if let Some((_, existing)) = slot.as_ref() {
+        return Arc::clone(existing);
+    }
+    *slot = Some((kind, Arc::clone(&backend)));
     backend
 }
 
-#[cfg(not(windows))]
-fn select_backend() -> Box<dyn Backend> {
-    let backend: Box<dyn Backend> = Box::new(CpalBackend::new());
+/// 按配置选定后端。
+///
+/// 环境变量 `PIGASIO_BACKEND` 优先级最高 —— 临时覆盖配置排查问题,不必去改
+/// 配置文件。选择没变时直接返回:这个函数每次应用配置都会被调用。
+pub fn select(preferred: BackendKind) {
+    let kind = env_override().unwrap_or(preferred);
+
+    let mut slot = BACKEND.write();
+    if matches!(slot.as_ref(), Some((current, _)) if *current == kind) {
+        return;
+    }
+    let backend = build(kind);
+    *slot = Some((kind, Arc::clone(&backend)));
+}
+
+/// 环境变量里的覆盖值。
+fn env_override() -> Option<BackendKind> {
+    let raw = std::env::var("PIGASIO_BACKEND").ok()?;
+    match BackendKind::parse(&raw) {
+        Some(kind) => Some(kind),
+        None => {
+            log::warn!(
+                "PIGASIO_BACKEND 的值 “{raw}” 无法识别(可选 auto / cpal / wasapi),已忽略"
+            );
+            None
+        }
+    }
+}
+
+/// 按种类造一个后端。无论走哪条分支都会记一条日志 —— 排查"到底用的哪个
+/// 后端"时,这条就是答案。
+fn build(kind: BackendKind) -> Arc<dyn Backend> {
+    let backend: Arc<dyn Backend> = match kind {
+        BackendKind::Cpal => Arc::new(CpalBackend::new()),
+        #[cfg(windows)]
+        BackendKind::Wasapi => Arc::new(WasapiBackend::new()),
+        #[cfg(not(windows))]
+        BackendKind::Wasapi => {
+            log::warn!("这个系统上没有 WASAPI 后端,改用 cpal");
+            Arc::new(CpalBackend::new())
+        }
+        BackendKind::Auto => {
+            #[cfg(windows)]
+            {
+                let wasapi = WasapiBackend::new();
+                if wasapi.available() {
+                    Arc::new(wasapi)
+                } else {
+                    log::warn!("WASAPI 后端在这台机器上不可用,退回 cpal");
+                    Arc::new(CpalBackend::new())
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                Arc::new(CpalBackend::new())
+            }
+        }
+    };
     log::info!("音频后端:{}", backend.name());
     backend
 }

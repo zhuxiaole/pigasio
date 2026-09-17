@@ -46,18 +46,34 @@ let hresult = audio_client.Initialize(share_mode, stream_flags, buffer_duration,
 
 ## 实现进度
 
-**阶段 1、2 已完成。**
+**阶段 1、2 已完成;阶段 4 的"配置开关"部分也已就绪**(水位联动还没做)。
 
-- `backend/mod.rs`:三个 trait 与公共类型。
+- `backend/mod.rs`:三个 trait 与公共类型,以及 [`BackendKind`] 的选择逻辑。
 - `backend/cpal_backend.rs`:原有 cpal 实现(默认后端)。
 - `backend/wasapi/`:`mod.rs` 是设备枚举与协商,`stream.rs` 是事件驱动的流。
 
-用环境变量切换后端(**默认仍是 cpal**):
+**切换后端**有三个入口,优先级从低到高:
+
+```toml
+# 1. 配置文件
+[engine]
+backend = "wasapi"   # cpal(默认) / wasapi / auto
+```
+
+```text
+2. 控制面板「引擎设置 → 音频后端」的下拉框
+```
 
 ```cmd
+:: 3. 环境变量(最高,方便临时覆盖排查)
 set PIGASIO_BACKEND=wasapi
-set PIGASIO_BACKEND=auto
 ```
+
+改动**配置文件或面板之后要重启宿主**才生效 —— 驱动跑在宿主进程里。控制面板
+自己的试运行会立刻用上新的选择。
+
+环境变量的值写错时会记一条警告并忽略,不会静默退回默认值 —— 否则用户会以为
+自己切换成功了。
 
 阶段 2 的验收实测(同一份 3 进 3 出的配置,各跑 12 秒):
 

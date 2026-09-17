@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::backend::BackendKind;
 use crate::error::{Error, Result, StreamKind};
 
 /// 配置文件的默认文件名。
@@ -287,6 +288,13 @@ pub struct EngineConfig {
     /// 通道名会退化成 `OUT 1 (dev2)` 这样的纯 ASCII 形式,用设备序号代替
     /// 设备名,任何编码下都不会出错。
     pub use_non_ascii_channel_names: bool,
+    /// 用哪个音频后端。
+    ///
+    /// 默认是 cpal —— 直写 WASAPI 的那个后端虽然已验证指标与它相当,但还没在
+    /// 真实宿主里长期跑过。想试就设成 `"wasapi"`,或者 `"auto"` 让它自动挑。
+    ///
+    /// 环境变量 `PIGASIO_BACKEND` 的优先级比这一项高,方便临时覆盖排查。
+    pub backend: BackendKind,
 }
 
 impl Default for EngineConfig {
@@ -297,6 +305,7 @@ impl Default for EngineConfig {
             max_drift_ppm: 500.0,
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
+            backend: BackendKind::default(),
         }
     }
 }
@@ -563,6 +572,8 @@ struct RawEngine {
     drift_correction: Option<bool>,
     max_drift_ppm: Option<f64>,
     use_non_ascii_channel_names: Option<bool>,
+    /// 音频后端:`auto` / `cpal` / `wasapi`。
+    backend: Option<String>,
     /// 目标水位,单位毫秒。
     watermark_ms: Option<f64>,
     /// 旧字段:目标水位,单位是 ASIO 缓冲区的倍数。
@@ -674,6 +685,14 @@ impl RawConfig {
                 use_non_ascii_channel_names: e
                     .use_non_ascii_channel_names
                     .unwrap_or(EngineConfig::default().use_non_ascii_channel_names),
+                backend: match e.backend.as_deref() {
+                    Some(value) => BackendKind::parse(value).ok_or_else(|| {
+                        Error::Config(format!(
+                            "未知的音频后端 “{value}”,可选:auto / cpal / wasapi"
+                        ))
+                    })?,
+                    None => EngineConfig::default().backend,
+                },
             },
         };
 
@@ -955,6 +974,38 @@ mod tests {
             let cfg = Config::from_toml_str(&text).unwrap_or_else(|e| panic!("{ok}: {e}"));
             assert!(cfg.outputs[0].linear_gain().is_finite(), "{ok} 的增益算出了非有限值");
         }
+    }
+
+    #[test]
+    fn 后端可以从配置里选() {
+        // 不写就是默认的 cpal。
+        assert_eq!(
+            Config::from_toml_str("sample_rate = 48000\n")
+                .unwrap()
+                .engine
+                .backend,
+            BackendKind::Cpal
+        );
+
+        // 三种取值;大小写和首尾空格都容忍。
+        for (text, expected) in [
+            ("cpal", BackendKind::Cpal),
+            ("wasapi", BackendKind::Wasapi),
+            ("auto", BackendKind::Auto),
+            (" WASAPI ", BackendKind::Wasapi),
+        ] {
+            let cfg = Config::from_toml_str(&format!(
+                "sample_rate = 48000\n[engine]\nbackend = \"{text}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(cfg.engine.backend, expected, "{text}");
+        }
+
+        // 写错了要明确报错,而不是悄悄退回默认 —— 用户以为切过去了才是最糟的。
+        let err =
+            Config::from_toml_str("sample_rate = 48000\n[engine]\nbackend = \"portaudio\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("后端"), "{err}");
     }
 
     #[test]

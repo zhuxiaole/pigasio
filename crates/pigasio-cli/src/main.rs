@@ -89,6 +89,16 @@ check / monitor 的选项:
 // ---------------------------------------------------------------------------
 
 fn cmd_devices() -> Result<(), String> {
+    // 后端会影响设备清单(名字和通道数来自不同实现),所以先按配置把它定下来。
+    // 这里刻意走一条**静默**的加载:devices 输出的是一张清单,不该被"配置文件:
+    // xxx"之类的话插进去。配置有问题也不拦着 —— 列设备本身用不着配置。
+    let cwd = std::env::current_dir().ok();
+    if let Some(path) = config::find_config_file(cwd.as_deref()) {
+        if let Ok(config) = Config::from_file(&path) {
+            pigasio_core::backend::select(config.engine.backend);
+        }
+    }
+
     println!("=== 系统音频设备 ===\n");
     let listing = pigasio_core::devices::describe_all().map_err(|e| format!("枚举设备失败:{e}"))?;
     print!("{listing}");
@@ -166,6 +176,12 @@ max_drift_ppm = 500.0
 # 多厚才够?至少要盖过一块设备的回调周期(WASAPI 共享模式下普遍 10 ms),
 # 30.0 是个稳妥的起点。调小之后如果实时状态里开始出现「欠载」,就往回调一点。
 watermark_ms = 30.0
+
+# 音频后端:cpal(默认) / wasapi(直写 WASAPI) / auto(优先 wasapi)。
+# 这两者目前行为相当 —— wasapi 是为将来的低延迟模式准备的后端。
+# 改动后要重启宿主才生效(驱动跑在宿主进程里)。
+# 环境变量 PIGASIO_BACKEND 的优先级比这一项高,方便临时覆盖排查。
+backend = "cpal"
 
 # ---- 输出设备 ----
 # 可以写多个 [[output]]。默认播放设备:
@@ -278,18 +294,21 @@ fn load_config(explicit: Option<&PathBuf>) -> Result<Config, String> {
         }
     };
 
-    match path {
+    let config = match path {
         Some(p) => {
             println!("配置文件:{}", p.display());
-            Config::from_file(&p).map_err(|e| e.to_string())
+            Config::from_file(&p).map_err(|e| e.to_string())?
         }
         None => {
             println!("配置文件:未找到,使用内置默认设置");
             let config = Config::default();
             config.validate().map_err(|e| e.to_string())?;
-            Ok(config)
+            config
         }
-    }
+    };
+    // 设备枚举和打开流都走选定的后端 —— 在命令真正干活之前把它定下来。
+    pigasio_core::backend::select(config.engine.backend);
+    Ok(config)
 }
 
 fn describe_config(config: &Config) {

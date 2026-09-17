@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use pigasio_core::backend::BackendKind;
 use pigasio_core::config::{
     AsioSampleType, ChannelSelection, Config, DeviceRef, EngineConfig, ResampleQuality,
     StreamConfig,
@@ -819,6 +820,7 @@ struct App {
     max_drift_ppm: f64,
     watermark_ms: f64,
     use_non_ascii_channel_names: bool,
+    backend: BackendKind,
     inputs: Vec<StreamEdit>,
     outputs: Vec<StreamEdit>,
 
@@ -897,6 +899,7 @@ impl App {
             max_drift_ppm: 500.0,
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
+            backend: BackendKind::default(),
             inputs: vec![StreamEdit::default()],
             outputs: vec![StreamEdit::default()],
             config_path: None,
@@ -1002,6 +1005,9 @@ impl App {
         self.max_drift_ppm = config.engine.max_drift_ppm;
         self.use_non_ascii_channel_names = config.engine.use_non_ascii_channel_names;
         self.watermark_ms = config.engine.watermark_ms;
+        self.backend = config.engine.backend;
+        // 后端必须在枚举设备之前定下来 —— 界面上的设备列表就是它给的。
+        pigasio_core::backend::select(config.engine.backend);
         self.inputs = config.inputs.iter().map(StreamEdit::from_config).collect();
         self.outputs = config.outputs.iter().map(StreamEdit::from_config).collect();
     }
@@ -1020,6 +1026,7 @@ impl App {
                 max_drift_ppm: self.max_drift_ppm,
                 use_non_ascii_channel_names: self.use_non_ascii_channel_names,
                 watermark_ms: self.watermark_ms,
+                backend: self.backend,
             },
         }
     }
@@ -1236,6 +1243,7 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
     engine["max_drift_ppm"] = value(config.engine.max_drift_ppm);
     engine["use_non_ascii_channel_names"] = value(config.engine.use_non_ascii_channel_names);
     engine["watermark_ms"] = value(config.engine.watermark_ms);
+    engine["backend"] = value(config.engine.backend.as_str());
 
     set_streams(&mut doc, "output", &config.outputs)?;
     set_streams(&mut doc, "input", &config.inputs)?;
@@ -1775,6 +1783,27 @@ impl App {
                             });
                         }
                     });
+                ui.end_row();
+
+                ui.label("音频后端");
+                egui::ComboBox::from_id_salt("backend")
+                    .selected_text(backend_label(self.backend))
+                    .width(COMBO)
+                    .show_ui(ui, |ui| {
+                        for kind in [BackendKind::Cpal, BackendKind::Wasapi, BackendKind::Auto] {
+                            ui.selectable_value(&mut self.backend, kind, backend_label(kind));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "用哪个实现去驱动声卡。\n\n\
+                         cpal —— 默认,久经考验。\n\
+                         直写 WASAPI —— 为将来的低延迟模式准备的后端,目前行为与 cpal 相当。\n\
+                         自动 —— 优先直写 WASAPI,这台机器上不可用时退回 cpal。\n\n\
+                         改完要**重启宿主**才生效(驱动跑在宿主进程里);\n\
+                         控制面板里的试运行会立刻用上新的选择。\n\n\
+                         环境变量 PIGASIO_BACKEND 的优先级比这里高。",
+                    );
                 ui.end_row();
             });
     }
@@ -2384,6 +2413,14 @@ fn resample_label(quality: ResampleQuality) -> &'static str {
         ResampleQuality::Sinc => "sinc(最好)",
         ResampleQuality::Fast => "fast(省 CPU)",
         ResampleQuality::None => "none(不重采样)",
+    }
+}
+
+fn backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Cpal => "cpal(默认)",
+        BackendKind::Wasapi => "直写 WASAPI",
+        BackendKind::Auto => "自动",
     }
 }
 

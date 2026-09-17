@@ -268,6 +268,7 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `engine.max_drift_ppm` | `500.0` | 稳态漂移补偿上限 |
 | `engine.watermark_ms` | `30.0` | 缓冲目标水位,**单位毫秒**;直接加在延迟上 |
 | `engine.use_non_ascii_channel_names` | `true` | 通道名是否允许中文;显示乱码时设为 `false` |
+| `engine.backend` | `"cpal"` | 音频后端:`cpal` / `wasapi` / `auto` |
 | `[[input]]` / `[[output]].device` | `"default"` | 设备名片段;`"default"` 用系统默认设备,`"none"` 禁用 |
 | `...channels` | — | 指定通道,如 `[0, 3]` |
 | `...channel_count` | `2` | 取前 N 个通道(上限 256);与 `channels` 二选一 |
