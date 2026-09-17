@@ -34,13 +34,23 @@ pub const CONFIG_FILE_NAME: &str = "PigASIO.toml";
 
 /// 一帧里单个通道的采样类型。决定 ASIO 侧 `getChannelInfo()` 返回的格式。
 ///
-/// 引擎内部始终以 `f32` 处理,这里只影响与宿主交换数据的格式。
+/// # 目前只有 `Float32` 可用
+///
+/// 引擎内部以 `f32` 处理,而 ASIO 缓冲区(`AsioBufferSet`)也全是 `f32`
+/// —— `createBuffers` 直接把 f32 指针交给宿主,**没有任何 f32↔整数转换**。
+/// 所以 `Int32` / `Int24` / `Int16` 只是预留的枚举值:一旦放行,
+/// `getChannelInfo()` 会把整数格式报给宿主,而宿主按那个字节宽度去解释
+/// 一块 f32 内存,数值全错且不报任何错 —— 只在听感上是噪声或静音。
+/// [`Config::validate`] 因此会拒绝它们,实现转换之前不要再放开。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AsioSampleType {
     #[default]
     Float32,
+    /// 尚未实现,`validate()` 会拒绝。
     Int32,
+    /// 尚未实现,`validate()` 会拒绝。
     Int24,
+    /// 尚未实现,`validate()` 会拒绝。
     Int16,
 }
 
@@ -71,7 +81,7 @@ impl AsioSampleType {
             "int24" | "i24" => Ok(AsioSampleType::Int24),
             "int16" | "i16" => Ok(AsioSampleType::Int16),
             other => Err(Error::Config(format!(
-                "未知的采样类型 “{other}”,可选:float32 / int32 / int24 / int16"
+                "未知的采样类型 “{other}”;目前只支持 float32"
             ))),
         }
     }
@@ -397,6 +407,16 @@ impl Config {
                 "buffer_size_samples = {} 不是 2 的幂,部分宿主可能拒绝该设置",
                 self.buffer_size_samples
             );
+        }
+        // ASIO 缓冲区内部是 f32,而驱动没有任何 f32↔整数转换(见
+        // `AsioSampleType` 的说明)。放行整数格式会让宿主按错误的字节宽度
+        // 去解释那块内存:数值全错,却不出任何错 —— 只在听感上表现为噪声
+        // 或静音。宁可在这里明确拒绝,也不要静默损坏音频。
+        if self.asio_sample_type != AsioSampleType::Float32 {
+            return Err(Error::Config(format!(
+                "asio_sample_type = \"{}\" 暂不支持:ASIO 侧目前只暴露 float32",
+                self.asio_sample_type
+            )));
         }
         // `is_finite` 顺手挡掉 NaN 和 inf —— 只写区间比较的话 NaN 会溜过去
         // (NaN 和任何数比都是 false)。
@@ -884,5 +904,33 @@ mod tests {
         // 边界值本身合法。
         assert!(Config::from_toml_str("[engine]\nwatermark_ms = 2000.0\n").is_ok());
         assert!(Config::from_toml_str("[engine]\nwatermark_ms = 1.0\n").is_ok());
+    }
+
+    #[test]
+    fn 只接受_float32_采样类型() {
+        // float32 是唯一真正实现的格式。
+        assert!(Config::from_toml_str("asio_sample_type = \"float32\"\n").is_ok());
+        // 不写就用默认值,也必须是 float32。
+        assert_eq!(
+            Config::from_toml_str("sample_rate = 48000\n")
+                .unwrap()
+                .asio_sample_type,
+            AsioSampleType::Float32
+        );
+
+        // 整数格式尚未实现:引擎的 ASIO 缓冲区是 f32,而驱动没有任何
+        // f32↔整数转换。放行它们会让 `getChannelInfo()` 把整数格式报给宿主,
+        // 宿主于是按错误的字节宽度解释那块 f32 内存 —— 数值全错却不出任何
+        // 错。必须在解析阶段就拒绝,不能等到用户听出噪声。
+        for bad in ["int32", "int24", "int16", "i32", "i24", "i16"] {
+            let text = format!("asio_sample_type = \"{bad}\"\n");
+            match Config::from_toml_str(&text) {
+                Ok(_) => panic!("asio_sample_type = {bad} 本该被拒绝,却解析成功了"),
+                Err(e) => assert!(
+                    e.to_string().contains("asio_sample_type"),
+                    "{bad} 的错误信息应点明是哪一项:{e}"
+                ),
+            }
+        }
     }
 }
