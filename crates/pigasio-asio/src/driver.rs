@@ -387,6 +387,15 @@ unsafe extern "system" fn vt_start(this: *mut core::ffi::c_void) -> ASIOError {
             return ase::INVALID_MODE;
         }
 
+        // 先把运行标志和采样位置摆好,**再**启动引擎。顺序不能反:
+        // `Engine::start()` 在返回之前就打开了回调闸门(见 `engine.rs` 里的
+        // `core.running = true`),音频线程可能立刻触发第一个 bufferSwitch。
+        // 那时宿主若在回调里调 `outputReady()`,会读到 running == false 而
+        // 拿到 INVALID_MODE;`sample_position` 也可能先被回调累加、随后才被
+        // 这里清零,白白丢掉一整块的位置。
+        obj.sample_position.store(0, Ordering::Relaxed);
+        obj.running.store(true, Ordering::Release);
+
         let code = enter("start", &mut state, |st| {
             let engine = st
                 .engine
@@ -397,9 +406,9 @@ unsafe extern "system" fn vt_start(this: *mut core::ffi::c_void) -> ASIOError {
                 .map_err(|e| fail(map_core_error(&e), e.to_string()))
         });
 
-        if code == ase::OK {
-            obj.sample_position.store(0, Ordering::Relaxed);
-            obj.running.store(true, Ordering::Release);
+        if code != ase::OK {
+            // 启动失败就把标志收回去,否则 outputReady() 会谎报"在运行"。
+            obj.running.store(false, Ordering::Release);
         }
         code
     })

@@ -439,7 +439,11 @@ impl Config {
                 self.engine.watermark_ms
             )));
         }
-        if self.engine.max_drift_ppm <= 0.0 || self.engine.max_drift_ppm > 100_000.0 {
+        // 同样要显式挡掉 NaN:`NaN <= 0.0` 和 `NaN > 100000.0` 都是 false,
+        // 只写区间比较的话它会溜过去(下游靠 `f64::max` 的 NaN 语义侥幸没崩,
+        // 但行为不可预测)。和上面的 watermark_ms 保持一致。
+        let max_drift_ppm = self.engine.max_drift_ppm;
+        if !max_drift_ppm.is_finite() || max_drift_ppm <= 0.0 || max_drift_ppm > 100_000.0 {
             return Err(Error::Config(
                 "engine.max_drift_ppm 必须落在 (0, 100000] 区间".into(),
             ));
@@ -745,11 +749,18 @@ impl RawStream {
         // 用户直到设备打不开才发现。与其维护一个两边对不齐的功能,
         // 不如只留子串匹配 —— 多设备场景里它够用,而且行为可预期。
         let device = match self.device.as_deref() {
-            Some(name) => match name.trim().to_ascii_lowercase().as_str() {
-                "default" | "" => DeviceRef::Default,
-                "none" | "null" | "disabled" => DeviceRef::None,
-                _ => DeviceRef::Substring(name.to_string()),
-            },
+            Some(raw) => {
+                // 前后空格先去掉,判断和存储都用同一个值。原来判断用
+                // `trim()` 过的、存储却用原文,于是 `device = " Realtek "`
+                // 变成一个带空格的子串、永远匹配不到任何设备,而
+                // `device = "default "` 却照常工作 —— 行为不一致。
+                let name = raw.trim();
+                match name.to_ascii_lowercase().as_str() {
+                    "" | "default" => DeviceRef::Default,
+                    "none" | "null" | "disabled" => DeviceRef::None,
+                    _ => DeviceRef::Substring(name.to_string()),
+                }
+            }
             None => DeviceRef::Default,
         };
 
@@ -995,6 +1006,40 @@ mod tests {
             let text = format!("[[output]]\ndevice = \"default\"\ngain_db = {ok}\n");
             let cfg = Config::from_toml_str(&text).unwrap_or_else(|e| panic!("{ok}: {e}"));
             assert!(cfg.outputs[0].linear_gain().is_finite(), "{ok} 的增益算出了非有限值");
+        }
+    }
+
+    #[test]
+    fn 漂移上限的_nan_会被拒绝() {
+        // `NaN <= 0.0` 和 `NaN > 100000.0` 都是 false —— 只写区间比较的话
+        // NaN 会溜过去,而它会让下游 PI 控制器的行为变得不可预测。
+        for bad in ["nan", "inf", "0.0", "-1.0", "200000.0"] {
+            let text = format!("[engine]\nmax_drift_ppm = {bad}\n");
+            match Config::from_toml_str(&text) {
+                Ok(_) => panic!("max_drift_ppm = {bad} 本该被拒绝,却解析成功了"),
+                Err(e) => assert!(e.to_string().contains("max_drift_ppm"), "{bad}: {e}"),
+            }
+        }
+        assert!(Config::from_toml_str("[engine]\nmax_drift_ppm = 500.0\n").is_ok());
+        assert!(Config::from_toml_str("[engine]\nmax_drift_ppm = 0.001\n").is_ok());
+    }
+
+    #[test]
+    fn 设备名前后的空格会被忽略() {
+        // 带空格的子串永远匹配不到设备 —— 设备名里没有那两个空格。
+        let cfg = Config::from_toml_str("[[output]]\ndevice = \" Realtek \"\n").unwrap();
+        assert_eq!(
+            cfg.outputs[0].device,
+            DeviceRef::Substring("Realtek".into())
+        );
+
+        // 特殊值同样认前后空格,空串仍按"系统默认设备"处理。
+        for text in [
+            "[[output]]\ndevice = \" default \"\n",
+            "[[output]]\ndevice = \"\"\n",
+        ] {
+            let cfg = Config::from_toml_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(cfg.outputs[0].device, DeviceRef::Default);
         }
     }
 }
