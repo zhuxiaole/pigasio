@@ -930,8 +930,11 @@ impl App {
             theme_mode: initial_theme,
         };
 
-        app.refresh_devices();
-
+        // 先加载配置:**它会选定音频后端**,而设备列表正是用那个后端枚举出来的。
+        // 顺序反了的话,打开面板的第一次枚举会走默认后端(cpal),而界面上的
+        // 后端已经是配置里指定的那个 —— 两个后端列出的设备名通常一样,这种
+        // 错位很难被发现。
+        //
         // 优先用驱动传进来的路径;没有就按标准顺序找。
         let path = config_path.or_else(|| {
             let cwd = std::env::current_dir().ok();
@@ -942,6 +945,8 @@ impl App {
         } else {
             app.message = "未找到配置文件,当前显示的是默认设置。".into();
         }
+
+        app.refresh_devices();
 
         app
     }
@@ -1917,62 +1922,95 @@ impl App {
             let sample_rate = self.sample_rate.max(1) as f64;
             let block_ms = block_frames as f64 / sample_rate * 1000.0;
             let floor_ms = watermark_floor_ms(block_ms);
-            match watermark_verdict(self.watermark_ms, block_ms) {
-                WatermarkVerdict::TooThin => {
-                    let label = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "⚠ 水位 {:.0} ms 薄于实测设备块 {block_ms:.0} ms({block_frames} 帧),\
-                                 建议至少 {floor_ms:.0} ms",
-                                self.watermark_ms,
-                            ))
-                            .color(egui::Color32::from_rgb(220, 160, 60)),
-                        )
-                        .truncate(),
-                    );
-                    label.on_hover_text(
-                        "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频\
-                         引擎决定,和 ASIO 缓冲区大小无关。两块设备回调之间环形缓冲没有\
-                         新数据补充,所以水位得比这个时间长,否则宿主来取数据时缓冲里\
-                         是空的。",
-                    );
-                }
-                WatermarkVerdict::TooThick => {
-                    // 反方向的问题:水位厚到这份上,多出来的部分全是在白等。
-                    // 典型症状是"切到了低延迟后端、设备块也降下来了,却感觉延迟
-                    // 没变" —— 设备块小了,水位没跟着降。
-                    let saved = self.watermark_ms - floor_ms;
-                    let label = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "↓ 水位 {:.0} ms,实测设备块 {block_ms:.1} ms —— \
-                                 可降到约 {floor_ms:.0} ms,省 {saved:.0} ms 延迟",
-                                self.watermark_ms,
-                            ))
-                            .color(egui::Color32::from_rgb(110, 170, 220)),
-                        )
-                        .truncate(),
-                    );
-                    label.on_hover_text(
-                        "水位是延迟的主要组成部分,而它只需要盖过**约两块**设备回调\
-                         就够稳 —— 水位按平均值维持,波谷会比均值低将近一整块设备回调。\n\n\
-                         设备块小的时候,现在的水位有一大半是白等的:调小它不会让抗\
-                         抖动能力变差,只是把余量收回到合理范围。\n\n\
-                         改完跑一次试运行,确认「欠载」还是 0;有欠载就往回调一点。",
-                    );
-                }
-                WatermarkVerdict::Ok => {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "实测最大设备块 {block_ms:.0} ms({block_frames} 帧),\
-                                 水位比它厚 {:.1} 倍",
-                                self.watermark_ms / block_ms
-                            ))
-                            .weak(),
-                        )
-                        .truncate(),
-                    );
+
+            // 请求了设备周期却一条流都没用上 —— 这比水位偏厚更值得先说,因为它
+            // 意味着用户为降延迟做的设置**根本没起作用**:共享模式的周期由驱动
+            // 说了算,不支持的请求会被忽略或夹到它自己的值。
+            //
+            // 判据是"**有没有**流用上了",而不是"最大设备块等不等于请求值":
+            // 多设备配置里往往只有一部分设备支持低周期,那种情况不该报错。
+            let requested = self.period_frames as usize;
+            let any_matched = requested > 0
+                && self
+                    .last_stats
+                    .iter()
+                    .any(|s| s.device_frames == requested);
+
+            if requested > 0 && !any_matched {
+                let label = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "⚠ 请求的设备周期 {requested} 帧一条流也没用上,\
+                             实测设备块是 {block_frames} 帧 —— 这台设备只支持它自己的周期"
+                        ))
+                        .color(egui::Color32::from_rgb(220, 160, 60)),
+                    )
+                    .truncate(),
+                );
+                label.on_hover_text(
+                    "共享模式的周期由驱动决定,驱动只能被\"请求\"。不支持的请求会被它\n\
+                     忽略、或夹到最接近的合法值,而界面上看不出这件事。\n\n\
+                     这里看的是**所有流**:只要有一条用上了请求值就不算失败。想看具体\n\
+                     是哪台设备没跟上,看下面每条流自己的「设备块」一列。",
+                );
+            } else {
+                match watermark_verdict(self.watermark_ms, block_ms) {
+                    WatermarkVerdict::TooThin => {
+                        let label = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "⚠ 水位 {:.0} ms 薄于实测设备块 {block_ms:.0} ms({block_frames} 帧),\
+                                     建议至少 {floor_ms:.0} ms",
+                                    self.watermark_ms,
+                                ))
+                                .color(egui::Color32::from_rgb(220, 160, 60)),
+                            )
+                            .truncate(),
+                        );
+                        label.on_hover_text(
+                            "设备块是每块声卡回调一次实际送来(或取走)的帧数,由系统音频\
+                             引擎决定,和 ASIO 缓冲区大小无关。两块设备回调之间环形缓冲没有\
+                             新数据补充,所以水位得比这个时间长,否则宿主来取数据时缓冲里\
+                             是空的。",
+                        );
+                    }
+                    WatermarkVerdict::TooThick => {
+                        // 反方向的问题:水位厚到这份上,多出来的部分全是在白等。
+                        // 典型症状是"切到了低延迟后端、设备块也降下来了,却感觉延迟
+                        // 没变" —— 设备块小了,水位没跟着降。
+                        let saved = self.watermark_ms - floor_ms;
+                        let label = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "↓ 水位 {:.0} ms,实测设备块 {block_ms:.1} ms —— \
+                                     可降到约 {floor_ms:.0} ms,省 {saved:.0} ms 延迟",
+                                    self.watermark_ms,
+                                ))
+                                .color(egui::Color32::from_rgb(110, 170, 220)),
+                            )
+                            .truncate(),
+                        );
+                        label.on_hover_text(
+                            "水位是延迟的主要组成部分,而它只需要盖过**约两块**设备回调\
+                             就够稳 —— 水位按平均值维持,波谷会比均值低将近一整块设备回调。\n\n\
+                             设备块小的时候,现在的水位有一大半是白等的:调小它不会让抗\
+                             抖动能力变差,只是把余量收回到合理范围。\n\n\
+                             改完跑一次试运行,确认「欠载」还是 0;有欠载就往回调一点。",
+                        );
+                    }
+                    WatermarkVerdict::Ok => {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "实测最大设备块 {block_ms:.0} ms({block_frames} 帧),\
+                                     水位比它厚 {:.1} 倍",
+                                    self.watermark_ms / block_ms
+                                ))
+                                .weak(),
+                            )
+                            .truncate(),
+                        );
+                    }
                 }
             }
         }
@@ -2582,6 +2620,43 @@ mod tests {
         assert_eq!(v2.window_pos, Some([10.0, 20.0]));
         assert!(v2.window_size.is_none());
         assert!(v2.maximized.is_none());
+    }
+
+    #[test]
+    fn 设备周期能在保存后重新载入() {
+        let dir = std::env::temp_dir().join(format!("pigasio-period-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("PigASIO.toml");
+        // 从一份**没有** [engine] 表的最小配置开始 —— 那是最常见的情形,
+        // 也是 `toml_edit` 需要新建整张表的情形。
+        std::fs::write(&path, "sample_rate = 48000\n").expect("写初始文件");
+
+        let config = Config {
+            sample_rate: 48000,
+            buffer_size_samples: 1024,
+            outputs: vec![StreamConfig::default()],
+            engine: EngineConfig {
+                period_frames: Some(128),
+                ..EngineConfig::default()
+            },
+            ..Config::default()
+        };
+        write_config(&path, &config).expect("保存");
+
+        let text = std::fs::read_to_string(&path).expect("读回");
+        assert!(
+            text.contains("period_frames = 128"),
+            "设备周期没写进文件:\n{text}"
+        );
+
+        let back = Config::from_file(&path).expect("重新载入");
+        assert_eq!(
+            back.engine.period_frames,
+            Some(128),
+            "保存之后读不回来:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
