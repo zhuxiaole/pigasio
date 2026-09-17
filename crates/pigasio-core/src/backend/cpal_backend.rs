@@ -185,6 +185,8 @@ impl DeviceHandle for CpalDevice {
                 sample_rate: rate.0,
                 channels: range.channels() as usize,
                 sample_format: DeviceSampleFormat::F32,
+                // cpal 不给调共享模式的 period,它由 audio engine 定。
+                period_frames: 0,
             });
         }
 
@@ -221,6 +223,7 @@ impl DeviceHandle for CpalDevice {
             sample_rate: default.sample_rate().0,
             channels: default.channels() as usize,
             sample_format,
+            period_frames: 0,
         })
     }
 

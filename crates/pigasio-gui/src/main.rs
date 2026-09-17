@@ -821,6 +821,8 @@ struct App {
     watermark_ms: f64,
     use_non_ascii_channel_names: bool,
     backend: BackendKind,
+    /// 请求的设备周期(帧)。0 = 用设备允许的最小值。
+    period_frames: u32,
     inputs: Vec<StreamEdit>,
     outputs: Vec<StreamEdit>,
 
@@ -900,6 +902,7 @@ impl App {
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
             backend: BackendKind::default(),
+            period_frames: 0,
             inputs: vec![StreamEdit::default()],
             outputs: vec![StreamEdit::default()],
             config_path: None,
@@ -1006,6 +1009,7 @@ impl App {
         self.use_non_ascii_channel_names = config.engine.use_non_ascii_channel_names;
         self.watermark_ms = config.engine.watermark_ms;
         self.backend = config.engine.backend;
+        self.period_frames = config.engine.period_frames.unwrap_or(0) as u32;
         // 后端必须在枚举设备之前定下来 —— 界面上的设备列表就是它给的。
         pigasio_core::backend::select(config.engine.backend);
         self.inputs = config.inputs.iter().map(StreamEdit::from_config).collect();
@@ -1027,6 +1031,7 @@ impl App {
                 use_non_ascii_channel_names: self.use_non_ascii_channel_names,
                 watermark_ms: self.watermark_ms,
                 backend: self.backend,
+                period_frames: (self.period_frames > 0).then_some(self.period_frames as usize),
             },
         }
     }
@@ -1244,6 +1249,10 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
     engine["use_non_ascii_channel_names"] = value(config.engine.use_non_ascii_channel_names);
     engine["watermark_ms"] = value(config.engine.watermark_ms);
     engine["backend"] = value(config.engine.backend.as_str());
+    // 只有显式指定了才写出去 —— 不写就是用设备允许的最短周期。
+    if let Some(frames) = config.engine.period_frames {
+        engine["period_frames"] = value(frames as i64);
+    }
 
     set_streams(&mut doc, "output", &config.outputs)?;
     set_streams(&mut doc, "input", &config.inputs)?;
@@ -1861,6 +1870,23 @@ impl App {
                          多厚才够?至少要盖过一块设备的回调周期。WASAPI 共享模式下\
                          设备普遍 10 ms 一块,所以低于 10 ms 基本一定会欠载;30 ms 是个\
                          稳妥的起点。",
+                );
+                ui.end_row();
+
+                ui.label("设备周期");
+                ui.add(
+                    egui::DragValue::new(&mut self.period_frames)
+                        .range(0..=4096)
+                        .suffix(" 帧"),
+                )
+                .on_hover_text(
+                    "请求的设备周期(帧)。0 = 用设备允许的最小值。\n\n\
+                     只有「直写 WASAPI」后端认这一项 —— 它把共享模式的 period 降到\
+                     这个量级;其他后端由系统决定,通常是 10 ms。周期越短延迟越低,\
+                     但 CPU 占用和爆音风险越高。\n\n\
+                     改小之后**记得把「缓冲目标水位」一起调小**:水位至少要盖过两块\
+                     设备回调,设备块变小了水位就该跟着降,否则总延迟省不下来。\n\
+                     用「试运行」看实测的设备块,再据此定水位。",
                 );
                 ui.end_row();
             });

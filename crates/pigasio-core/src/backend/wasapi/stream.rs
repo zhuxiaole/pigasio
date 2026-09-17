@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 };
 use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
@@ -112,7 +113,12 @@ struct ClientSetup {
 /// 激活并初始化一个共享模式的音频客户端。
 ///
 /// 格式直接用系统的混音格式 —— 共享模式只能用它(见模块文档)。
-fn init_client(device: &IMMDevice, device_name: &str) -> Result<ClientSetup> {
+/// `period_frames` 是 0 就按系统默认周期,否则尽量按它缩短。
+fn init_client(
+    device: &IMMDevice,
+    device_name: &str,
+    period_frames: usize,
+) -> Result<ClientSetup> {
     ensure_com()?;
 
     let client: IAudioClient =
@@ -126,20 +132,7 @@ fn init_client(device: &IMMDevice, device_name: &str) -> Result<ClientSetup> {
         reason: format!("读取混音格式失败:{e}"),
     })?;
 
-    let initialized = unsafe {
-        client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            // 事件驱动:系统在有数据时 SetEvent,而不是让我们轮询。
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            // 共享模式下缓冲时长由 audio engine 决定,传 0 表示"用默认"。
-            // 这也正是本后端要取代 cpal 的那一点:阶段 3 会换成
-            // `IAudioClient3::InitializeSharedAudioStream` 来指定更小的 period。
-            0,
-            0,
-            mix,
-            None,
-        )
-    };
+    let initialized = initialize_stream(&client, mix, period_frames);
     unsafe { CoTaskMemFree(Some(mix as *const _)) };
     initialized.map_err(|e| Error::DeviceOpen {
         name: device_name.to_string(),
@@ -167,6 +160,39 @@ fn init_client(device: &IMMDevice, device_name: &str) -> Result<ClientSetup> {
         event,
         buffer_frames,
     })
+}
+
+/// 初始化共享模式的流。
+///
+/// 优先走 `IAudioClient3::InitializeSharedAudioStream` —— 这是唯一能把共享模式
+/// 的 period 压下来的路子(见 `docs/low-latency-wasapi.md`)。拿不到这个接口、
+/// 或者指定周期被拒绝,就退回普通的 `Initialize`,让系统按默认周期来。
+///
+/// 两条路径都用事件驱动(`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`)。
+fn initialize_stream(
+    client: &IAudioClient,
+    format: *const windows::Win32::Media::Audio::WAVEFORMATEX,
+    period_frames: usize,
+) -> windows::core::Result<()> {
+    const FLAGS: u32 = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+    if period_frames > 0 {
+        if let Ok(modern) = client.cast::<IAudioClient3>() {
+            // SAFETY: 调用方保证 `format` 在这次调用期间有效。
+            let result = unsafe {
+                modern.InitializeSharedAudioStream(FLAGS, period_frames as u32, format, None)
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => log::warn!(
+                    "按 {period_frames} 帧初始化共享模式失败({e}),退回系统默认 period"
+                ),
+            }
+        }
+    }
+
+    // 共享模式下缓冲时长由 audio engine 决定,传 0 表示"用默认"。
+    unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, FLAGS, 0, 0, format, None) }
 }
 
 /// 渲染线程要的一切。整体按值交给线程体,理由见模块文档。
@@ -202,7 +228,7 @@ pub(super) fn open_output(
     on_data: OutputCallback,
     on_error: ErrorCallback,
 ) -> Result<Box<dyn StreamHandle>> {
-    let setup = init_client(device, device_name)?;
+    let setup = init_client(device, device_name, format.period_frames)?;
     let render: IAudioRenderClient = unsafe { setup.client.GetService() }
         .map_err(|e| Error::Backend(format!("取渲染客户端失败:{e}")))?;
 
@@ -243,7 +269,7 @@ pub(super) fn open_input(
     on_data: InputCallback,
     on_error: ErrorCallback,
 ) -> Result<Box<dyn StreamHandle>> {
-    let setup = init_client(device, device_name)?;
+    let setup = init_client(device, device_name, format.period_frames)?;
     let capture: IAudioCaptureClient = unsafe { setup.client.GetService() }
         .map_err(|e| Error::Backend(format!("取采集客户端失败:{e}")))?;
 

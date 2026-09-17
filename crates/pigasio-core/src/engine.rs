@@ -1379,9 +1379,13 @@ impl Engine {
             let info = &self.input_devices[i];
             let mapped = cfg.channels.expand();
             let ring_channels = mapped.len();
-            let format = info
-                .handle
-                .negotiate(StreamKind::Input, &StreamRequest { sample_rate })?;
+            let format = info.handle.negotiate(
+                StreamKind::Input,
+                &StreamRequest {
+                    sample_rate,
+                    period_frames: engine_cfg.period_frames,
+                },
+            )?;
 
             let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);
@@ -1449,9 +1453,13 @@ impl Engine {
             let info = &self.output_devices[i];
             let mapped = cfg.channels.expand();
             let ring_channels = mapped.len();
-            let format = info
-                .handle
-                .negotiate(StreamKind::Output, &StreamRequest { sample_rate })?;
+            let format = info.handle.negotiate(
+                StreamKind::Output,
+                &StreamRequest {
+                    sample_rate,
+                    period_frames: engine_cfg.period_frames,
+                },
+            )?;
 
             let capacity = ring_capacity(chunk, engine_cfg.watermark_ms, sample_rate);
             let (writer, reader) = ring::ring_buffer(ring_channels, capacity);

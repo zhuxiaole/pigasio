@@ -295,6 +295,16 @@ pub struct EngineConfig {
     ///
     /// 环境变量 `PIGASIO_BACKEND` 的优先级比这一项高,方便临时覆盖排查。
     pub backend: BackendKind,
+    /// 请求的设备周期(帧)。
+    ///
+    /// `None`(不写)或 `0` 表示"用设备允许的最小值"。只有 WASAPI 后端认这一
+    /// 项 —— 它靠 `IAudioClient3` 把共享模式的 period 降到这个量级;cpal 后端
+    /// 忽略它,那时周期仍由系统决定(共享模式下通常 10 ms)。
+    ///
+    /// 周期越短延迟越低,但 CPU 占用和爆音风险越高。降下来之后**记得把
+    /// `watermark_ms` 一起调小** —— 水位至少要盖过两块设备回调,设备块变小
+    /// 了水位就该跟着降,否则延迟省不下来。
+    pub period_frames: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -306,6 +316,7 @@ impl Default for EngineConfig {
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
             backend: BackendKind::default(),
+            period_frames: None,
         }
     }
 }
@@ -574,6 +585,8 @@ struct RawEngine {
     use_non_ascii_channel_names: Option<bool>,
     /// 音频后端:`auto` / `cpal` / `wasapi`。
     backend: Option<String>,
+    /// 请求的设备周期(帧)。0 或省略 = 用设备允许的最小值。
+    period_frames: Option<usize>,
     /// 目标水位,单位毫秒。
     watermark_ms: Option<f64>,
     /// 旧字段:目标水位,单位是 ASIO 缓冲区的倍数。
@@ -692,6 +705,11 @@ impl RawConfig {
                         ))
                     })?,
                     None => EngineConfig::default().backend,
+                },
+                period_frames: match e.period_frames {
+                    // 0 和"不写"是一个意思:让设备自己挑最短的。
+                    Some(0) | None => None,
+                    Some(frames) => Some(frames),
                 },
             },
         };

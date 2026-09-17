@@ -46,22 +46,63 @@ let hresult = audio_client.Initialize(share_mode, stream_flags, buffer_duration,
 
 ## 实现进度
 
-**阶段 1、2 已完成;阶段 4 的"配置开关"部分也已就绪**(水位联动还没做)。
+**阶段 1、2、3 已完成;阶段 4 的"配置开关"部分也已就绪**(水位联动还没做)。
 
 - `backend/mod.rs`:三个 trait 与公共类型,以及 [`BackendKind`] 的选择逻辑。
 - `backend/cpal_backend.rs`:原有 cpal 实现(默认后端)。
-- `backend/wasapi/`:`mod.rs` 是设备枚举与协商,`stream.rs` 是事件驱动的流。
+- `backend/wasapi/`:`mod.rs` 是设备枚举、混音格式协商与 period 选择,
+  `stream.rs` 是事件驱动的流。
 
-**切换后端**有三个入口,优先级从低到高:
+### 低延迟 period 是怎么接的
+
+`negotiate` 里先试 `IAudioClient3::GetSharedModeEnginePeriod` 问出设备支持的
+范围,选定的值放进 `StreamFormat::period_frames`;`init_client` 再用
+`InitializeSharedAudioStream` 按它初始化。任何一步失败(拿不到
+`IAudioClient3`、查不到范围、指定周期被拒)都退回普通的 `Initialize`,
+行为等同阶段 2。
+
+不写 `period_frames` 就用设备允许的**最小值**;显式指定时会向上对齐到
+`fundamental_period` 的整数倍 —— 不对齐的话 `InitializeSharedAudioStream`
+直接返回 `E_INVALIDARG`,再夹进设备报的范围。
+
+### 实测:收益完全取决于驱动
+
+在开发机上试过的所有端点(虚拟声卡、Realtek 板载、USB 声卡)**全部报告
+`480..480`**,也就是 `min == max == fundamental == 480 帧`:
+
+```
+共享模式 period:可选 480..480 帧(默认 480、基本单位 480),选用 480 帧
+```
+
+系统是 Windows 11(26200),`IAudioClient3` 正常可用 —— 是**驱动**只支持
+这一个 period。所以在这台机器上低延迟共享模式拿不到任何收益,设备块仍是
+10 ms。
+
+这不是实现问题,而是这个特性的固有限制:它要求驱动声明支持更小的 period,
+而相当多的消费级音频驱动(尤其是带音效处理的板载方案)并不支持。**能不能
+受益要看你自己的设备** —— 跑一次 `pigasio check`,看日志里那一行:
+
+- `可选 480..480` → 这台设备没戏,阶段 3 对它没有意义;
+- 比如 `可选 64..480` → 有戏,设备块会降到 64 帧(48 kHz 下 1.3 ms)。
+
+顺带排除了一个猜想:试过用 `IAudioClient2::SetClientProperties` 把流声明成
+"专业音频"类别来解锁更小的 period,但 `AUDIO_STREAM_CATEGORY` 枚举里根本
+没有 ProAudio 这个值(Windows 的 "Pro Audio" 指的是 MMCSS 线程优先级,项目
+已经在用了),所以这条路不成立。
+
+### 切换后端
+
+有三个入口,优先级从低到高:
 
 ```toml
 # 1. 配置文件
 [engine]
 backend = "wasapi"   # cpal(默认) / wasapi / auto
+period_frames = 0    # 0 或省略 = 用设备允许的最小周期
 ```
 
 ```text
-2. 控制面板「引擎设置 → 音频后端」的下拉框
+2. 控制面板「引擎设置 → 音频后端 / 设备周期」
 ```
 
 ```cmd
@@ -75,6 +116,8 @@ set PIGASIO_BACKEND=wasapi
 环境变量的值写错时会记一条警告并忽略,不会静默退回默认值 —— 否则用户会以为
 自己切换成功了。
 
+### 验收实测
+
 阶段 2 的验收实测(同一份 3 进 3 出的配置,各跑 12 秒):
 
 | | cpal | wasapi |
@@ -87,6 +130,15 @@ set PIGASIO_BACKEND=wasapi
 把"打开闸门"提到"启动输出设备"之前。原来设备 Start 后会立刻从环形缓冲
 取数据,而闸门还没开、`drain()` 不执行,缓冲只出不进 —— WASAPI 后端下这会
 造成启动期几百帧的欠载,cpal 因为内部时序不同而没有暴露出来。
+
+### 还剩什么
+
+- **水位联动**(阶段 4 的后半):设备块降到 3 ms 之后,`watermark_ms` 的默认
+  30 ms 就成了纯粹的多余延迟。现在引擎已经实测出每条流的设备块
+  (`StreamStatusSnapshot::device_frames`),可以据此提示或自动下调水位。
+  在驱动支持低 period 的机器上,这两件事必须一起做才看得到效果。
+- 阶段 3 的代码路径在开发机上只走通了"退回默认"那一支(因为驱动不支持),
+  `InitializeSharedAudioStream` 真正成功的那条分支**还没有在真机上验证过**。
 
 **阶段 1 单独就有价值**:它把 `engine.rs` 从 cpal 的具体类型上摘下来,
 即使后面几阶段不做了,也让后端可替换。

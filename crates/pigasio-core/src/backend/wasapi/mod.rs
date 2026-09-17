@@ -27,10 +27,11 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 
+use windows::core::Interface;
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    DEVICE_STATE_ACTIVE,
+    eCapture, eConsole, eRender, IAudioClient, IAudioClient3, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
@@ -171,8 +172,9 @@ impl DeviceHandle for WasapiDevice {
             name: self.name.clone(),
             reason: format!("读取混音格式失败:{e}"),
         })?;
-        // 先解析再释放 —— `read_mix_format` 之后就不需要那块内存了。
+        // 解析和 period 查询都在释放之前做完 —— 两者都要用那块内存。
         let parsed = unsafe { read_mix_format(format) };
+        let period_frames = unsafe { choose_period(&client, format, request.period_frames) };
         unsafe { CoTaskMemFree(Some(format as *const _)) };
         let (channels, sample_rate, sample_format) = parsed.map_err(|e| Error::DeviceOpen {
             name: self.name.clone(),
@@ -191,6 +193,7 @@ impl DeviceHandle for WasapiDevice {
             sample_rate,
             channels,
             sample_format,
+            period_frames,
         })
     }
 
@@ -344,4 +347,82 @@ unsafe fn read_mix_format(
     }
 
     Ok((channels, sample_rate, DeviceSampleFormat::F32))
+}
+
+/// 挑一个共享模式的 period(帧)。
+///
+/// 拿不到 `IAudioClient3`(Windows 10 之前,或者驱动不支持)就返回 0 —— 那时
+/// period 由 audio engine 决定,我们插不上手,只能照旧走默认的 `Initialize`。
+///
+/// # Safety
+/// `format` 必须来自 `IAudioClient::GetMixFormat`,且仍在有效期内。
+unsafe fn choose_period(
+    client: &IAudioClient,
+    format: *const windows::Win32::Media::Audio::WAVEFORMATEX,
+    requested: Option<usize>,
+) -> usize {
+    let Ok(modern) = client.cast::<IAudioClient3>() else {
+        log::debug!("这台设备不支持 IAudioClient3,共享模式 period 由系统决定");
+        return 0;
+    };
+
+    let mut default_period = 0u32;
+    let mut fundamental = 0u32;
+    let mut min_period = 0u32;
+    let mut max_period = 0u32;
+    if modern
+        .GetSharedModeEnginePeriod(
+            format,
+            &mut default_period,
+            &mut fundamental,
+            &mut min_period,
+            &mut max_period,
+        )
+        .is_err()
+    {
+        log::debug!("查不到共享模式的 period 范围,按默认处理");
+        return 0;
+    }
+    if fundamental == 0 || min_period == 0 {
+        return 0;
+    }
+
+    let target = match requested {
+        // 用户点名了周期:`InitializeSharedAudioStream` 要求它是基本单位的
+        // 整数倍,不对齐就直接返回 E_INVALIDARG,所以这里向上取整。
+        Some(frames) => align_up(frames, fundamental as usize),
+        // 没点名就取最短的那个 —— 这正是这个后端存在的意义。
+        None => min_period as usize,
+    }
+    .clamp(min_period as usize, max_period.max(min_period) as usize);
+
+    log::info!(
+        "共享模式 period:可选 {min_period}..{max_period} 帧(默认 {default_period}、\
+         基本单位 {fundamental}),选用 {target} 帧"
+    );
+    target
+}
+
+/// 把 `value` 向上对齐到 `unit` 的整数倍。
+fn align_up(value: usize, unit: usize) -> usize {
+    if unit == 0 {
+        return value;
+    }
+    value.div_ceil(unit) * unit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::align_up;
+
+    #[test]
+    fn 向上对齐到基本单位的整数倍() {
+        // 128 是 Windows 上常见的 fundamental period(48 kHz 下约 2.67 ms)。
+        assert_eq!(align_up(128, 128), 128);
+        assert_eq!(align_up(129, 128), 256);
+        assert_eq!(align_up(1, 128), 128);
+        assert_eq!(align_up(0, 128), 0);
+        // 基本单位为 0 时不该除零,原样返回。
+        assert_eq!(align_up(300, 0), 300);
+    }
 }

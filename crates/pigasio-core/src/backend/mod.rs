@@ -102,6 +102,11 @@ pub struct StreamFormat {
     pub channels: usize,
     /// 设备原生的样本格式。引擎不关心它,只是转交给后端的 `open_*`。
     pub sample_format: DeviceSampleFormat,
+    /// 实际生效的设备周期(帧)。**0 表示这个后端不控制它** —— 周期由系统
+    /// 决定,问不出来。
+    ///
+    /// 这是给诊断用的:它决定了"水位至少要盖过多久",是延迟的下限之一。
+    pub period_frames: usize,
 }
 
 /// 打开流时的请求。具体格式由后端协商。
@@ -109,6 +114,12 @@ pub struct StreamFormat {
 pub struct StreamRequest {
     /// 期望的采样率。设备不支持时后端可以向下调整。
     pub sample_rate: u32,
+    /// 期望的设备周期(帧)。`None` 表示"越短越好"(设备允许的最小值)。
+    ///
+    /// 只有 WASAPI 后端认这一项 —— 它靠 `IAudioClient3` 把共享模式的 period
+    /// 降到这个量级。cpal 后端忽略它,因为共享模式的周期由 audio engine 定,
+    /// cpal 没有暴露调它的接口。
+    pub period_frames: Option<usize>,
 }
 
 /// 输入回调:后端把设备数据转成 `f32` 交错后交过来。
