@@ -269,7 +269,7 @@ IN 1 (Line 1)    IN 2 (Line 1)
 | `engine.watermark_ms` | `30.0` | 缓冲目标水位,**单位毫秒**;直接加在延迟上 |
 | `engine.use_non_ascii_channel_names` | `true` | 通道名是否允许中文;显示乱码时设为 `false` |
 | `engine.backend` | `"cpal"` | 音频后端:`cpal` / `wasapi` / `auto` |
-| `engine.period_frames` | — | 请求的设备周期(帧);省略 = 用设备允许的最小值。只有 `wasapi` 后端认 |
+| `engine.period_frames` | — | 请求的设备周期(帧);省略 = 保持设备默认。只有 `wasapi` 后端认,且需自行验证稳定性 |
 | `[[input]]` / `[[output]].device` | `"default"` | 设备名片段;`"default"` 用系统默认设备,`"none"` 禁用 |
 | `...channels` | — | 指定通道,如 `[0, 3]` |
 | `...channel_count` | `2` | 取前 N 个通道(上限 256);与 `channels` 二选一 |

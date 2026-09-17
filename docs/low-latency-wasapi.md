@@ -61,34 +61,39 @@ let hresult = audio_client.Initialize(share_mode, stream_flags, buffer_duration,
 `IAudioClient3`、查不到范围、指定周期被拒)都退回普通的 `Initialize`,
 行为等同阶段 2。
 
-不写 `period_frames` 就用设备允许的**最小值**;显式指定时会向上对齐到
-`fundamental_period` 的整数倍 —— 不对齐的话 `InitializeSharedAudioStream`
-直接返回 `E_INVALIDARG`,再夹进设备报的范围。
+**不写 `period_frames` 就保持设备默认的周期** —— 不主动去降。显式指定时向上
+对齐到 `fundamental_period` 的整数倍(不对齐会直接返回 `E_INVALIDARG`),
+再夹进设备报的范围。目标等于默认值时同样退回 `Initialize`:显式设置和用默认
+没区别,没必要多一次可能被驱动实现歪掉的调用。
 
-### 实测:收益完全取决于驱动
+### 实测:能不能降、降了稳不稳,都取决于驱动
 
-在开发机上试过的所有端点(虚拟声卡、Realtek 板载、USB 声卡)**全部报告
-`480..480`**,也就是 `min == max == fundamental == 480 帧`:
+这是整个方案里最不确定的一环,实测结论也最反直觉。
+
+**物理声卡**(Realtek 板载、USB 声卡)报告 `480..480`,即
+`min == max == fundamental == 480 帧` —— 没有任何向下空间。
+
+**虚拟声卡反而"支持"低延迟。** Virtual Audio Cable 报告 `48..480`
+(fundamental = 1),最小 period 是 48 帧,48 kHz 下 1 ms,看起来正是想要的东西。
+但**用了会出事**:
 
 ```
-共享模式 period:可选 480..480 帧(默认 480、基本单位 480),选用 480 帧
+共享模式 period:可选 48..480 帧(默认 480、基本单位 1),选用 48 帧
+→ 设备块 48 帧 | 写 977.4k / 读 965.5k 帧 | 溢出 26863、水位贴满
 ```
 
-系统是 Windows 11(26200),`IAudioClient3` 正常可用 —— 是**驱动**只支持
-这一个 period。所以在这台机器上低延迟共享模式拿不到任何收益,设备块仍是
-10 ms。
+在 48 帧周期下,VAC 的**事件频率是约 1034 次/秒**(而非 1000),产出速率比
+标称高约 3%。这个偏差远超漂移补偿的能力(默认 500 ppm = 0.05%),环形缓冲
+会一路积压到容量上限、持续溢出。同一块设备走默认周期时一切正常。
 
-这不是实现问题,而是这个特性的固有限制:它要求驱动声明支持更小的 period,
-而相当多的消费级音频驱动(尤其是带音效处理的板载方案)并不支持。**能不能
-受益要看你自己的设备** —— 跑一次 `pigasio check`,看日志里那一行:
+所以**默认不去降 period**。这不是保守 —— 是因为"驱动报告支持"和"驱动实际
+干得好"完全是两回事,而这个偏差在配置层面看不出来,只会表现成莫名其妙的溢出。
+愿意折腾的人显式设 `period_frames`,自己用 `check` 验证。
 
-- `可选 480..480` → 这台设备没戏,阶段 3 对它没有意义;
-- 比如 `可选 64..480` → 有戏,设备块会降到 64 帧(48 kHz 下 1.3 ms)。
-
-顺带排除了一个猜想:试过用 `IAudioClient2::SetClientProperties` 把流声明成
-"专业音频"类别来解锁更小的 period,但 `AUDIO_STREAM_CATEGORY` 枚举里根本
-没有 ProAudio 这个值(Windows 的 "Pro Audio" 指的是 MMCSS 线程优先级,项目
-已经在用了),所以这条路不成立。
+排查过程中顺带排除了一个猜想:曾想用 `IAudioClient2::SetClientProperties` 把流
+声明成"专业音频"类别来解锁更小的 period,但 `AUDIO_STREAM_CATEGORY` 枚举里
+根本没有 ProAudio 这个值(Windows 的 "Pro Audio" 指的是 MMCSS 线程优先级,
+项目早就在用了),这条路不成立。
 
 ### 切换后端
 

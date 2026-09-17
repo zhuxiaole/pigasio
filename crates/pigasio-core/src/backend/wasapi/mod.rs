@@ -389,12 +389,29 @@ unsafe fn choose_period(
 
     let target = match requested {
         // 用户点名了周期:`InitializeSharedAudioStream` 要求它是基本单位的
-        // 整数倍,不对齐就直接返回 E_INVALIDARG,所以这里向上取整。
-        Some(frames) => align_up(frames, fundamental as usize),
-        // 没点名就取最短的那个 —— 这正是这个后端存在的意义。
-        None => min_period as usize,
+        // 整数倍,不对齐就直接返回 E_INVALIDARG,所以向上取整;再夹进设备
+        // 报出的范围。
+        Some(frames) => align_up(frames, fundamental as usize)
+            .clamp(min_period as usize, max_period.max(min_period) as usize),
+        // 没点名就**保持设备默认的 period**。
+        //
+        // 这里一度取的是最小值 —— "默认就把延迟压到最低"听起来很合理,但实测
+        // Virtual Audio Cable 在它的最小 period(48 帧)下产出速率比标称高约
+        // 3%(事件频率 1034/秒而非 1000),远超漂移补偿的能力(默认 500 ppm
+        // = 0.05%),环形缓冲会一路积压到溢出。降周期是要承担风险的,应该由
+        // 用户主动要,不该是默认行为。
+        None => default_period as usize,
+    };
+
+    // 目标就是设备默认值时,显式设置和用默认没有区别 —— 那就别折腾,退回普通
+    // 的 `Initialize`。少一次可能被驱动实现歪掉的调用。
+    if requested.is_none() && target <= default_period as usize {
+        log::debug!(
+            "共享模式默认 period 是 {default_period} 帧(可选 {min_period}..{max_period}),\
+             保持默认"
+        );
+        return 0;
     }
-    .clamp(min_period as usize, max_period.max(min_period) as usize);
 
     log::info!(
         "共享模式 period:可选 {min_period}..{max_period} 帧(默认 {default_period}、\

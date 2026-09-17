@@ -139,6 +139,21 @@ fn init_client(
         reason: format!("初始化音频客户端失败:{e}"),
     })?;
 
+    // 校验实际生效的 period。驱动**不一定**照我们请求的来 —— 实测有虚拟声卡
+    // 在显式设置 period 后,实际包大小掉到了请求值的十分之一。这种事必须留下
+    // 痕迹,否则只会表现成"莫名其妙开始溢出"。
+    if period_frames > 0 {
+        if let Some(actual) = current_period(&client) {
+            if actual != period_frames {
+                log::warn!(
+                    "设备 “{device_name}” 请求的设备周期是 {period_frames} 帧,\
+                     实际生效 {actual} 帧 —— 驱动没照做。水位请按**实测**的设备块来定\
+                     (看试运行面板里的那一行)。"
+                );
+            }
+        }
+    }
+
     let buffer_frames = unsafe { client.GetBufferSize() }.map_err(|e| Error::DeviceOpen {
         name: device_name.to_string(),
         reason: format!("读取设备缓冲大小失败:{e}"),
@@ -160,6 +175,21 @@ fn init_client(
         event,
         buffer_frames,
     })
+}
+
+/// 查当前流实际生效的共享模式 period(帧)。
+///
+/// 拿不到 `IAudioClient3`、或者调用失败时返回 `None`(那就无从校验)。
+fn current_period(client: &IAudioClient) -> Option<usize> {
+    let modern = client.cast::<IAudioClient3>().ok()?;
+    let mut format: *mut windows::Win32::Media::Audio::WAVEFORMATEX = std::ptr::null_mut();
+    let mut period = 0u32;
+    unsafe { modern.GetCurrentSharedModeEnginePeriod(&mut format, &mut period) }.ok()?;
+    // 这个格式是引擎新分配的,要还回去。
+    if !format.is_null() {
+        unsafe { CoTaskMemFree(Some(format as *const _)) };
+    }
+    Some(period as usize)
 }
 
 /// 初始化共享模式的流。
