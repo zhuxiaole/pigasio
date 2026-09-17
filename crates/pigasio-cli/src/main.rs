@@ -237,6 +237,12 @@ fn parse_run_options(args: &[String], default_seconds: f64) -> Result<RunOptions
                 opts.seconds = value
                     .parse()
                     .map_err(|_| format!("--seconds 的值 “{value}” 不是数字"))?;
+                // `parse::<f64>` 认 "nan" / "inf",而它们都能过下面那个
+                // `<= 0.0`(NaN 和任何数比较都是 false),随后
+                // `Duration::from_secs_f64` 会直接 panic。先挡掉非有限值。
+                if !opts.seconds.is_finite() {
+                    return Err(format!("--seconds 的值 “{value}” 不是有限的数字"));
+                }
                 if opts.seconds <= 0.0 {
                     return Err("--seconds 必须是正数".into());
                 }
@@ -805,4 +811,32 @@ fn cmd_channels(args: &[String]) -> Result<(), String> {
     println!("          [engine]");
     println!("          use_non_ascii_channel_names = false");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seconds_args(value: &str) -> Vec<String> {
+        vec!["--seconds".to_string(), value.to_string()]
+    }
+
+    #[test]
+    fn 秒数参数拒绝非有限值与非正数() {
+        // `parse::<f64>` 认 "nan" / "inf",而它们能骗过 `<= 0.0`
+        // (NaN 与任何数比较都是 false),随后 `Duration::from_secs_f64`
+        // 会 panic —— 必须在解析阶段就挡掉。
+        for bad in ["nan", "inf", "-inf", "0", "-1"] {
+            assert!(
+                parse_run_options(&seconds_args(bad), 1.0).is_err(),
+                "--seconds {bad} 本该被拒绝"
+            );
+        }
+
+        let opts = parse_run_options(&seconds_args("2.5"), 1.0).expect("2.5 该被接受");
+        assert_eq!(opts.seconds, 2.5);
+        // 不写 --seconds 时用调用方给的默认值。
+        let opts = parse_run_options(&[], 3.0).expect("默认值该被接受");
+        assert_eq!(opts.seconds, 3.0);
+    }
 }
