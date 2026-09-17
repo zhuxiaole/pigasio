@@ -166,27 +166,39 @@ pub fn current() -> &'static dyn Backend {
 /// 按上面的规则挑一个后端。
 #[cfg(windows)]
 fn select_backend() -> Box<dyn Backend> {
-    match std::env::var("PIGASIO_BACKEND").as_deref() {
-        Ok("cpal") => Box::new(CpalBackend::new()),
-        Ok("wasapi") => {
-            log::info!("音频后端:wasapi(由 PIGASIO_BACKEND 指定)");
-            Box::new(WasapiBackend::new())
-        }
-        Ok("auto") => {
+    // 顺手容忍大小写和首尾空格 —— 环境变量本来就容易写歪,没必要在这种
+    // 地方挑刺,写错了还给个明确的警告。
+    let requested = std::env::var("PIGASIO_BACKEND")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let backend: Box<dyn Backend> = match requested.as_str() {
+        "" | "cpal" => Box::new(CpalBackend::new()),
+        "wasapi" => Box::new(WasapiBackend::new()),
+        "auto" => {
             let wasapi = WasapiBackend::new();
             if wasapi.available() {
-                log::info!("音频后端:wasapi(自动选择)");
                 Box::new(wasapi)
             } else {
                 log::warn!("WASAPI 后端在这台机器上不可用,退回 cpal");
                 Box::new(CpalBackend::new())
             }
         }
-        _ => Box::new(CpalBackend::new()),
-    }
+        other => {
+            log::warn!(
+                "PIGASIO_BACKEND 的值 “{other}” 无法识别(可选 cpal / wasapi / auto),按 cpal 处理"
+            );
+            Box::new(CpalBackend::new())
+        }
+    };
+    // 无论走哪条分支都记一条 —— 排查"到底用的哪个后端"时,这条就是答案。
+    log::info!("音频后端:{}", backend.name());
+    backend
 }
 
 #[cfg(not(windows))]
 fn select_backend() -> Box<dyn Backend> {
-    Box::new(CpalBackend::new())
+    let backend: Box<dyn Backend> = Box::new(CpalBackend::new());
+    log::info!("音频后端:{}", backend.name());
+    backend
 }
