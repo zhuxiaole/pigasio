@@ -219,7 +219,11 @@ impl DriverObject {
         // 对不齐,所以这里不做任何"乐观"的缩减。
         let watermark =
             engine.config().engine.watermark_ms / 1000.0 * engine.sample_rate() as f64;
-        let frames = (watermark.round() as i32).saturating_add(buffer_size as i32);
+        // 重采样滤波器的 group delay 也在路径上,一并算进来 —— 报小了会让
+        // 宿主的录音对齐补偿不够(`prepare()` 之前这项是 0)。
+        let frames = (watermark.round() as i32)
+            .saturating_add(buffer_size as i32)
+            .saturating_add(engine.resampler_delay_frames() as i32);
         self.latency_frames
             .store(frames.max(0) as usize, Ordering::Relaxed);
     }

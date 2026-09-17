@@ -55,7 +55,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use crate::channel_name::ChannelNames;
-use crate::config::{Config, StreamConfig as PigStreamConfig};
+use crate::config::{Config, ResampleQuality, StreamConfig as PigStreamConfig};
 use crate::devices::{self, DeviceInfo};
 use crate::drift::DriftController;
 use crate::error::{Error, Result, StreamKind};
@@ -263,6 +263,18 @@ impl InputStreamRuntime {
     /// 用当前水位推进漂移控制。
     fn update_drift(&mut self, dt_seconds: f64) {
         let queued = self.reader.available_frames();
+        // 直通流没有可调的比率(见 `stream_quality`)。它的水位靠「生产和
+        // 消费同源」保持稳定,这里只上报水位 —— 否则界面上会挂着一个永远
+        // 不会生效的漂移修正量。
+        if self.resampler.is_passthrough() {
+            self.stats
+                .queued_frames
+                .store(queued as u64, Ordering::Relaxed);
+            self.stats
+                .underflow_frames
+                .store(self.reader.underflow_frames(), Ordering::Relaxed);
+            return;
+        }
         let adjust = self.drift.update(queued, dt_seconds);
         self.resampler.set_relative_ratio(1.0 + adjust, true);
         self.stats
@@ -370,6 +382,16 @@ impl OutputStreamRuntime {
 
     fn update_drift(&mut self, dt_seconds: f64) {
         let queued = self.writer.queued_frames();
+        // 直通流:同输入侧,只上报水位。
+        if self.resampler.is_passthrough() {
+            self.stats
+                .queued_frames
+                .store(queued as u64, Ordering::Relaxed);
+            self.stats
+                .overflow_frames
+                .store(self.writer.overflow_frames(), Ordering::Relaxed);
+            return;
+        }
         let adjust = self.drift.update(queued, dt_seconds);
         self.resampler.set_relative_ratio(1.0 + adjust, true);
         self.stats
@@ -1134,6 +1156,11 @@ pub struct Engine {
     channel_names: ChannelNames,
     stream_error: Arc<AtomicBool>,
     prepared: Arc<AtomicBool>,
+    /// 各流重采样器引入的延迟(帧),取最大值。`prepare()` 之后才有意义。
+    ///
+    /// 它直接加在音频路径上,`getLatencies()` 必须算进去。构造时是 0 ——
+    /// 重采样器要等 `prepare()` 才建出来。
+    resampler_delay_frames: usize,
     /// 每条流各自的设备块大小,顺序同 `stream_infos`(先输入后输出)。
     ///
     /// 这是量出来的,不是我们请求的:WASAPI 共享模式下缓冲由系统音频引擎
@@ -1263,6 +1290,7 @@ impl Engine {
             dropped_frames,
             stream_error: Arc::new(AtomicBool::new(false)),
             prepared: Arc::new(AtomicBool::new(false)),
+            resampler_delay_frames: 0,
             device_frames_per_stream: Vec::new(),
             stream_infos,
             channel_names,
@@ -1337,6 +1365,14 @@ impl Engine {
         (n, n, n, 0)
     }
 
+    /// 各流重采样器引入的延迟(帧),取最大值。
+    ///
+    /// 这个值直接加在音频路径上,`getLatencies()` 要把它和水位、缓冲区一起
+    /// 报给宿主。`prepare()` 之前恒为 0 —— 那时候重采样器还没建出来。
+    pub fn resampler_delay_frames(&self) -> usize {
+        self.resampler_delay_frames
+    }
+
     /// 取得 ASIO 缓冲区的地址,用于 `ASIOCreateBuffers()`。
     ///
     /// 这些指针在流运行期间保持有效 —— 内部缓冲一旦建立就不再重新分配。
@@ -1396,8 +1432,14 @@ impl Engine {
             // 标称比率 = 输出率 / 输入率。这里的“输入”是设备侧,
             // “输出”是 ASIO 侧。
             let nominal = sample_rate as f64 / device_cfg.sample_rate.0.max(1) as f64;
+            let is_master = self.clock_master == (StreamKind::Input, i);
             let resampler = FixedOutResampler::new(&ResamplerSpec {
-                quality: engine_cfg.resample_quality,
+                quality: stream_quality(
+                    engine_cfg.resample_quality,
+                    nominal,
+                    is_master,
+                    &info.name,
+                ),
                 channels: ring_channels,
                 chunk_size: chunk,
                 nominal_ratio: nominal,
@@ -1422,7 +1464,6 @@ impl Engine {
                 stats: Arc::clone(&stats),
             });
 
-            let is_master = self.clock_master == (StreamKind::Input, i);
             specs.push(StreamSpec {
                 kind: StreamKind::Input,
                 device: info.device.clone(),
@@ -1462,8 +1503,14 @@ impl Engine {
             // 标称比率 = 输出率 / 输入率。这里的“输入”是 ASIO 侧,
             // “输出”是设备侧 —— 与输入流的方向恰好相反。
             let nominal = device_cfg.sample_rate.0.max(1) as f64 / sample_rate as f64;
+            let is_master = self.clock_master == (StreamKind::Output, i);
             let resampler = FixedInResampler::new(&ResamplerSpec {
-                quality: engine_cfg.resample_quality,
+                quality: stream_quality(
+                    engine_cfg.resample_quality,
+                    nominal,
+                    is_master,
+                    &info.name,
+                ),
                 channels: ring_channels,
                 chunk_size: chunk,
                 nominal_ratio: nominal,
@@ -1489,7 +1536,6 @@ impl Engine {
                 stats: Arc::clone(&stats),
             });
 
-            let is_master = self.clock_master == (StreamKind::Output, i);
             specs.push(StreamSpec {
                 kind: StreamKind::Output,
                 device: info.device.clone(),
@@ -1512,6 +1558,16 @@ impl Engine {
             });
             output_offset += ring_channels;
         }
+
+        // 重采样滤波器的 group delay 直接加在音频路径上,`getLatencies()`
+        // 得把它算进去 —— 报小了,宿主的录音对齐补偿就不够。各流可能不同
+        // (直通的流是 0),取最大的那个。
+        self.resampler_delay_frames = inputs
+            .iter()
+            .map(|s| s.resampler.output_delay_frames())
+            .chain(outputs.iter().map(|s| s.resampler.output_delay_frames()))
+            .max()
+            .unwrap_or(0);
 
         // 把运行时状态和宿主回调装进核心。
         {
@@ -1815,6 +1871,35 @@ fn target_watermark_frames(sample_rate: u32, watermark_ms: f64) -> usize {
     ((sample_rate as f64 * watermark_ms / 1000.0).round() as usize).max(1)
 }
 
+/// 决定某条流实际用哪种重采样质量。
+///
+/// **时钟主设备**在设备采样率与 ASIO 一致时完全不需要重采样:ASIO 的时钟
+/// 就是它的时钟,生产(设备回调写进 ring)和消费(`advance` 攒够一块后搬运)
+/// 都由它驱动,长期速率必然相等,不存在漂移可言。这条路径上的 sinc 滤波器
+/// 于是只剩一个副作用 —— 它的 group delay 直接加在音频上。直通掉它。
+///
+/// **从设备不行**:哪怕采样率相同,它也得靠变速重采样把时钟软锁到主设备上。
+///
+/// `nominal_ratio` 由两个整数相除得到,两边相等时是精确的 1.0,可以直接比。
+fn stream_quality(
+    configured: ResampleQuality,
+    nominal_ratio: f64,
+    is_master: bool,
+    device_name: &str,
+) -> ResampleQuality {
+    if is_master && nominal_ratio == 1.0 {
+        if configured != ResampleQuality::None {
+            log::info!(
+                "时钟主设备 “{device_name}” 与 ASIO 采样率一致,直通不做重采样\
+                 (省掉滤波器的 group delay)"
+            );
+        }
+        ResampleQuality::None
+    } else {
+        configured
+    }
+}
+
 /// 一轮 `advance` 处理不完时,把超出的累计帧数丢掉,返回 (丢掉的帧数, 保留的余数)。
 ///
 /// 单位必须是**帧**。`accumulated` 是帧,除以缓冲区大小得到的是"多少个
@@ -2018,6 +2103,39 @@ mod tests {
                 cpal::SampleRate(192_000)
             ),
             cpal::SampleRate(48_000)
+        );
+    }
+
+    #[test]
+    fn 时钟主设备在同采样率下走直通() {
+        // 主设备定义 ASIO 的时钟,不存在漂移可言 —— 直通能省掉 sinc 滤波器的
+        // group delay。
+        assert_eq!(
+            stream_quality(ResampleQuality::Sinc, 1.0, true, "主设备"),
+            ResampleQuality::None
+        );
+        // 从设备即使采样率相同也要变速(把时钟软锁到主设备),不能直通。
+        assert_eq!(
+            stream_quality(ResampleQuality::Sinc, 1.0, false, "从设备"),
+            ResampleQuality::Sinc
+        );
+        // 主设备但设备采样率与 ASIO 不同:仍要做真正的采样率转换。
+        assert_eq!(
+            stream_quality(ResampleQuality::Sinc, 0.5, true, "主设备"),
+            ResampleQuality::Sinc
+        );
+        assert_eq!(
+            stream_quality(ResampleQuality::Sinc, 2.0, true, "主设备"),
+            ResampleQuality::Sinc
+        );
+        // 用户显式设的档位该保留的保留、该直通的直通。
+        assert_eq!(
+            stream_quality(ResampleQuality::None, 1.0, false, "从设备"),
+            ResampleQuality::None
+        );
+        assert_eq!(
+            stream_quality(ResampleQuality::Fast, 0.5, false, "从设备"),
+            ResampleQuality::Fast
         );
     }
 }

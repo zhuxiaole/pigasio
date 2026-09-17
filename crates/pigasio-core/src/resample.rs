@@ -253,6 +253,26 @@ impl FixedOutResampler {
         self.current_relative
     }
 
+    /// 重采样滤波器引入的延迟(输出侧帧数)。
+    ///
+    /// 数据要穿过滤波器才能出来,这段 group delay 直接加在音频路径上,
+    /// 所以 `getLatencies()` 必须把它算进去。直通模式是 0。
+    ///
+    /// 单位是输出侧的帧,而输入流的输出侧就是 ASIO 侧 —— 正好是延迟报告
+    /// 需要的口径。
+    pub fn output_delay_frames(&self) -> usize {
+        match &self.inner {
+            FixedOutInner::PassThrough => 0,
+            FixedOutInner::Fast(r) => r.output_delay(),
+            FixedOutInner::Sinc(r) => r.output_delay(),
+        }
+    }
+
+    /// 是否处于直通模式(完全不做重采样)。
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self.inner, FixedOutInner::PassThrough)
+    }
+
     /// 直通模式下借用内部缓冲,便于调用方直接读设备数据。
     pub fn passthrough_buffers(&mut self) -> Option<&mut Vec<Vec<f32>>> {
         match self.inner {
@@ -427,6 +447,24 @@ impl FixedInResampler {
     pub fn current_relative_ratio(&self) -> f64 {
         self.current_relative
     }
+
+    /// 重采样滤波器引入的延迟(输出侧帧数)。
+    ///
+    /// 理由同 [`FixedOutResampler::output_delay_frames`]。输出流的输出侧是
+    /// **设备**侧,所以这个值对输出流来说是在设备采样率下的帧数 —— 和 ASIO
+    /// 侧差一个标称比率,但那个比率通常在 1.0 附近,报告延迟时忽略不计。
+    pub fn output_delay_frames(&self) -> usize {
+        match &self.inner {
+            FixedInInner::PassThrough => 0,
+            FixedInInner::Fast(r) => r.output_delay(),
+            FixedInInner::Sinc(r) => r.output_delay(),
+        }
+    }
+
+    /// 是否处于直通模式(完全不做重采样)。
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self.inner, FixedInInner::PassThrough)
+    }
 }
 
 /// 预分配一组分离通道的缓冲。
@@ -597,5 +635,28 @@ mod tests {
         let mut output = allocate_planes(1, 4);
         r.process_into(&input, &mut output).unwrap();
         assert_eq!(output[0], vec![1.0, 2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn 直通零延迟而_sinc_有约半个滤波器的延迟() {
+        // 直通不碰数据,延迟为 0 —— 这正是让时钟主设备直通的意义。
+        let passthrough = FixedOutResampler::new(&spec(ResampleQuality::None, 2, 512)).unwrap();
+        assert!(passthrough.is_passthrough());
+        assert_eq!(passthrough.output_delay_frames(), 0);
+
+        // 默认的 sinc_len = 128,group delay = len × ratio ÷ 2 = 64 个输出样本
+        // (48 kHz 下约 1.3 ms),是音频路径上实打实的一段延迟。
+        let sinc = FixedOutResampler::new(&spec(ResampleQuality::Sinc, 2, 512)).unwrap();
+        assert!(!sinc.is_passthrough());
+        assert_eq!(
+            sinc.output_delay_frames(),
+            64,
+            "sinc_len=128 的延迟应当是 64 个输出样本"
+        );
+
+        // 多项式只有 8 个抽头,延迟小一个数量级。
+        let fast = FixedOutResampler::new(&spec(ResampleQuality::Fast, 2, 512)).unwrap();
+        assert_eq!(fast.output_delay_frames(), 4);
+        assert!(fast.output_delay_frames() < sinc.output_delay_frames());
     }
 }
