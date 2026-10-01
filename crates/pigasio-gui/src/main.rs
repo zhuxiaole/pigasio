@@ -1895,6 +1895,28 @@ impl App {
                     });
                 ui.end_row();
 
+                ui.label("采样类型");
+                egui::ComboBox::from_id_salt("asio_sample_type")
+                    .selected_text(self.asio_sample_type.to_string())
+                    .width(COMBO)
+                    .show_ui(ui, |ui| {
+                        for t in [
+                            AsioSampleType::Float32,
+                            AsioSampleType::Int32,
+                            AsioSampleType::Int24,
+                            AsioSampleType::Int16,
+                        ] {
+                            ui.selectable_value(&mut self.asio_sample_type, t, t.to_string())
+                                .on_hover_text(match t {
+                                    AsioSampleType::Float32 => "32 位 IEEE 浮点，默认且音质最高。",
+                                    AsioSampleType::Int32 => "32 位整型 (Int32 LSB)。",
+                                    AsioSampleType::Int24 => "24 位整型 (Int24 LSB，3字节紧凑打包)。",
+                                    AsioSampleType::Int16 => "16 位整型 (Int16 LSB)。",
+                                });
+                        }
+                    });
+                ui.end_row();
+
                 ui.label("音频后端");
                 egui::ComboBox::from_id_salt("backend")
                     .selected_text(backend_label(self.backend))

@@ -153,8 +153,9 @@ sample_rate = 48000
 # 48 kHz 下 512 帧 ≈ 10.7 ms 延迟,1024 帧 ≈ 21.3 ms。
 buffer_size_samples = 1024
 
-# 暴露给宿主的采样类型。目前只支持 float32 ——
-# 它也是 Windows 音频引擎的内部格式,转换代价最低。
+# 暴露给宿主的采样类型:float32(默认,推荐) / int32 / int24 / int16。
+# float32 是 Windows 音频引擎的内部格式,无转换损耗;
+# 若老式宿主仅支持整型格式,可按需配置为 int32 / int24 / int16。
 asio_sample_type = "float32"
 
 [engine]
@@ -341,8 +342,9 @@ fn describe_config(config: &Config) {
     let chunk = config.buffer_size_samples;
     let latency_ms = chunk as f64 / rate as f64 * 1000.0;
     println!(
-        "采样率 {rate} Hz,缓冲区 {chunk} 帧(约 {latency_ms:.1} ms),\
+        "采样率 {rate} Hz,缓冲区 {chunk} 帧(约 {latency_ms:.1} ms),格式 {},\
          {} 路 ASIO 输入 / {} 路 ASIO 输出",
+        config.asio_sample_type,
         config.total_input_channels(),
         config.total_output_channels()
     );

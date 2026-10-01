@@ -79,7 +79,7 @@ PigASIO 的处理方式:
 | WASAPI 独占模式 | 支持 | 暂未实现 |
 | 多设备时钟同步 | 不适用 | 环形缓冲 + 变速重采样 + PI 控制 |
 | 动态重载配置 | 支持(监听配置文件变化) | 需要重启宿主 |
-| ASIO 采样类型 | float32 / int32 / int24 / int16 | float32 |
+| ASIO 采样类型 | float32 / int32 / int24 / int16 | float32 / int32 / int24 / int16 |
 | 平台 | Windows x86 + x64 | Windows **x64**(见下方"已知限制") |
 | 许可证 | GPL-3.0 | GPL-3.0 |
 

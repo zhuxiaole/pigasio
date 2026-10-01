@@ -59,12 +59,13 @@ use crate::backend::{
     StreamRequest,
 };
 use crate::channel_name::ChannelNames;
-use crate::config::{Config, ResampleQuality, StreamConfig as PigStreamConfig};
+use crate::config::{AsioSampleType, Config, ResampleQuality, StreamConfig as PigStreamConfig};
 use crate::devices::{self, DeviceInfo};
 use crate::drift::DriftController;
 use crate::error::{Error, Result, StreamKind};
 use crate::resample::{allocate_planes, FixedInResampler, FixedOutResampler, ResamplerSpec};
 use crate::ring::{self, FrameReader, FrameWriter, RingStats, RingStatsSnapshot};
+use crate::sample_format::{convert_asio_to_f32, convert_f32_to_asio, HostBuffer};
 
 /// 环形缓冲容量相对于目标水位的倍数。
 const RING_CAPACITY_FACTOR: f64 = 6.0;
@@ -104,28 +105,65 @@ pub type BufferSwitchCallback = Box<dyn FnMut(&mut AsioBufferSet, usize) + Send>
 /// 每个通道是一块**连续**内存,前半段是 index 0,后半段是 index 1。
 /// 连续性很重要:宿主会长期持有这些指针,任何重新分配都会让它手里的
 /// 指针失效,进而直接踩坏宿主进程的内存。
+///
+/// 若采样格式为 `Float32`，宿主直接读写内部的 `f32` 内存；
+/// 若配置为 `Int16` / `Int24` / `Int32`，则额外维护满足对齐要求的原生字节缓冲，并在
+/// 回调前后进行双向采样格式转换。
 pub struct AsioBufferSet {
     buffer_size: usize,
+    sample_type: AsioSampleType,
     input_channels: usize,
     output_channels: usize,
     inputs: Vec<Vec<f32>>,
     outputs: Vec<Vec<f32>>,
+    host_inputs: Vec<HostBuffer>,
+    host_outputs: Vec<HostBuffer>,
 }
 
 impl AsioBufferSet {
-    pub fn new(input_channels: usize, output_channels: usize, buffer_size: usize) -> Self {
+    pub fn new(
+        input_channels: usize,
+        output_channels: usize,
+        buffer_size: usize,
+        sample_type: AsioSampleType,
+    ) -> Self {
         let span = buffer_size * 2;
+        let bytes_per_chan = span * sample_type.size_of();
+
+        let host_inputs = if sample_type == AsioSampleType::Float32 {
+            Vec::new()
+        } else {
+            (0..input_channels)
+                .map(|_| HostBuffer::new(bytes_per_chan))
+                .collect()
+        };
+
+        let host_outputs = if sample_type == AsioSampleType::Float32 {
+            Vec::new()
+        } else {
+            (0..output_channels)
+                .map(|_| HostBuffer::new(bytes_per_chan))
+                .collect()
+        };
+
         AsioBufferSet {
             buffer_size,
+            sample_type,
             input_channels,
             output_channels,
             inputs: (0..input_channels).map(|_| vec![0.0; span]).collect(),
             outputs: (0..output_channels).map(|_| vec![0.0; span]).collect(),
+            host_inputs,
+            host_outputs,
         }
     }
 
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    pub fn sample_type(&self) -> AsioSampleType {
+        self.sample_type
     }
 
     pub fn input_channels(&self) -> usize {
@@ -137,15 +175,27 @@ impl AsioBufferSet {
     }
 
     /// 输入缓冲在 `index` 处的起始地址,写进 `ASIOBufferInfo::buffers[index]`。
-    pub fn input_ptr(&mut self, channel: usize, index: usize) -> *mut f32 {
-        let off = index * self.buffer_size;
-        self.inputs[channel][off..].as_mut_ptr()
+    pub fn input_ptr(&mut self, channel: usize, index: usize) -> *mut core::ffi::c_void {
+        if self.sample_type == AsioSampleType::Float32 {
+            let off = index * self.buffer_size;
+            self.inputs[channel][off..].as_mut_ptr() as *mut core::ffi::c_void
+        } else {
+            let bytes_per_sample = self.sample_type.size_of();
+            let off = index * self.buffer_size * bytes_per_sample;
+            unsafe { self.host_inputs[channel].as_mut_ptr().add(off) as *mut core::ffi::c_void }
+        }
     }
 
     /// 输出缓冲在 `index` 处的起始地址。
-    pub fn output_ptr(&mut self, channel: usize, index: usize) -> *mut f32 {
-        let off = index * self.buffer_size;
-        self.outputs[channel][off..].as_mut_ptr()
+    pub fn output_ptr(&mut self, channel: usize, index: usize) -> *mut core::ffi::c_void {
+        if self.sample_type == AsioSampleType::Float32 {
+            let off = index * self.buffer_size;
+            self.outputs[channel][off..].as_mut_ptr() as *mut core::ffi::c_void
+        } else {
+            let bytes_per_sample = self.sample_type.size_of();
+            let off = index * self.buffer_size * bytes_per_sample;
+            unsafe { self.host_outputs[channel].as_mut_ptr().add(off) as *mut core::ffi::c_void }
+        }
     }
 
     pub fn input_plane_mut(&mut self, channel: usize, index: usize) -> &mut [f32] {
@@ -171,6 +221,7 @@ impl AsioBufferSet {
         let size = self.buffer_size;
         &mut self.outputs[channel][off..off + size]
     }
+
     /// 同时取得一个输入通道和一个输出通道。
     ///
     /// 单独调用 [`Self::input_plane`] 和 [`Self::output_plane_mut`] 会被
@@ -188,6 +239,42 @@ impl AsioBufferSet {
         let input = &self.inputs[input_channel][off..off + size];
         let output = &mut self.outputs[output_channel][off..off + size];
         (input, output)
+    }
+
+    /// 在把缓冲区交给宿主回调之前，将内部输入 `f32` 转为宿主所需的采样类型（如 Int16/Int24/Int32）。
+    pub fn sync_inputs_to_host(&mut self, index: usize) {
+        if self.sample_type == AsioSampleType::Float32 {
+            return;
+        }
+        let sample_size = self.sample_type.size_of();
+        let chunk = self.buffer_size;
+        let byte_offset = index * chunk * sample_size;
+        let byte_len = chunk * sample_size;
+
+        for ch in 0..self.input_channels {
+            let f32_off = index * chunk;
+            let src = &self.inputs[ch][f32_off..f32_off + chunk];
+            let host_dst = &mut self.host_inputs[ch].as_mut_slice()[byte_offset..byte_offset + byte_len];
+            convert_f32_to_asio(src, host_dst, self.sample_type);
+        }
+    }
+
+    /// 在宿主回调返回之后，将宿主写入的原生输出缓冲解码回内部 `f32` 平面。
+    pub fn sync_outputs_from_host(&mut self, index: usize) {
+        if self.sample_type == AsioSampleType::Float32 {
+            return;
+        }
+        let sample_size = self.sample_type.size_of();
+        let chunk = self.buffer_size;
+        let byte_offset = index * chunk * sample_size;
+        let byte_len = chunk * sample_size;
+
+        for ch in 0..self.output_channels {
+            let host_src = &self.host_outputs[ch].as_slice()[byte_offset..byte_offset + byte_len];
+            let f32_off = index * chunk;
+            let dst = &mut self.outputs[ch][f32_off..f32_off + chunk];
+            convert_asio_to_f32(host_src, dst, self.sample_type);
+        }
     }
 }
 
@@ -563,10 +650,16 @@ impl AudioCore {
             stream.fill(buffers, index, chunk);
         }
 
+        // 若 ASIO 采样类型非 Float32，在调用宿主回调前将 f32 转成宿主格式写入原生缓冲
+        buffers.sync_inputs_to_host(index);
+
         // 宿主在这里读输入、写输出。注意宿主可能在自己的处理里回头调用
         // 本驱动的 getSamplePosition() —— 那些接口只读原子变量,不会
         // 碰到这把锁。
         callback(buffers, index);
+
+        // 若 ASIO 采样类型非 Float32，将宿主写入的原生输出缓冲解码回 f32
+        buffers.sync_outputs_from_host(index);
 
         for stream in outputs.iter_mut() {
             stream.drain(buffers, index, chunk);
@@ -589,6 +682,10 @@ impl AudioCore {
         let AudioCore {
             buffers, outputs, ..
         } = self;
+
+        // 若 ASIO 采样类型非 Float32，宿主在启动前填入 index 1 的数据可能在 host 缓冲里，先解码到 f32
+        buffers.sync_outputs_from_host(1);
+
         for stream in outputs.iter_mut() {
             // 顺序很重要:先垫静音、再推宿主的音频。反过来的话宿主那一块
             // 会被设备立刻取走,ring 又回到近乎全空的状态。
@@ -1271,7 +1368,12 @@ impl Engine {
         Ok(Engine {
             sample_rate: config.sample_rate,
             core: Arc::new(Mutex::new(AudioCore {
-                buffers: AsioBufferSet::new(input_channel_count, output_channel_count, buffer_size),
+                buffers: AsioBufferSet::new(
+                    input_channel_count,
+                    output_channel_count,
+                    buffer_size,
+                    config.asio_sample_type,
+                ),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 callback: Box::new(|_, _| {}),
@@ -1379,7 +1481,7 @@ impl Engine {
     /// 取得 ASIO 缓冲区的地址,用于 `ASIOCreateBuffers()`。
     ///
     /// 这些指针在流运行期间保持有效 —— 内部缓冲一旦建立就不再重新分配。
-    pub fn buffer_ptr(&self, is_input: bool, channel: usize, index: usize) -> *mut f32 {
+    pub fn buffer_ptr(&self, is_input: bool, channel: usize, index: usize) -> *mut core::ffi::c_void {
         let mut core = self.core.lock();
         if is_input {
             core.buffers.input_ptr(channel, index)
@@ -1588,8 +1690,12 @@ impl Engine {
             core.inputs = inputs;
             core.outputs = outputs;
             core.callback = callback;
-            core.buffers =
-                AsioBufferSet::new(self.input_channel_count, self.output_channel_count, chunk);
+            core.buffers = AsioBufferSet::new(
+                self.input_channel_count,
+                self.output_channel_count,
+                chunk,
+                self.config.asio_sample_type,
+            );
             core.buffer_index = 0;
             core.accumulated = 0;
             core.sample_rate = sample_rate as f64;
@@ -2002,19 +2108,31 @@ mod tests {
 
     #[test]
     fn asio_缓冲指针按块偏移且互不重叠() {
-        let mut b = AsioBufferSet::new(2, 2, 4);
-        let p0 = b.input_ptr(0, 0);
-        let p1 = b.input_ptr(0, 1);
+        let mut b = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32);
+        let p0 = b.input_ptr(0, 0) as *mut f32;
+        let p1 = b.input_ptr(0, 1) as *mut f32;
         assert_ne!(p0, p1);
         // index 1 正好在 index 0 之后 buffer_size 个 f32。
         assert_eq!(unsafe { p1.offset_from(p0) }, 4);
 
         // 不同通道的缓冲互不重叠。
-        let mut b2 = AsioBufferSet::new(2, 2, 4);
-        let a = b2.input_ptr(0, 0);
-        let c = b2.input_ptr(1, 0);
+        let mut b2 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32);
+        let a = b2.input_ptr(0, 0) as *mut f32;
+        let c = b2.input_ptr(1, 0) as *mut f32;
         assert_ne!(a, c);
         assert!(unsafe { a.offset_from(c) }.abs() >= 8);
+
+        // 验证 Int16 采样格式下的缓冲指针偏移
+        let mut b16 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int16);
+        let p16_0 = b16.input_ptr(0, 0) as *mut u8;
+        let p16_1 = b16.input_ptr(0, 1) as *mut u8;
+        assert_eq!(unsafe { p16_1.offset_from(p16_0) }, 4 * 2);
+
+        // 验证 Int24 采样格式下的缓冲指针偏移
+        let mut b24 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int24);
+        let p24_0 = b24.input_ptr(0, 0) as *mut u8;
+        let p24_1 = b24.input_ptr(0, 1) as *mut u8;
+        assert_eq!(unsafe { p24_1.offset_from(p24_0) }, 4 * 3);
     }
 
     #[test]
@@ -2055,7 +2173,7 @@ mod tests {
         let samples_processed = Arc::new(AtomicU64::new(0));
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let core = Arc::new(Mutex::new(AudioCore {
-            buffers: AsioBufferSet::new(1, 1, 512),
+            buffers: AsioBufferSet::new(1, 1, 512, AsioSampleType::Float32),
             inputs: Vec::new(),
             outputs: Vec::new(),
             callback: Box::new(|_, _| {}),

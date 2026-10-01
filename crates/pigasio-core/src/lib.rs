@@ -30,6 +30,7 @@ pub mod error;
 pub mod log;
 pub mod resample;
 pub mod ring;
+pub mod sample_format;
 
 pub use backend::{DeviceInfo, PeriodRange};
 pub use channel_name::ChannelNames;
