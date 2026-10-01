@@ -769,34 +769,56 @@ unsafe extern "system" fn vt_set_sample_rate(
             return ase::INVALID_MODE;
         }
 
-        let mut state = obj.state.lock();
-        enter("setSampleRate", &mut state, |st| {
-            let Some(mut config) = st.config.clone() else {
-                return Err(fail(ase::INVALID_MODE, "配置尚未加载"));
-            };
-            config.sample_rate = new_rate;
+        enum ResetAction {
+            Message(unsafe extern "system" fn(i32, i32, *mut core::ffi::c_void, *mut f64) -> i32),
+            DidChange(unsafe extern "system" fn(ASIOSampleRate)),
+        }
+        let mut action: Option<ResetAction> = None;
 
-            // 情况 1:缓冲区尚未创建(init 阶段或尚未 createBuffers)
-            // 此时没有打开任何底层音频流,直接按新采样率重构引擎即可。
-            if !st.prepared {
-                let new_engine = Engine::new(config.clone())
-                    .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
-                obj.sample_rate.store(new_rate, Ordering::Release);
-                obj.update_sizes(&new_engine);
-                st.engine = Some(new_engine);
+        let code = {
+            let mut state = obj.state.lock();
+            enter("setSampleRate", &mut state, |st| {
+                let Some(mut config) = st.config.clone() else {
+                    return Err(fail(ase::INVALID_MODE, "配置尚未加载"));
+                };
+                config.sample_rate = new_rate;
+
+                // 情况 1:缓冲区尚未创建(init 阶段或尚未 createBuffers)
+                // 此时没有打开任何底层音频流,直接按新采样率重构引擎即可。
+                if !st.prepared {
+                    let new_engine = Engine::new(config.clone())
+                        .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
+                    obj.sample_rate.store(new_rate, Ordering::Release);
+                    obj.update_sizes(&new_engine);
+                    st.engine = Some(new_engine);
+                    st.config = Some(config);
+                    log::info!("采样率已动态切换为 {new_rate} Hz");
+                    return Ok(());
+                }
+
+                // 情况 2:缓冲区已创建(prepared == true,但已处于 stop 状态)
+                // 此时底层流和缓冲区按旧采样率分配,通知宿主发送 kAsioResetRequest 请求重建缓冲区。
+                //
+                // **死锁红线**:部分宿主收到 reset 请求后会在当前线程同步调用
+                // `disposeBuffers()` / `createBuffers()`,那两条路径都要拿 `state` 锁。
+                // 所以对宿主回调的调用绝不能留在锁内,必须在锁释放后执行。
+                let callbacks = st.callbacks;
                 st.config = Some(config);
-                log::info!("采样率已动态切换为 {new_rate} Hz");
-                return Ok(());
-            }
+                obj.sample_rate.store(new_rate, Ordering::Release);
 
-            // 情况 2:缓冲区已创建(prepared == true,但已处于 stop 状态)
-            // 此时底层流和缓冲区按旧采样率分配,通知宿主发送 kAsioResetRequest 请求重建缓冲区
-            let callbacks = st.callbacks;
-            st.config = Some(config);
-            obj.sample_rate.store(new_rate, Ordering::Release);
+                if let Some(msg) = callbacks.asio_message {
+                    action = Some(ResetAction::Message(msg));
+                } else if let Some(did_change) = callbacks.sample_rate_did_change {
+                    action = Some(ResetAction::DidChange(did_change));
+                }
 
-            // 若宿主支持消息回调,通知其重建缓冲区
-            if let Some(msg) = callbacks.asio_message {
+                Ok(())
+            })
+        };
+
+        // 锁已完全释放,安全调用宿主回调
+        match action {
+            Some(ResetAction::Message(msg)) => {
                 log::info!("通知宿主 kAsioResetRequest 以应用新采样率 {new_rate} Hz");
                 unsafe {
                     msg(
@@ -806,13 +828,15 @@ unsafe extern "system" fn vt_set_sample_rate(
                         core::ptr::null_mut(),
                     );
                 }
-            } else if let Some(did_change) = callbacks.sample_rate_did_change {
+            }
+            Some(ResetAction::DidChange(did_change)) => {
                 log::info!("通知宿主 sampleRateDidChange({new_rate})");
                 unsafe { did_change(sample_rate) };
             }
+            None => {}
+        }
 
-            Ok(())
-        })
+        code
     })
 }
 
@@ -1107,6 +1131,18 @@ unsafe extern "system" fn vt_dispose_buffers(this: *mut core::ffi::c_void) -> AS
             st.prepared = false;
             obj.clear_active();
             st.callbacks = ASIOCallbacks::default();
+
+            // 若在销毁前通过 setSampleRate 更新过采样率,重建引擎以使新采样率在随后的 createBuffers 生效
+            if let (Some(cfg), Some(eng)) = (st.config.as_ref(), st.engine.as_ref()) {
+                if cfg.sample_rate != eng.sample_rate() {
+                    if let Ok(new_engine) = Engine::new(cfg.clone()) {
+                        obj.update_sizes(&new_engine);
+                        st.engine = Some(new_engine);
+                        log::info!("disposeBuffers 后已按新采样率 {} Hz 重构引擎", cfg.sample_rate);
+                    }
+                }
+            }
+
             Ok(())
         })
     })
