@@ -280,7 +280,9 @@ impl InputStreamRuntime {
             return;
         }
         let adjust = self.drift.update(queued, dt_seconds);
-        self.resampler.set_relative_ratio(1.0 + adjust, true);
+        if self.resampler.set_relative_ratio(1.0 + adjust, true).is_err() {
+            self.stats.resample_failures.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats
             .drift_ppm
             .store((adjust * 1e6) as i64, Ordering::Relaxed);
@@ -397,7 +399,9 @@ impl OutputStreamRuntime {
             return;
         }
         let adjust = self.drift.update(queued, dt_seconds);
-        self.resampler.set_relative_ratio(1.0 + adjust, true);
+        if self.resampler.set_relative_ratio(1.0 + adjust, true).is_err() {
+            self.stats.resample_failures.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats
             .drift_ppm
             .store((adjust * 1e6) as i64, Ordering::Relaxed);
@@ -510,12 +514,26 @@ impl AudioCore {
             self.dropped_since_log = 0;
         }
         // 输入和输出是不同的类型,chain 不起来,分两趟走。
-        for stream in self.inputs.iter() {
+        for stream in self.inputs.iter_mut() {
+            let resets = stream.drift.take_resets();
+            if resets > 0 {
+                out.push(format!(
+                    "输入设备 “{}” 水位严重失步,已重置漂移积分 {} 次",
+                    stream.device_name, resets
+                ));
+            }
             if let Some(msg) = take_resample_failures(&stream.device_name, &stream.stats) {
                 out.push(msg);
             }
         }
-        for stream in self.outputs.iter() {
+        for stream in self.outputs.iter_mut() {
+            let resets = stream.drift.take_resets();
+            if resets > 0 {
+                out.push(format!(
+                    "输出设备 “{}” 水位严重失步,已重置漂移积分 {} 次",
+                    stream.device_name, resets
+                ));
+            }
             if let Some(msg) = take_resample_failures(&stream.device_name, &stream.stats) {
                 out.push(msg);
             }

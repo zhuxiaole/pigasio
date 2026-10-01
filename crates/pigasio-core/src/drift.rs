@@ -92,6 +92,8 @@ pub struct DriftController {
     elapsed_seconds: f64,
     /// 最近一次观察到的水位,用于诊断。
     last_queued: usize,
+    /// 积分项因水位超阈值被重置的累计次数。
+    resets: u64,
 }
 
 impl DriftController {
@@ -112,6 +114,7 @@ impl DriftController {
             enabled,
             elapsed_seconds: 0.0,
             last_queued: target_frames,
+            resets: 0,
         }
     }
 
@@ -144,6 +147,14 @@ impl DriftController {
     pub fn reset(&mut self) {
         self.integral = 0.0;
         self.last_adjust = 0.0;
+        self.resets = 0;
+    }
+
+    /// 取走积分被重置的次数(读一次清零一次)。只能从非实时诊断路径调用。
+    pub fn take_resets(&mut self) -> u64 {
+        let n = self.resets;
+        self.resets = 0;
+        n
     }
 
     /// 根据当前水位推进一次控制,返回应当施加的相对比率修正量。
@@ -165,9 +176,11 @@ impl DriftController {
 
         // 偏差过大通常意味着发生了不连续事件,而不是真实的时钟漂移。
         // 这时候继续用历史积分值只会帮倒忙。
+        //
+        // 音频线程绝不在这里打日志:记下重置次数,由 `Engine::status()` 出锁后落盘。
         if error.abs() > RESET_THRESHOLD {
-            log::debug!("水位偏差 {:.1}% 超过阈值,重置漂移积分", error * 100.0);
             self.integral = 0.0;
+            self.resets = self.resets.saturating_add(1);
         }
 
         // 误差为正(积压)时积分朝「减小比率」的方向累积。
@@ -353,5 +366,22 @@ mod tests {
             error < 200.0,
             "控制器未能把水位拉回目标附近:水位 {queued},误差 {error}"
         );
+    }
+
+    #[test]
+    fn 严重偏差时重置积分并记录重置次数() {
+        let mut c = DriftController::new(2048, 500.0, true);
+        assert_eq!(c.take_resets(), 0);
+
+        // 正常小范围水位波动,不触发重置
+        c.update(2048 + 100, 1024.0 / 48000.0);
+        assert_eq!(c.take_resets(), 0);
+
+        // 偏差超过 75% 触发重置
+        c.update(2048 + 2000, 1024.0 / 48000.0);
+        assert_eq!(c.take_resets(), 1);
+
+        // 再次读取已被清零
+        assert_eq!(c.take_resets(), 0);
     }
 }

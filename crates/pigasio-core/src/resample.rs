@@ -230,21 +230,19 @@ impl FixedOutResampler {
     /// 让输出比标称快 200 ppm。
     ///
     /// `ramp = true` 会让 rubato 平滑过渡到新比率,避免比率突变引入咔哒声。
-    pub fn set_relative_ratio(&mut self, relative: f64, ramp: bool) {
+    ///
+    /// 失败时返回错误,由调用方记入统计 —— 音频线程绝不在此打日志。
+    pub fn set_relative_ratio(&mut self, relative: f64, ramp: bool) -> Result<()> {
         let relative = relative.clamp(0.5, 2.0);
         self.current_relative = relative;
         match &mut self.inner {
-            FixedOutInner::PassThrough => {}
-            FixedOutInner::Fast(r) => {
-                if let Err(e) = r.set_resample_ratio_relative(relative, ramp) {
-                    log::warn!("调整重采样比率失败:{e}");
-                }
-            }
-            FixedOutInner::Sinc(r) => {
-                if let Err(e) = r.set_resample_ratio_relative(relative, ramp) {
-                    log::warn!("调整重采样比率失败:{e}");
-                }
-            }
+            FixedOutInner::PassThrough => Ok(()),
+            FixedOutInner::Fast(r) => r
+                .set_resample_ratio_relative(relative, ramp)
+                .map_err(|e| Error::Resampler(e.to_string())),
+            FixedOutInner::Sinc(r) => r
+                .set_resample_ratio_relative(relative, ramp)
+                .map_err(|e| Error::Resampler(e.to_string())),
         }
     }
 
@@ -425,21 +423,17 @@ impl FixedInResampler {
         }
     }
 
-    pub fn set_relative_ratio(&mut self, relative: f64, ramp: bool) {
+    pub fn set_relative_ratio(&mut self, relative: f64, ramp: bool) -> Result<()> {
         let relative = relative.clamp(0.5, 2.0);
         self.current_relative = relative;
         match &mut self.inner {
-            FixedInInner::PassThrough => {}
-            FixedInInner::Fast(r) => {
-                if let Err(e) = r.set_resample_ratio_relative(relative, ramp) {
-                    log::warn!("调整重采样比率失败:{e}");
-                }
-            }
-            FixedInInner::Sinc(r) => {
-                if let Err(e) = r.set_resample_ratio_relative(relative, ramp) {
-                    log::warn!("调整重采样比率失败:{e}");
-                }
-            }
+            FixedInInner::PassThrough => Ok(()),
+            FixedInInner::Fast(r) => r
+                .set_resample_ratio_relative(relative, ramp)
+                .map_err(|e| Error::Resampler(e.to_string())),
+            FixedInInner::Sinc(r) => r
+                .set_resample_ratio_relative(relative, ramp)
+                .map_err(|e| Error::Resampler(e.to_string())),
         }
     }
 
@@ -564,7 +558,7 @@ mod tests {
         // 比率调高意味着同样多的输出帧只需要更少的输入帧。
         let mut r = FixedOutResampler::new(&spec(ResampleQuality::Sinc, 1, 256)).unwrap();
         let base = r.input_frames_next();
-        r.set_relative_ratio(1.005, false);
+        r.set_relative_ratio(1.005, false).unwrap();
         let faster = r.input_frames_next();
         assert!(
             faster <= base,
@@ -572,7 +566,7 @@ mod tests {
         );
 
         // 反方向:比率调低,需要的输入帧变多。
-        r.set_relative_ratio(0.995, false);
+        r.set_relative_ratio(0.995, false).unwrap();
         let slower = r.input_frames_next();
         assert!(
             slower >= base,
@@ -584,7 +578,7 @@ mod tests {
     fn 输入上限足够覆盖实际需求() {
         let mut r = FixedOutResampler::new(&spec(ResampleQuality::Sinc, 2, 512)).unwrap();
         // 在最极端的比率下,实际需求也不能超过我们声明的上界。
-        r.set_relative_ratio(1.0 / 1.01, false);
+        r.set_relative_ratio(1.0 / 1.01, false).unwrap();
         assert!(
             r.input_frames_next() <= r.max_input_frames(),
             "需求 {} 超过上界 {}",
@@ -596,7 +590,7 @@ mod tests {
     #[test]
     fn 输出上限足够覆盖实际产出() {
         let mut r = FixedInResampler::new(&spec(ResampleQuality::Sinc, 2, 512)).unwrap();
-        r.set_relative_ratio(1.01, false);
+        r.set_relative_ratio(1.01, false).unwrap();
         assert!(
             r.output_frames_next() <= r.max_output_frames(),
             "产出 {} 超过上界 {}",
