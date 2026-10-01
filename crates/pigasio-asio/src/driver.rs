@@ -272,6 +272,8 @@ impl DriverObject {
 struct DriverState {
     /// 引擎在 `init()` 时建立,`release` 或 `dispose()` 时丢弃。
     engine: Option<Engine>,
+    /// 当前生效的完整配置副本,便于动态修改参数(如采样率)时重建引擎。
+    config: Option<pigasio_core::Config>,
     /// 宿主提供的回调表。
     callbacks: ASIOCallbacks,
     /// 宿主传给 `init()` 的窗口句柄。只存不用,所以保存成整数,
@@ -289,6 +291,7 @@ impl DriverState {
     fn new() -> Self {
         DriverState {
             engine: None,
+            config: None,
             callbacks: ASIOCallbacks::default(),
             sys_handle: 0,
             last_error: String::new(),
@@ -480,6 +483,7 @@ unsafe extern "system" fn vt_init(
             let (config, path) = pigasio_core::config::load(host_dir.as_deref())
                 .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
             st.config_path = path;
+            st.config = Some(config.clone());
 
             log::info!(
                 "配置:{} Hz,{} 帧缓冲,{} 路输入 / {} 路输出",
@@ -696,13 +700,15 @@ unsafe extern "system" fn vt_can_sample_rate(
             // 还没 init,也就谈不上有什么设备 —— 规范里这种情形报 ASE_NotPresent。
             return ase::NOT_PRESENT;
         }
-        // 采样率由配置文件决定,不支持宿主动态切换:设备是按配置里的
-        // 采样率打开的,嘴上答应切到 96 kHz 而实际还在 48 kHz 跑,
-        // 会让宿主的录音对齐整个错掉。
-        if (sample_rate - current as f64).abs() < 0.5 {
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return ase::INVALID_PARAMETER;
+        }
+        let rate = sample_rate.round() as u32;
+        // PigASIO 支持变速重采样,只要采样率落在合理区间(8000..=768000)内均可协商
+        if rate >= 8_000 && rate <= 768_000 {
             ase::OK
         } else {
-            log::debug!("canSampleRate({sample_rate}) -> 不支持,配置为 {current} Hz");
+            log::debug!("canSampleRate({sample_rate}) -> 不支持,超出范围");
             ase::NO_CLOCK
         }
     })
@@ -739,17 +745,74 @@ unsafe extern "system" fn vt_set_sample_rate(
         if current == 0 {
             return ase::INVALID_MODE;
         }
-        if (sample_rate - current as f64).abs() < 0.5 {
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return ase::INVALID_PARAMETER;
+        }
+        let new_rate = sample_rate.round() as u32;
+        if new_rate < 8_000 || new_rate > 768_000 {
+            let message = format!("采样率 {sample_rate} 超出合理范围(8000..=768000)");
+            log::warn!("{message}");
+            obj.state.lock().last_error = message;
+            return ase::INVALID_PARAMETER;
+        }
+
+        // 当前采样率相同,直接成功
+        if new_rate == current {
             return ase::OK;
         }
-        let message = format!(
-            "PigASIO 不支持动态切换采样率(请求 {sample_rate} Hz,当前 {current} Hz);\
-             请修改 {config} 里的 sample_rate 后重启宿主",
-            config = pigasio_core::config::CONFIG_FILE_NAME
-        );
-        log::warn!("{message}");
-        obj.state.lock().last_error = message;
-        ase::NO_CLOCK
+
+        // 运行中不能直接改变硬件流采样率
+        if obj.running.load(Ordering::Acquire) {
+            let message = "引擎运行中不可更改采样率,请先停止播放".to_string();
+            log::warn!("{message}");
+            obj.state.lock().last_error = message;
+            return ase::INVALID_MODE;
+        }
+
+        let mut state = obj.state.lock();
+        enter("setSampleRate", &mut state, |st| {
+            let Some(mut config) = st.config.clone() else {
+                return Err(fail(ase::INVALID_MODE, "配置尚未加载"));
+            };
+            config.sample_rate = new_rate;
+
+            // 情况 1:缓冲区尚未创建(init 阶段或尚未 createBuffers)
+            // 此时没有打开任何底层音频流,直接按新采样率重构引擎即可。
+            if !st.prepared {
+                let new_engine = Engine::new(config.clone())
+                    .map_err(|e| fail(map_core_error(&e), e.to_string()))?;
+                obj.sample_rate.store(new_rate, Ordering::Release);
+                obj.update_sizes(&new_engine);
+                st.engine = Some(new_engine);
+                st.config = Some(config);
+                log::info!("采样率已动态切换为 {new_rate} Hz");
+                return Ok(());
+            }
+
+            // 情况 2:缓冲区已创建(prepared == true,但已处于 stop 状态)
+            // 此时底层流和缓冲区按旧采样率分配,通知宿主发送 kAsioResetRequest 请求重建缓冲区
+            let callbacks = st.callbacks;
+            st.config = Some(config);
+            obj.sample_rate.store(new_rate, Ordering::Release);
+
+            // 若宿主支持消息回调,通知其重建缓冲区
+            if let Some(msg) = callbacks.asio_message {
+                log::info!("通知宿主 kAsioResetRequest 以应用新采样率 {new_rate} Hz");
+                unsafe {
+                    msg(
+                        asio_message::RESET_REQUEST,
+                        0,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                    );
+                }
+            } else if let Some(did_change) = callbacks.sample_rate_did_change {
+                log::info!("通知宿主 sampleRateDidChange({new_rate})");
+                unsafe { did_change(sample_rate) };
+            }
+
+            Ok(())
+        })
     })
 }
 
@@ -1234,6 +1297,44 @@ mod tests {
             assert!(!o.is_active(true, 1));
 
             vt_release(obj as *mut core::ffi::c_void);
+        }
+    }
+
+    #[test]
+    fn 测试_can_sample_rate与set_sample_rate动态切换() {
+        let ptr = DriverObject::create();
+        let this = ptr as *mut core::ffi::c_void;
+
+        unsafe {
+            let o = &*ptr;
+
+            // init 前:报 NOT_PRESENT
+            assert_eq!(vt_can_sample_rate(this, 48000.0), ase::NOT_PRESENT);
+
+            // 模拟 init 完成:当前 48000 Hz
+            o.sample_rate.store(48000, Ordering::Release);
+            o.state.lock().config = Some(pigasio_core::Config::default());
+
+            // 常用标准采样率应当得到支持
+            assert_eq!(vt_can_sample_rate(this, 48000.0), ase::OK);
+            assert_eq!(vt_can_sample_rate(this, 44100.0), ase::OK);
+            assert_eq!(vt_can_sample_rate(this, 96000.0), ase::OK);
+            assert_eq!(vt_can_sample_rate(this, 192000.0), ase::OK);
+
+            // 非法/越界采样率
+            assert_eq!(vt_can_sample_rate(this, 0.0), ase::INVALID_PARAMETER);
+            assert_eq!(vt_can_sample_rate(this, -48000.0), ase::INVALID_PARAMETER);
+            assert_eq!(vt_can_sample_rate(this, 1_000_000.0), ase::NO_CLOCK);
+
+            // 切换到当前同一采样率:直接成功
+            assert_eq!(vt_set_sample_rate(this, 48000.0), ase::OK);
+
+            // 运行状态中禁止修改采样率
+            o.running.store(true, Ordering::Release);
+            assert_eq!(vt_set_sample_rate(this, 44100.0), ase::INVALID_MODE);
+            o.running.store(false, Ordering::Release);
+
+            vt_release(this);
         }
     }
 }
