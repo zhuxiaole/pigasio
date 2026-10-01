@@ -420,6 +420,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let out_ch = engine.output_channel_count();
     let chunk = engine.buffer_size();
     let rate = engine.sample_rate();
+    let max_drift_ppm = engine.config().engine.max_drift_ppm;
     println!("      ASIO 将暴露 {in_ch} 路输入 / {out_ch} 路输出");
 
     println!("[2/5] 打开设备流…");
@@ -641,6 +642,30 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             "以下流在启动阶段出现过欠载/溢出:{};最后 1 秒没有新增,说明已经稳定,\
              不影响结论",
             glitchy.join("、")
+        ));
+    }
+
+    // 检查是否有从设备的漂移补偿打满上限(例如部分虚拟声卡在小周期下时钟偏快 3%)
+    let max_drift_limit = (max_drift_ppm * 10.0).min(5000.0) * 0.95;
+    let saturated: Vec<_> = status
+        .stream_stats
+        .iter()
+        .filter(|s| !s.is_clock_master && s.stats.drift_ppm.abs() >= max_drift_limit)
+        .map(|s| {
+            format!(
+                "{} “{}”({:+.0} ppm)",
+                s.kind.as_str(),
+                s.device_name,
+                s.stats.drift_ppm
+            )
+        })
+        .collect();
+    if !saturated.is_empty() {
+        problems.push(format!(
+            "以下从设备的漂移补偿已打满上限:{}。生产与消费速率存在持续偏差(超出漂移补偿能力),\
+             环形缓冲将持续积压并最终溢出。若设置了较小的「设备周期」(period_frames),\
+             说明该设备驱动在当前周期下时钟失真,请调大周期或恢复为默认(0)",
+            saturated.join("、")
         ));
     }
 

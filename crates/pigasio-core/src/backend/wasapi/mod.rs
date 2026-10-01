@@ -45,7 +45,7 @@ use crate::error::{Error, Result, StreamKind};
 
 use super::{
     Backend, DeviceHandle, DeviceInfo, DeviceSampleFormat, ErrorCallback, InputCallback,
-    OutputCallback, StreamFormat, StreamHandle, StreamRequest,
+    OutputCallback, PeriodRange, StreamFormat, StreamHandle, StreamRequest,
 };
 
 mod stream;
@@ -104,7 +104,7 @@ impl Backend for WasapiBackend {
                 }
             };
             // 读不出混音格式,说明这个端点在当前方向用不了。
-            let (max_channels, default_sample_rate) = match mix_format(&device) {
+            let (max_channels, default_sample_rate, period_range) = match mix_format(&device) {
                 Ok(info) => info,
                 Err(e) => {
                     log::debug!("设备 “{name}” 无法作为{}打开:{e}", kind.as_str());
@@ -115,6 +115,7 @@ impl Backend for WasapiBackend {
                 name: name.clone(),
                 max_channels,
                 default_sample_rate,
+                period_range,
                 handle: Arc::new(WasapiDevice { name, device }),
             });
         }
@@ -127,11 +128,12 @@ impl Backend for WasapiBackend {
         let device = unsafe { enumerator.GetDefaultAudioEndpoint(data_flow(kind), eConsole) }
             .map_err(|e| Error::Backend(format!("取默认{}设备失败:{e}", kind.as_str())))?;
         let name = friendly_name(&device)?;
-        let (max_channels, default_sample_rate) = mix_format(&device)?;
+        let (max_channels, default_sample_rate, period_range) = mix_format(&device)?;
         Ok(DeviceInfo {
             name: name.clone(),
             max_channels,
             default_sample_rate,
+            period_range,
             handle: Arc::new(WasapiDevice { name, device }),
         })
     }
@@ -312,8 +314,8 @@ unsafe fn utf16_ptr_to_string(ptr: *const u16) -> String {
         .into_owned()
 }
 
-/// 读混音格式的通道数与采样率(设备枚举用)。
-fn mix_format(device: &IMMDevice) -> Result<(usize, u32)> {
+/// 读混音格式的通道数、采样率与可选的低延迟周期范围(设备枚举用)。
+fn mix_format(device: &IMMDevice) -> Result<(usize, u32, Option<PeriodRange>)> {
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .map_err(|e| Error::Backend(format!("激活音频客户端失败:{e}")))?;
     let format = unsafe { client.GetMixFormat() }
@@ -321,7 +323,8 @@ fn mix_format(device: &IMMDevice) -> Result<(usize, u32)> {
     // `WAVEFORMATEX` 在 windows crate 里是 packed 的,直接按引用读字段会被
     // 判为未对齐访问 —— 复制成局部值再读。
     let base = unsafe { std::ptr::read_unaligned(format) };
-    let info = (base.nChannels as usize, base.nSamplesPerSec);
+    let period_range = unsafe { query_period_range(&client, format) };
+    let info = (base.nChannels as usize, base.nSamplesPerSec, period_range);
     unsafe { CoTaskMemFree(Some(format as *const _)) };
     Ok(info)
 }
@@ -363,23 +366,15 @@ unsafe fn read_mix_format(
     Ok((channels, sample_rate, DeviceSampleFormat::F32))
 }
 
-/// 挑一个共享模式的 period(帧)。
-///
-/// 拿不到 `IAudioClient3`(Windows 10 之前,或者驱动不支持)就返回 0 —— 那时
-/// period 由 audio engine 决定,我们插不上手,只能照旧走默认的 `Initialize`。
+/// 查设备在共享模式下的周期范围。
 ///
 /// # Safety
 /// `format` 必须来自 `IAudioClient::GetMixFormat`,且仍在有效期内。
-unsafe fn choose_period(
+unsafe fn query_period_range(
     client: &IAudioClient,
     format: *const windows::Win32::Media::Audio::WAVEFORMATEX,
-    requested: Option<usize>,
-) -> usize {
-    let Ok(modern) = client.cast::<IAudioClient3>() else {
-        log::debug!("这台设备不支持 IAudioClient3,共享模式 period 由系统决定");
-        return 0;
-    };
-
+) -> Option<PeriodRange> {
+    let modern = client.cast::<IAudioClient3>().ok()?;
     let mut default_period = 0u32;
     let mut fundamental = 0u32;
     let mut min_period = 0u32;
@@ -394,19 +389,42 @@ unsafe fn choose_period(
         )
         .is_err()
     {
-        log::debug!("查不到共享模式的 period 范围,按默认处理");
-        return 0;
+        return None;
     }
     if fundamental == 0 || min_period == 0 {
-        return 0;
+        return None;
     }
+    Some(PeriodRange {
+        default_frames: default_period as usize,
+        fundamental_frames: fundamental as usize,
+        min_frames: min_period as usize,
+        max_frames: max_period as usize,
+    })
+}
+
+/// 挑一个共享模式的 period(帧)。
+///
+/// 拿不到 `IAudioClient3`(Windows 10 之前,或者驱动不支持)就返回 0 —— 那时
+/// period 由 audio engine 决定,我们插不上手,只能照旧走默认的 `Initialize`。
+///
+/// # Safety
+/// `format` 必须来自 `IAudioClient::GetMixFormat`,且仍在有效期内。
+unsafe fn choose_period(
+    client: &IAudioClient,
+    format: *const windows::Win32::Media::Audio::WAVEFORMATEX,
+    requested: Option<usize>,
+) -> usize {
+    let Some(range) = query_period_range(client, format) else {
+        log::debug!("设备不支持 IAudioClient3 或查不到共享模式 period 范围,按系统默认处理");
+        return 0;
+    };
 
     let target = match requested {
         // 用户点名了周期:`InitializeSharedAudioStream` 要求它是基本单位的
         // 整数倍,不对齐就直接返回 E_INVALIDARG,所以向上取整;再夹进设备
         // 报出的范围。
-        Some(frames) => align_up(frames, fundamental as usize)
-            .clamp(min_period as usize, max_period.max(min_period) as usize),
+        Some(frames) => align_up(frames, range.fundamental_frames)
+            .clamp(range.min_frames, range.max_frames.max(range.min_frames)),
         // 没点名就**保持设备默认的 period**。
         //
         // 这里一度取的是最小值 —— "默认就把延迟压到最低"听起来很合理,但实测
@@ -414,22 +432,22 @@ unsafe fn choose_period(
         // 3%(事件频率 1034/秒而非 1000),远超漂移补偿的能力(默认 500 ppm
         // = 0.05%),环形缓冲会一路积压到溢出。降周期是要承担风险的,应该由
         // 用户主动要,不该是默认行为。
-        None => default_period as usize,
+        None => range.default_frames,
     };
 
-    // 目标就是设备默认值时,显式设置和用默认没有区别 —— 那就别折腾,退回普通
-    // 的 `Initialize`。少一次可能被驱动实现歪掉的调用。
-    if requested.is_none() && target <= default_period as usize {
+    // 目标就是设备默认值时(不论是未指定,还是设备硬件本身没有向下空间),
+    // 显式设置和用默认没有区别 —— 退回普通的 `Initialize`,少一次可能被驱动实现歪掉的调用。
+    if target == range.default_frames {
         log::debug!(
-            "共享模式默认 period 是 {default_period} 帧(可选 {min_period}..{max_period}),\
-             保持默认"
+            "共享模式选用默认 period {} 帧(可选 {}..{}),走普通初始化",
+            range.default_frames, range.min_frames, range.max_frames
         );
         return 0;
     }
 
     log::info!(
-        "共享模式 period:可选 {min_period}..{max_period} 帧(默认 {default_period}、\
-         基本单位 {fundamental}),选用 {target} 帧"
+        "共享模式 period:可选 {}..{} 帧(默认 {}、基本单位 {}),选用 {} 帧",
+        range.min_frames, range.max_frames, range.default_frames, range.fundamental_frames, target
     );
     target
 }

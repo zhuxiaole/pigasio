@@ -153,9 +153,19 @@ pub fn describe_all() -> Result<String> {
             out.push_str("  (无)\n");
         }
         for (i, d) in devices.iter().enumerate() {
+            let period_str = match d.period_range {
+                Some(r) if r.can_reduce() => {
+                    format!(
+                        " (可选周期 {}..{} 帧,默认 {} 帧,步长 {})",
+                        r.min_frames, r.max_frames, r.default_frames, r.fundamental_frames
+                    )
+                }
+                Some(r) => format!(" (周期固定为 {} 帧)", r.default_frames),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  [{i}] {} —— {} 通道,默认 {} Hz\n",
-                d.name, d.max_channels, d.default_sample_rate
+                "  [{i}] {} —— {} 通道,默认 {} Hz{}\n",
+                d.name, d.max_channels, d.default_sample_rate, period_str
             ));
         }
         out.push('\n');

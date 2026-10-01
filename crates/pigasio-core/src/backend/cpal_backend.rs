@@ -76,6 +76,7 @@ impl Backend for CpalBackend {
                 name: name.clone(),
                 max_channels,
                 default_sample_rate,
+                period_range: None,
                 handle: Arc::new(CpalDevice { name, device }),
             });
         }
@@ -117,6 +118,7 @@ impl Backend for CpalBackend {
             name: name.clone(),
             max_channels,
             default_sample_rate,
+            period_range: None,
             handle: Arc::new(CpalDevice { name, device }),
         })
     }

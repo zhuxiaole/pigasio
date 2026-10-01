@@ -163,6 +163,26 @@ pub trait DeviceHandle: Send + Sync {
     ) -> Result<Box<dyn StreamHandle>>;
 }
 
+/// 设备在共享模式下支持的周期范围(帧)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodRange {
+    /// 系统默认周期。
+    pub default_frames: usize,
+    /// 调整周期的基本颗粒度(整倍数步长)。
+    pub fundamental_frames: usize,
+    /// 最小支持周期。
+    pub min_frames: usize,
+    /// 最大支持周期。
+    pub max_frames: usize,
+}
+
+impl PeriodRange {
+    /// 设备是否具备向下压缩周期的空间。
+    pub fn can_reduce(self) -> bool {
+        self.min_frames < self.default_frames
+    }
+}
+
 /// 一次枚举得到的设备信息。
 ///
 /// `handle` 是引用计数的句柄,所以克隆整条记录很便宜。
@@ -174,6 +194,8 @@ pub struct DeviceInfo {
     pub max_channels: usize,
     /// 设备偏好的采样率(展示与诊断用)。
     pub default_sample_rate: u32,
+    /// 共享模式周期范围。只有 WASAPI 后端且设备支持 IAudioClient3 时能查到。
+    pub period_range: Option<PeriodRange>,
     /// 打开设备用的句柄。
     pub handle: Arc<dyn DeviceHandle>,
 }

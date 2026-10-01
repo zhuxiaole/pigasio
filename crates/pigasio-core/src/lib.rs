@@ -31,7 +31,7 @@ pub mod log;
 pub mod resample;
 pub mod ring;
 
-pub use backend::DeviceInfo;
+pub use backend::{DeviceInfo, PeriodRange};
 pub use channel_name::ChannelNames;
 pub use config::{AsioSampleType, Config, DeviceRef, StreamConfig};
 pub use engine::{AsioBufferSet, Engine, EngineStatus, StreamInfo, StreamStatusSnapshot};
