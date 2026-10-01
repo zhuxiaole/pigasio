@@ -641,6 +641,8 @@ struct StreamSpec {
     output_reader: Option<FrameReader>,
     /// 只有时钟主设备才需要它来推进整个引擎。
     master_core: Option<Arc<Mutex<AudioCore>>>,
+    /// 时钟主设备在抢不到锁时暂存未推进的帧数,下一次回调补上。
+    master_pending_advance: Option<Arc<AtomicUsize>>,
     err_flag: Arc<AtomicBool>,
     /// 报给实时优先级提升用的「每块缓冲多少帧」。
     ///
@@ -716,6 +718,7 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         ch_map,
         input_writer,
         master_core,
+        master_pending_advance,
         stats,
         err_flag,
         frames_per_buffer,
@@ -766,9 +769,14 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
             .store(writer.overflow_frames(), Ordering::Relaxed);
 
         // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
-        if let Some(core) = master_core.as_ref() {
+        // 抢不到锁时暂存未推进的帧数,下一次回调补上,避免时钟漏拍导致水位暴跌。
+        if let (Some(core), Some(pending)) =
+            (master_core.as_ref(), master_pending_advance.as_ref())
+        {
+            pending.fetch_add(frames, Ordering::Relaxed);
             if let Some(mut core) = core.try_lock() {
-                core.advance(frames);
+                let to_advance = pending.swap(0, Ordering::Relaxed);
+                core.advance(to_advance);
             }
         }
     });
@@ -797,6 +805,7 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         ch_map,
         output_reader,
         master_core,
+        master_pending_advance,
         stats,
         err_flag,
         frames_per_buffer,
@@ -855,11 +864,15 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         stats.read_frames.fetch_add(got as u64, Ordering::Relaxed);
 
         // 时钟推进要碰所有流的另一半端,这才需要锁。抢不到就跳过这一拍:
-        // 数据没丢(上面已经读到手了),只是引擎时钟停一拍,下一次回调会把
-        // 欠的那部分一起补上。
-        if let Some(core) = master_core.as_ref() {
+        // 数据没丢(上面已经读到手了),未推进的帧数暂存在 pending 里,
+        // 下一次回调拿锁时一起补上。
+        if let (Some(core), Some(pending)) =
+            (master_core.as_ref(), master_pending_advance.as_ref())
+        {
+            pending.fetch_add(frames, Ordering::Relaxed);
             if let Some(mut core) = core.try_lock() {
-                core.advance(frames);
+                let to_advance = pending.swap(0, Ordering::Relaxed);
+                core.advance(to_advance);
             }
         }
 
@@ -1138,6 +1151,8 @@ pub struct Engine {
     /// (虚拟声卡常见 20 ms 上下,物理声卡可能是 10 ms)。汇总成一个最大值
     /// 只能看出"最慢的那块有多慢",定位不到是谁。
     device_frames_per_stream: Vec<Arc<AtomicUsize>>,
+    /// 时钟主设备在抢不到锁时暂存未推进的帧数。
+    master_pending_advance: Arc<AtomicUsize>,
 }
 
 impl Engine {
@@ -1261,6 +1276,7 @@ impl Engine {
             prepared: Arc::new(AtomicBool::new(false)),
             resampler_delay_frames: 0,
             device_frames_per_stream: Vec::new(),
+            master_pending_advance: Arc::new(AtomicUsize::new(0)),
             stream_infos,
             channel_names,
             config,
@@ -1447,6 +1463,8 @@ impl Engine {
                 input_writer: Some(writer),
                 output_reader: None,
                 master_core: is_master.then(|| Arc::clone(&self.core)),
+                master_pending_advance: is_master
+                    .then(|| Arc::clone(&self.master_pending_advance)),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
                 stats: Arc::clone(&stats),
@@ -1522,6 +1540,8 @@ impl Engine {
                 input_writer: None,
                 output_reader: Some(reader),
                 master_core: is_master.then(|| Arc::clone(&self.core)),
+                master_pending_advance: is_master
+                    .then(|| Arc::clone(&self.master_pending_advance)),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
                 stats: Arc::clone(&stats),
@@ -1606,6 +1626,7 @@ impl Engine {
             core.prime_outputs();
         }
         self.samples_processed.store(0, Ordering::Relaxed);
+        self.master_pending_advance.store(0, Ordering::Relaxed);
 
         host.start(StreamGroup::Inputs)?;
 
@@ -1706,6 +1727,7 @@ impl Engine {
             core.accumulated = 0;
         }
         self.running.store(false, Ordering::Release);
+        self.master_pending_advance.store(0, Ordering::Relaxed);
 
         if let Some(host) = self.host.as_ref() {
             host.stop()?;
@@ -1722,6 +1744,7 @@ impl Engine {
         let _ = self.stop();
         // `StreamHost` 的 Drop 会结束线程,并在那里销毁所有流。
         self.host = None;
+        self.master_pending_advance.store(0, Ordering::Relaxed);
         {
             let mut core = self.core.lock();
             core.inputs.clear();
@@ -2007,5 +2030,58 @@ mod tests {
             stream_quality(ResampleQuality::Fast, 0.5, false, "从设备"),
             ResampleQuality::Fast
         );
+    }
+
+    #[test]
+    fn 主设备锁竞争时暂存推进帧数并在下一次拿锁时补齐() {
+        let samples_processed = Arc::new(AtomicU64::new(0));
+        let dropped_frames = Arc::new(AtomicU64::new(0));
+        let core = Arc::new(Mutex::new(AudioCore {
+            buffers: AsioBufferSet::new(1, 1, 512),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            callback: Box::new(|_, _| {}),
+            buffer_index: 0,
+            accumulated: 0,
+            sample_rate: 48000.0,
+            running: true,
+            samples_processed: Arc::clone(&samples_processed),
+            dropped_frames: Arc::clone(&dropped_frames),
+            dropped_since_log: 0,
+        }));
+        let pending = Arc::new(AtomicUsize::new(0));
+
+        // 模拟外部线程(如 status)正持有 core 锁
+        let guard = core.lock();
+
+        // 模拟时钟主设备回调:第一拍 480 帧
+        let frames1 = 480usize;
+        pending.fetch_add(frames1, Ordering::Relaxed);
+        if let Some(mut c) = core.try_lock() {
+            let to_advance = pending.swap(0, Ordering::Relaxed);
+            c.advance(to_advance);
+        }
+
+        // 确认第一拍因为锁冲突跳过,但未推进的 480 帧完整保存在 pending 里
+        assert_eq!(pending.load(Ordering::Relaxed), 480);
+        assert_eq!(guard.accumulated, 0);
+
+        // 外部操作完成,释放锁
+        drop(guard);
+
+        // 模拟时钟主设备回调:第二拍 480 帧
+        let frames2 = 480usize;
+        pending.fetch_add(frames2, Ordering::Relaxed);
+        if let Some(mut c) = core.try_lock() {
+            let to_advance = pending.swap(0, Ordering::Relaxed);
+            c.advance(to_advance);
+        }
+
+        // 确认第二拍成功拿锁后:pending 被清零,两次合计 960 帧被完整推进
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        let c = core.lock();
+        // 960 帧在 512 帧的 buffer_size 下推进了 1 次(消耗 512),余下 448
+        assert_eq!(c.accumulated, 448);
+        assert_eq!(samples_processed.load(Ordering::Relaxed), 512);
     }
 }
