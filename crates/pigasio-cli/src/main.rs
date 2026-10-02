@@ -167,6 +167,10 @@ resample_quality = "sinc"
 # 关掉它,只要两块声卡的晶振有哪怕 50 ppm 的差异,几十秒内就会爆音。
 drift_correction = true
 
+# 是否在向宿主暴露整型格式(int16 / int24)时启用 TPDF 量化抖动(Dither)。
+# 默认开启,可消除小信号下的量化谐波失真与台阶感;float32/int32 下自动忽略。
+dither = true
+
 # 漂移补偿的最大修正量(ppm)。500 足以覆盖绝大多数消费级声卡;
 # 如果日志里频繁出现“水位异常”,可以适当调大。
 max_drift_ppm = 500.0
@@ -349,9 +353,14 @@ fn describe_config(config: &Config) {
         config.total_output_channels()
     );
     println!(
-        "重采样 {:?},漂移补偿 {}",
+        "重采样 {:?},漂移补偿 {},量化抖动 {}",
         config.engine.resample_quality,
         if config.engine.drift_correction {
+            "开启"
+        } else {
+            "关闭"
+        },
+        if config.engine.dither {
             "开启"
         } else {
             "关闭"

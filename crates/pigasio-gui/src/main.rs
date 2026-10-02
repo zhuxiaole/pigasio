@@ -829,6 +829,7 @@ struct App {
     asio_sample_type: AsioSampleType,
     resample_quality: ResampleQuality,
     drift_correction: bool,
+    dither: bool,
     max_drift_ppm: f64,
     watermark_ms: f64,
     use_non_ascii_channel_names: bool,
@@ -919,6 +920,7 @@ impl App {
             asio_sample_type: AsioSampleType::Float32,
             resample_quality: ResampleQuality::Sinc,
             drift_correction: true,
+            dither: true,
             max_drift_ppm: 500.0,
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
@@ -1079,6 +1081,7 @@ impl App {
         self.asio_sample_type = config.asio_sample_type;
         self.resample_quality = config.engine.resample_quality;
         self.drift_correction = config.engine.drift_correction;
+        self.dither = config.engine.dither;
         self.max_drift_ppm = config.engine.max_drift_ppm;
         self.use_non_ascii_channel_names = config.engine.use_non_ascii_channel_names;
         self.watermark_ms = config.engine.watermark_ms;
@@ -1101,6 +1104,7 @@ impl App {
             engine: EngineConfig {
                 resample_quality: self.resample_quality,
                 drift_correction: self.drift_correction,
+                dither: self.dither,
                 max_drift_ppm: self.max_drift_ppm,
                 use_non_ascii_channel_names: self.use_non_ascii_channel_names,
                 watermark_ms: self.watermark_ms,
@@ -1332,6 +1336,7 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
         "use_non_ascii_channel_names",
         "watermark_ms",
         "backend",
+        "dither",
         "period_frames",
     ] {
         engine.remove(key);
@@ -1339,6 +1344,7 @@ fn write_config(path: &std::path::Path, config: &Config) -> std::io::Result<()> 
 
     engine["resample_quality"] = value(quality_name(config.engine.resample_quality));
     engine["drift_correction"] = value(config.engine.drift_correction);
+    engine["dither"] = value(config.engine.dither);
     engine["max_drift_ppm"] = value(config.engine.max_drift_ppm);
     engine["use_non_ascii_channel_names"] = value(config.engine.use_non_ascii_channel_names);
     engine["watermark_ms"] = value(config.engine.watermark_ms);
@@ -1948,6 +1954,15 @@ impl App {
             .show(ui, |ui| {
                 ui.label("时钟漂移补偿");
                 ui.checkbox(&mut self.drift_correction, "启用");
+                ui.end_row();
+
+                ui.label("量化抖动 (Dither)");
+                ui.checkbox(&mut self.dither, "启用")
+                    .on_hover_text(
+                        "向宿主提供整型格式（Int16 / Int24）时引入 TPDF 随机抖动。\n\
+                         消除弱信号下的阶跃感与谐波失真，转换为平坦白噪声。\n\
+                         格式为 Float32 或 Int32 时自动跳过，无额外开销。",
+                    );
                 ui.end_row();
 
                 ui.label("通道名带设备名");
@@ -3156,7 +3171,10 @@ mod tests {
                     ..StreamConfig::default()
                 },
             ],
-            engine: EngineConfig::default(),
+            engine: EngineConfig {
+                dither: false,
+                ..EngineConfig::default()
+            },
         };
 
         write_config(&path, &config).unwrap();
@@ -3164,6 +3182,7 @@ mod tests {
 
         assert_eq!(parsed.sample_rate, 48_000);
         assert_eq!(parsed.buffer_size_samples, 512);
+        assert!(!parsed.engine.dither);
         assert_eq!(parsed.inputs.len(), 1);
         assert_eq!(parsed.outputs.len(), 2);
         assert_eq!(parsed.total_input_channels(), 2);

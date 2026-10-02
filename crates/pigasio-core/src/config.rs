@@ -239,6 +239,10 @@ pub struct EngineConfig {
     /// 是否启用时钟漂移补偿。关闭后各设备按标称速率运行,
     /// 一旦硬件时钟有偏差就会累积并最终溢出或欠载。
     pub drift_correction: bool,
+    /// 是否在向 ASIO 宿主输出整型采样（Int16/Int24）时应用 TPDF 量化抖动。
+    ///
+    /// 默认启用。能有效消除低位宽下的量化谐波失真，转换为平坦白噪声。
+    pub dither: bool,
     /// 漂移补偿允许的最大修正量,单位 ppm(百万分之一)。
     /// 这个值同时决定了重采样器可以工作的变速范围。
     pub max_drift_ppm: f64,
@@ -307,6 +311,7 @@ impl Default for EngineConfig {
         EngineConfig {
             resample_quality: ResampleQuality::Sinc,
             drift_correction: true,
+            dither: true,
             max_drift_ppm: 500.0,
             watermark_ms: 30.0,
             use_non_ascii_channel_names: true,
@@ -566,6 +571,7 @@ struct RawConfig {
 struct RawEngine {
     resample_quality: Option<String>,
     drift_correction: Option<bool>,
+    dither: Option<bool>,
     max_drift_ppm: Option<f64>,
     use_non_ascii_channel_names: Option<bool>,
     /// 音频后端:`auto` / `cpal` / `wasapi`。
@@ -654,6 +660,9 @@ impl RawConfig {
                 drift_correction: e
                     .drift_correction
                     .unwrap_or(EngineConfig::default().drift_correction),
+                dither: e
+                    .dither
+                    .unwrap_or(EngineConfig::default().dither),
                 max_drift_ppm: e
                     .max_drift_ppm
                     .unwrap_or(EngineConfig::default().max_drift_ppm),
@@ -932,6 +941,17 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn 抖动配置支持开关() {
+        assert!(Config::default().engine.dither);
+
+        let cfg_on = Config::from_toml_str("[engine]\ndither = true\n").unwrap();
+        assert!(cfg_on.engine.dither);
+
+        let cfg_off = Config::from_toml_str("[engine]\ndither = false\n").unwrap();
+        assert!(!cfg_off.engine.dither);
     }
 
     #[test]

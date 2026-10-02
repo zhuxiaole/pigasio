@@ -65,7 +65,9 @@ use crate::drift::DriftController;
 use crate::error::{Error, Result, StreamKind};
 use crate::resample::{allocate_planes, FixedInResampler, FixedOutResampler, ResamplerSpec};
 use crate::ring::{self, FrameReader, FrameWriter, RingStats, RingStatsSnapshot};
-use crate::sample_format::{convert_asio_to_f32, convert_f32_to_asio, HostBuffer};
+use crate::sample_format::{
+    convert_asio_to_f32, convert_f32_to_asio_dithered, DitherPrng, HostBuffer,
+};
 
 /// 环形缓冲容量相对于目标水位的倍数。
 const RING_CAPACITY_FACTOR: f64 = 6.0;
@@ -112,12 +114,14 @@ pub type BufferSwitchCallback = Box<dyn FnMut(&mut AsioBufferSet, usize) + Send>
 pub struct AsioBufferSet {
     buffer_size: usize,
     sample_type: AsioSampleType,
+    dither_enabled: bool,
     input_channels: usize,
     output_channels: usize,
     inputs: Vec<Vec<f32>>,
     outputs: Vec<Vec<f32>>,
     host_inputs: Vec<HostBuffer>,
     host_outputs: Vec<HostBuffer>,
+    input_prngs: Vec<DitherPrng>,
 }
 
 impl AsioBufferSet {
@@ -126,6 +130,7 @@ impl AsioBufferSet {
         output_channels: usize,
         buffer_size: usize,
         sample_type: AsioSampleType,
+        dither_enabled: bool,
     ) -> Self {
         let span = buffer_size * 2;
         let bytes_per_chan = span * sample_type.size_of();
@@ -146,15 +151,21 @@ impl AsioBufferSet {
                 .collect()
         };
 
+        let input_prngs = (0..input_channels)
+            .map(DitherPrng::for_channel)
+            .collect();
+
         AsioBufferSet {
             buffer_size,
             sample_type,
+            dither_enabled,
             input_channels,
             output_channels,
             inputs: (0..input_channels).map(|_| vec![0.0; span]).collect(),
             outputs: (0..output_channels).map(|_| vec![0.0; span]).collect(),
             host_inputs,
             host_outputs,
+            input_prngs,
         }
     }
 
@@ -250,12 +261,18 @@ impl AsioBufferSet {
         let chunk = self.buffer_size;
         let byte_offset = index * chunk * sample_size;
         let byte_len = chunk * sample_size;
+        let dither_enabled = self.dither_enabled;
 
         for ch in 0..self.input_channels {
             let f32_off = index * chunk;
             let src = &self.inputs[ch][f32_off..f32_off + chunk];
             let host_dst = &mut self.host_inputs[ch].as_mut_slice()[byte_offset..byte_offset + byte_len];
-            convert_f32_to_asio(src, host_dst, self.sample_type);
+            let prng = if dither_enabled {
+                Some(&mut self.input_prngs[ch])
+            } else {
+                None
+            };
+            convert_f32_to_asio_dithered(src, host_dst, self.sample_type, prng);
         }
     }
 
@@ -1373,6 +1390,7 @@ impl Engine {
                     output_channel_count,
                     buffer_size,
                     config.asio_sample_type,
+                    config.engine.dither,
                 ),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
@@ -1695,6 +1713,7 @@ impl Engine {
                 self.output_channel_count,
                 chunk,
                 self.config.asio_sample_type,
+                self.config.engine.dither,
             );
             core.buffer_index = 0;
             core.accumulated = 0;
@@ -2108,7 +2127,7 @@ mod tests {
 
     #[test]
     fn asio_缓冲指针按块偏移且互不重叠() {
-        let mut b = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32);
+        let mut b = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32, false);
         let p0 = b.input_ptr(0, 0) as *mut f32;
         let p1 = b.input_ptr(0, 1) as *mut f32;
         assert_ne!(p0, p1);
@@ -2116,20 +2135,20 @@ mod tests {
         assert_eq!(unsafe { p1.offset_from(p0) }, 4);
 
         // 不同通道的缓冲互不重叠。
-        let mut b2 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32);
+        let mut b2 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Float32, false);
         let a = b2.input_ptr(0, 0) as *mut f32;
         let c = b2.input_ptr(1, 0) as *mut f32;
         assert_ne!(a, c);
         assert!(unsafe { a.offset_from(c) }.abs() >= 8);
 
         // 验证 Int16 采样格式下的缓冲指针偏移
-        let mut b16 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int16);
+        let mut b16 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int16, true);
         let p16_0 = b16.input_ptr(0, 0) as *mut u8;
         let p16_1 = b16.input_ptr(0, 1) as *mut u8;
         assert_eq!(unsafe { p16_1.offset_from(p16_0) }, 4 * 2);
 
         // 验证 Int24 采样格式下的缓冲指针偏移
-        let mut b24 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int24);
+        let mut b24 = AsioBufferSet::new(2, 2, 4, AsioSampleType::Int24, true);
         let p24_0 = b24.input_ptr(0, 0) as *mut u8;
         let p24_1 = b24.input_ptr(0, 1) as *mut u8;
         assert_eq!(unsafe { p24_1.offset_from(p24_0) }, 4 * 3);
@@ -2173,7 +2192,7 @@ mod tests {
         let samples_processed = Arc::new(AtomicU64::new(0));
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let core = Arc::new(Mutex::new(AudioCore {
-            buffers: AsioBufferSet::new(1, 1, 512, AsioSampleType::Float32),
+            buffers: AsioBufferSet::new(1, 1, 512, AsioSampleType::Float32, false),
             inputs: Vec::new(),
             outputs: Vec::new(),
             callback: Box::new(|_, _| {}),
