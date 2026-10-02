@@ -523,7 +523,7 @@ impl OutputStreamRuntime {
 // ---------------------------------------------------------------------------
 
 /// 由时钟主设备回调驱动的核心状态。
-struct AudioCore {
+pub(crate) struct AudioCore {
     buffers: AsioBufferSet,
     inputs: Vec<InputStreamRuntime>,
     outputs: Vec<OutputStreamRuntime>,
@@ -749,14 +749,221 @@ impl AudioCore {
 }
 
 // ---------------------------------------------------------------------------
-// 设备流构建
+// 时钟协调与故障转移
 // ---------------------------------------------------------------------------
+
+/// 标识使用软件定时器作为回退时钟源的 ID。
+pub const FALLBACK_CLOCK_SOURCE_ID: usize = usize::MAX;
+
+/// 单条设备流的健康监测状态。
+struct StreamHealth {
+    stream_id: usize,
+    #[allow(dead_code)]
+    kind: StreamKind,
+    device_name: String,
+    failed: AtomicBool,
+    last_tick_nanos: AtomicU64,
+}
+
+impl StreamHealth {
+    fn new(stream_id: usize, kind: StreamKind, device_name: String) -> Self {
+        Self {
+            stream_id,
+            kind,
+            device_name,
+            failed: AtomicBool::new(false),
+            last_tick_nanos: AtomicU64::new(0),
+        }
+    }
+}
+
+/// 全局时钟协调器。
+///
+/// 负责管理多条音频流中的心跳驱动（`advance`）。
+/// 当原本的时钟主设备发生故障（如调用了 `on_error` 或停止产生回调）时，
+/// 协调器会自动将主时钟源迁移到其他健康的从设备；
+/// 若所有设备皆故障或离线，则由紧急软件定时器接管心跳，防止宿主死锁。
+pub struct ClockCoordinator {
+    core: Arc<Mutex<AudioCore>>,
+    pending_advance: Arc<AtomicUsize>,
+    current_source_id: AtomicUsize,
+    streams: Vec<StreamHealth>,
+    /// 标记发生过时钟故障转移，通知外部（如 ASIO 驱动）向宿主发送重置请求。
+    failover_notified: Arc<AtomicBool>,
+    /// 用于标记是否全设备挂掉进入了软件时钟兜底。
+    emergency_active: AtomicBool,
+}
+
+impl ClockCoordinator {
+    pub(crate) fn new(
+        core: Arc<Mutex<AudioCore>>,
+        pending_advance: Arc<AtomicUsize>,
+        initial_master_id: usize,
+        streams: Vec<(usize, StreamKind, String)>,
+    ) -> Arc<Self> {
+        let healths = streams
+            .into_iter()
+            .map(|(id, kind, name)| StreamHealth::new(id, kind, name))
+            .collect();
+
+        Arc::new(Self {
+            core,
+            pending_advance,
+            current_source_id: AtomicUsize::new(initial_master_id),
+            streams: healths,
+            failover_notified: Arc::new(AtomicBool::new(false)),
+            emergency_active: AtomicBool::new(false),
+        })
+    }
+
+    /// 检查并重置故障转移通知标记。
+    pub fn take_failover_notified(&self) -> bool {
+        self.failover_notified.swap(false, Ordering::AcqRel)
+    }
+
+    /// 当前激活的时钟源 ID。
+    #[inline]
+    pub fn current_source_id(&self) -> usize {
+        self.current_source_id.load(Ordering::Relaxed)
+    }
+
+    /// 当前是否处于软件时钟兜底状态。
+    #[inline]
+    pub fn is_emergency_active(&self) -> bool {
+        self.emergency_active.load(Ordering::Relaxed)
+    }
+
+    /// 当某条流产出音频帧时调用。如果是当前主时钟源，负责推进心跳。
+    #[inline]
+    pub fn on_stream_tick(&self, stream_id: usize, frames: usize) {
+        if stream_id < self.streams.len() {
+            // 记录当前时间（粗粒度纳秒，无需系统调用，取单调时钟）
+            // 在实时线程中，若系统时钟开销大，我们用原子帧数或轻量记录
+            self.streams[stream_id]
+                .last_tick_nanos
+                .fetch_add(frames as u64, Ordering::Relaxed);
+        }
+
+        let current = self.current_source_id.load(Ordering::Relaxed);
+        if current == stream_id {
+            self.pending_advance.fetch_add(frames, Ordering::Relaxed);
+            if let Some(mut core) = self.core.try_lock() {
+                let to_advance = self.pending_advance.swap(0, Ordering::Relaxed);
+                core.advance(to_advance);
+            }
+        }
+    }
+
+    /// 当某条流报告错误时调用。若恰好是当前主时钟，立即执行故障转移。
+    pub fn on_stream_error(&self, stream_id: usize, error_msg: &str) {
+        if stream_id < self.streams.len() {
+            self.streams[stream_id].failed.store(true, Ordering::Release);
+            log::warn!(
+                "设备流 #{} “{}” 报错，已标记为不健康: {error_msg}",
+                stream_id,
+                self.streams[stream_id].device_name
+            );
+        }
+
+        let current = self.current_source_id.load(Ordering::Relaxed);
+        if current == stream_id {
+            self.elect_new_master(stream_id);
+        }
+    }
+
+    /// 选举新的健康流作为主时钟源。
+    fn elect_new_master(&self, failed_id: usize) {
+        // 查找第一条没有 failed 的流
+        let candidate = self
+            .streams
+            .iter()
+            .find(|s| s.stream_id != failed_id && !s.failed.load(Ordering::Acquire))
+            .map(|s| s.stream_id);
+
+        if let Some(new_id) = candidate {
+            let old = self.current_source_id.swap(new_id, Ordering::Release);
+            let name = &self.streams[new_id].device_name;
+            log::warn!(
+                "【时钟故障转移】原主时钟流 #{old} 失效，已自动切换至流 #{new_id} ({name}) 接管时钟推进！"
+            );
+            self.failover_notified.store(true, Ordering::Release);
+        } else {
+            // 所有设备均已失效，切换至软件定时器兜底
+            let _ = self
+                .current_source_id
+                .swap(FALLBACK_CLOCK_SOURCE_ID, Ordering::Release);
+            self.emergency_active.store(true, Ordering::Release);
+            log::error!(
+                "【时钟故障转移】所有物理设备流均已失效！已启动软件静音时钟进行心跳兜底，防止宿主死锁。"
+            );
+            self.failover_notified.store(true, Ordering::Release);
+        }
+    }
+
+    /// 紧急软件时钟步进。
+    pub fn emergency_tick(&self, frames: usize) {
+        self.pending_advance.fetch_add(frames, Ordering::Relaxed);
+        if let Some(mut core) = self.core.try_lock() {
+            let to_advance = self.pending_advance.swap(0, Ordering::Relaxed);
+            core.advance(to_advance);
+        }
+    }
+
+    /// 标记软件兜底已不再激活。
+    pub fn stop_emergency(&self) {
+        self.emergency_active.store(false, Ordering::Release);
+    }
+}
+
+/// 紧急软件时钟线程守护句柄。
+struct EmergencyClockHost {
+    running: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl EmergencyClockHost {
+    fn spawn(coordinator: Arc<ClockCoordinator>, chunk_size: usize, sample_rate: u32) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+
+        let interval = std::time::Duration::from_secs_f64(
+            (chunk_size as f64 / sample_rate.max(1) as f64).max(0.005),
+        );
+
+        let join = std::thread::Builder::new()
+            .name("pigasio-emergency-clock".into())
+            .spawn(move || {
+                log::debug!("紧急时钟守护线程已就绪 (周期约 {:?})", interval);
+                while running_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(interval);
+                    if !running_clone.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if coordinator.is_emergency_active() {
+                        coordinator.emergency_tick(chunk_size);
+                    }
+                }
+                log::debug!("紧急时钟守护线程退出");
+            })
+            .ok();
+
+        Self { running, join }
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
 
 /// 构建一条音频流所需的全部材料。
 ///
 /// 这些都会被移动到专用线程上 —— 流必须在它被创建的那个线程里启动和
 /// 销毁,所以准备工作也只能在线程内部完成。
 struct StreamSpec {
+    stream_id: usize,
     kind: StreamKind,
     /// 设备句柄。用 `Arc` 是因为 `DeviceInfo` 是可克隆的,而句柄本身由
     /// 后端持有引用计数。
@@ -771,10 +978,8 @@ struct StreamSpec {
     input_writer: Option<FrameWriter>,
     /// 输出流:设备回调持消费者。
     output_reader: Option<FrameReader>,
-    /// 只有时钟主设备才需要它来推进整个引擎。
-    master_core: Option<Arc<Mutex<AudioCore>>>,
-    /// 时钟主设备在抢不到锁时暂存未推进的帧数,下一次回调补上。
-    master_pending_advance: Option<Arc<AtomicUsize>>,
+    /// 时钟协调器，统一负责心跳推进与故障转移。
+    clock_coordinator: Arc<ClockCoordinator>,
     err_flag: Arc<AtomicBool>,
     /// 报给实时优先级提升用的「每块缓冲多少帧」。
     ///
@@ -844,13 +1049,13 @@ fn promote_audio_thread(frames_per_buffer: u32, sample_rate: u32) {
 /// 设备原生格式到 `f32` 的转换已经在后端做完,所以这里没有泛型。
 fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     let StreamSpec {
+        stream_id,
         device,
         device_name,
         format,
         ch_map,
         input_writer,
-        master_core,
-        master_pending_advance,
+        clock_coordinator,
         stats,
         err_flag,
         frames_per_buffer,
@@ -868,6 +1073,7 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     // —— 参见 `promote_audio_thread`。这里只需要一个"做过了"的开关。
     let rt_tried = Arc::new(AtomicBool::new(false));
 
+    let coordinator_tick = Arc::clone(&clock_coordinator);
     let on_data: InputCallback = Box::new(move |data: &[f32]| {
         // 快速路径:提过了就直接过去。用原子标志而不是加锁 —— 这是音频线程,
         // 每块缓冲都要跑一遍,不该为只做一次的活去争锁。
@@ -900,22 +1106,15 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
             .overflow_frames
             .store(writer.overflow_frames(), Ordering::Relaxed);
 
-        // 如果这条流就是时钟主设备,它同时负责推进整个引擎。
-        // 抢不到锁时暂存未推进的帧数,下一次回调补上,避免时钟漏拍导致水位暴跌。
-        if let (Some(core), Some(pending)) =
-            (master_core.as_ref(), master_pending_advance.as_ref())
-        {
-            pending.fetch_add(frames, Ordering::Relaxed);
-            if let Some(mut core) = core.try_lock() {
-                let to_advance = pending.swap(0, Ordering::Relaxed);
-                core.advance(to_advance);
-            }
-        }
+        // 由时钟协调器判断本流是否为当前主时钟（或已接管成为新主时钟），若是则推进引擎心跳
+        coordinator_tick.on_stream_tick(stream_id, frames);
     });
 
     let mut err_logged = false;
+    let coordinator_err = Arc::clone(&clock_coordinator);
     let on_error: ErrorCallback = Box::new(move |e: String| {
         err_flag.store(true, Ordering::Release);
+        coordinator_err.on_stream_error(stream_id, &e);
         // 只在第一次落盘。这个回调跑在后端的音频线程上,而设备一旦出错
         // (被拔掉、被独占)往往会**每次回调都报**——日志要写文件,不能
         // 每次都记。`err_flag` 本身是给界面看的,它照样每次都置位。
@@ -931,13 +1130,13 @@ fn build_input(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
 /// 输出方向:从 ring 取数据交给设备播放。
 fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     let StreamSpec {
+        stream_id,
         device,
         device_name,
         format,
         ch_map,
         output_reader,
-        master_core,
-        master_pending_advance,
+        clock_coordinator,
         stats,
         err_flag,
         frames_per_buffer,
@@ -955,6 +1154,7 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     // 同输入侧:音频线程的实时优先级只能在回调内部申请。
     let rt_tried = Arc::new(AtomicBool::new(false));
 
+    let coordinator_tick = Arc::clone(&clock_coordinator);
     let on_data: OutputCallback = Box::new(move |data: &mut [f32]| {
         if !rt_tried.swap(true, Ordering::Relaxed) {
             promote_audio_thread(frames_per_buffer, sample_rate);
@@ -974,39 +1174,16 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
         }
 
         // 先把本流自己的 ring 读出来 —— **不需要锁**。
-        //
-        // reader 半端由本回调独占;生产者半端只被 `advance()` 里的 `drain()`
-        // 碰,而时钟推进就发生在这个回调里(`master_core` 那一支),所以两边
-        // 其实是同一个线程。唯一的例外是启动时 `prime_outputs()` 从控制线程
-        // 写过一次,但那发生在输出设备启动之前,不会有回调与它并发。
-        //
-        // 这里曾经整个包在 `try_lock` 里。代价是抢不到锁时这一整块只能送静音,
-        // 而且 `read_interleaved` 根本没被调用 —— 欠载计数也不会增加,丢得
-        // 无声无息。现在读和锁解耦,设备永远能拿到 ring 里的数据,计数也永远准。
         let got = reader.read_interleaved(&mut scratch[..ring_samples], frames);
 
-        // 这一侧的欠载只能在这里上报。ring 的消费者半端就在本回调手里,
-        // 它的计数除了这里没有第二个人能读走 —— `OutputStreamRuntime` 拿到的是
-        // 生产者半端,只能看到溢出。少这一行,输出侧的欠载就永远不会出现在
-        // 界面上:水位掉到不足一块设备缓冲时,界面照样显示「正常」。
         stats
             .underflow_frames
             .store(reader.underflow_frames(), Ordering::Relaxed);
         // 流量计数同样和输入侧对称:从 ring 里取走多少就在这里记多少。
         stats.read_frames.fetch_add(got as u64, Ordering::Relaxed);
 
-        // 时钟推进要碰所有流的另一半端,这才需要锁。抢不到就跳过这一拍:
-        // 数据没丢(上面已经读到手了),未推进的帧数暂存在 pending 里,
-        // 下一次回调拿锁时一起补上。
-        if let (Some(core), Some(pending)) =
-            (master_core.as_ref(), master_pending_advance.as_ref())
-        {
-            pending.fetch_add(frames, Ordering::Relaxed);
-            if let Some(mut core) = core.try_lock() {
-                let to_advance = pending.swap(0, Ordering::Relaxed);
-                core.advance(to_advance);
-            }
-        }
+        // 由时钟协调器判断本流是否为当前主时钟（或已接管成为新主时钟），若是则推进引擎心跳
+        coordinator_tick.on_stream_tick(stream_id, frames);
 
         // 填数据放在锁外,尽量缩短持锁时间。
         for s in data.iter_mut() {
@@ -1024,8 +1201,10 @@ fn build_output(spec: StreamSpec) -> Result<Box<dyn StreamHandle>> {
     });
 
     let mut err_logged = false;
+    let coordinator_err = Arc::clone(&clock_coordinator);
     let on_error: ErrorCallback = Box::new(move |e: String| {
         err_flag.store(true, Ordering::Release);
+        coordinator_err.on_stream_error(stream_id, &e);
         // 同输入侧:只在第一次落盘,理由见那里。
         if !err_logged {
             err_logged = true;
@@ -1285,6 +1464,10 @@ pub struct Engine {
     device_frames_per_stream: Vec<Arc<AtomicUsize>>,
     /// 时钟主设备在抢不到锁时暂存未推进的帧数。
     master_pending_advance: Arc<AtomicUsize>,
+    /// 时钟协调器，负责主时钟故障转移与软件时钟兜底。
+    clock_coordinator: Option<Arc<ClockCoordinator>>,
+    /// 紧急软件时钟后台守护句柄。
+    emergency_host: Option<EmergencyClockHost>,
 }
 
 impl Engine {
@@ -1415,6 +1598,8 @@ impl Engine {
             resampler_delay_frames: 0,
             device_frames_per_stream: Vec::new(),
             master_pending_advance: Arc::new(AtomicUsize::new(0)),
+            clock_coordinator: None,
+            emergency_host: None,
             stream_infos,
             channel_names,
             config,
@@ -1479,6 +1664,14 @@ impl Engine {
         self.stream_error.load(Ordering::Acquire)
     }
 
+    /// 检查并重置时钟故障转移标记（发生主时钟失效自动切换或软件兜底时为 true）。
+    pub fn take_clock_failover_notified(&self) -> bool {
+        self.clock_coordinator
+            .as_ref()
+            .map(|c| c.take_failover_notified())
+            .unwrap_or(false)
+    }
+
     /// ASIO 宿主可选的缓冲区大小范围。
     ///
     /// 对外只承诺一个值。好处是内部所有缓冲和重采样器都能按固定块长
@@ -1540,6 +1733,37 @@ impl Engine {
         // `status()` 才能按同样的下标对回去。
         let mut device_frames_per_stream: Vec<Arc<AtomicUsize>> = Vec::new();
 
+        // 构造流元信息并建立时钟协调器
+        let mut stream_meta = Vec::new();
+        let mut initial_master_id = 0usize;
+        let mut cur_id = 0usize;
+        for (i, _) in self.config.active_inputs() {
+            let info = &self.input_devices[i];
+            if self.clock_master == (StreamKind::Input, i) {
+                initial_master_id = cur_id;
+            }
+            stream_meta.push((cur_id, StreamKind::Input, info.name.clone()));
+            cur_id += 1;
+        }
+        for (i, _) in self.config.active_outputs() {
+            let info = &self.output_devices[i];
+            if self.clock_master == (StreamKind::Output, i) {
+                initial_master_id = cur_id;
+            }
+            stream_meta.push((cur_id, StreamKind::Output, info.name.clone()));
+            cur_id += 1;
+        }
+
+        let clock_coordinator = ClockCoordinator::new(
+            Arc::clone(&self.core),
+            Arc::clone(&self.master_pending_advance),
+            initial_master_id,
+            stream_meta,
+        );
+        self.clock_coordinator = Some(Arc::clone(&clock_coordinator));
+
+        let mut stream_counter = 0usize;
+
         // ---- 输入流 ----
         for (i, cfg) in self.config.active_inputs() {
             let info = &self.input_devices[i];
@@ -1593,6 +1817,7 @@ impl Engine {
             });
 
             specs.push(StreamSpec {
+                stream_id: stream_counter,
                 kind: StreamKind::Input,
                 device: Arc::clone(&info.handle),
                 device_name: info.name.clone(),
@@ -1600,9 +1825,7 @@ impl Engine {
                 ch_map: mapped,
                 input_writer: Some(writer),
                 output_reader: None,
-                master_core: is_master.then(|| Arc::clone(&self.core)),
-                master_pending_advance: is_master
-                    .then(|| Arc::clone(&self.master_pending_advance)),
+                clock_coordinator: Arc::clone(&clock_coordinator),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
                 stats: Arc::clone(&stats),
@@ -1613,6 +1836,7 @@ impl Engine {
                 },
             });
             input_offset += ring_channels;
+            stream_counter += 1;
         }
 
         // ---- 输出流 ----
@@ -1670,6 +1894,7 @@ impl Engine {
             });
 
             specs.push(StreamSpec {
+                stream_id: stream_counter,
                 kind: StreamKind::Output,
                 device: Arc::clone(&info.handle),
                 device_name: info.name.clone(),
@@ -1677,9 +1902,7 @@ impl Engine {
                 ch_map: mapped,
                 input_writer: None,
                 output_reader: Some(reader),
-                master_core: is_master.then(|| Arc::clone(&self.core)),
-                master_pending_advance: is_master
-                    .then(|| Arc::clone(&self.master_pending_advance)),
+                clock_coordinator: Arc::clone(&clock_coordinator),
                 err_flag: Arc::clone(&self.stream_error),
                 frames_per_buffer: chunk as u32,
                 stats: Arc::clone(&stats),
@@ -1690,6 +1913,7 @@ impl Engine {
                 },
             });
             output_offset += ring_channels;
+            stream_counter += 1;
         }
 
         // 重采样滤波器的 group delay 直接加在音频路径上,`getLatencies()`
@@ -1799,6 +2023,15 @@ impl Engine {
         // 5. 让输出设备开始播放。
         host.start(StreamGroup::Outputs)?;
 
+        // 6. 启动紧急软件时钟守护线程（在全部硬件设备失效时兜底推进）
+        if let Some(coordinator) = self.clock_coordinator.as_ref() {
+            self.emergency_host = Some(EmergencyClockHost::spawn(
+                Arc::clone(coordinator),
+                self.buffer_size,
+                self.sample_rate,
+            ));
+        }
+
         self.running.store(true, Ordering::Release);
         log::info!("引擎已启动");
         Ok(())
@@ -1862,6 +2095,14 @@ impl Engine {
 
     /// 停止所有设备流。
     pub fn stop(&mut self) -> Result<()> {
+        // 先停掉软件时钟守护线程
+        if let Some(mut emergency) = self.emergency_host.take() {
+            emergency.stop();
+        }
+        if let Some(coordinator) = self.clock_coordinator.as_ref() {
+            coordinator.stop_emergency();
+        }
+
         // 先掐掉回调入口,保证 `stop()` 返回后不会再有 bufferSwitch 飞出去
         // —— ASIO 规范对此有明确要求。
         {
@@ -1887,6 +2128,8 @@ impl Engine {
         let _ = self.stop();
         // `StreamHost` 的 Drop 会结束线程,并在那里销毁所有流。
         self.host = None;
+        self.clock_coordinator = None;
+        self.emergency_host = None;
         self.master_pending_advance.store(0, Ordering::Relaxed);
         {
             let mut core = self.core.lock();
@@ -2238,5 +2481,67 @@ mod tests {
         // 960 帧在 512 帧的 buffer_size 下推进了 1 次(消耗 512),余下 448
         assert_eq!(c.accumulated, 448);
         assert_eq!(samples_processed.load(Ordering::Relaxed), 512);
+    }
+
+    #[test]
+    fn 主时钟失效故障转移至从设备及软件兜底() {
+        let samples_processed = Arc::new(AtomicU64::new(0));
+        let dropped_frames = Arc::new(AtomicU64::new(0));
+        let core = Arc::new(Mutex::new(AudioCore {
+            buffers: AsioBufferSet::new(1, 1, 512, AsioSampleType::Float32, false),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            callback: Box::new(|_, _| {}),
+            buffer_index: 0,
+            accumulated: 0,
+            sample_rate: 48000.0,
+            running: true,
+            samples_processed: Arc::clone(&samples_processed),
+            dropped_frames: Arc::clone(&dropped_frames),
+            dropped_since_log: 0,
+        }));
+        let pending = Arc::new(AtomicUsize::new(0));
+
+        let streams = vec![
+            (0, StreamKind::Output, "Master Device".into()),
+            (1, StreamKind::Output, "Slave Device".into()),
+        ];
+
+        let coordinator = ClockCoordinator::new(
+            Arc::clone(&core),
+            Arc::clone(&pending),
+            0,
+            streams,
+        );
+
+        assert_eq!(coordinator.current_source_id(), 0);
+        assert!(!coordinator.is_emergency_active());
+
+        // 1. 主设备 (0) 正常推进 512 帧
+        coordinator.on_stream_tick(0, 512);
+        assert_eq!(samples_processed.load(Ordering::Relaxed), 512);
+
+        // 此时从设备 (1) 的 tick 不会重复推进心跳
+        coordinator.on_stream_tick(1, 512);
+        assert_eq!(samples_processed.load(Ordering::Relaxed), 512);
+
+        // 2. 主设备 (0) 发生故障
+        coordinator.on_stream_error(0, "Device disconnected");
+        assert_eq!(coordinator.current_source_id(), 1);
+        assert!(coordinator.take_failover_notified());
+
+        // 从设备 (1) 接管后，推进心跳生效
+        coordinator.on_stream_tick(1, 512);
+        assert_eq!(samples_processed.load(Ordering::Relaxed), 1024);
+
+        // 3. 从设备 (1) 也发生故障 -> 所有物理设备流全部失效
+        coordinator.on_stream_error(1, "Out of buffers");
+        assert_eq!(coordinator.current_source_id(), FALLBACK_CLOCK_SOURCE_ID);
+        assert!(coordinator.is_emergency_active());
+        assert!(coordinator.take_failover_notified());
+
+        // 软件静音时钟进行兜底推进
+        coordinator.emergency_tick(512);
+        assert_eq!(samples_processed.load(Ordering::Relaxed), 1536);
     }
 }

@@ -893,6 +893,29 @@ unsafe extern "system" fn vt_get_sample_position(
             return ase::INVALID_PARAMETER;
         }
         let obj = object(this);
+
+        // 检查引擎是否发生过时钟故障转移；若发生过且宿主支持，异步/非阻塞通知宿主重置
+        if let Some(engine) = obj.state.try_lock().and_then(|mut st| {
+            if let Some(eng) = st.engine.as_mut() {
+                if eng.take_clock_failover_notified() {
+                    return Some((st.callbacks.asio_message, true));
+                }
+            }
+            None
+        }) {
+            if let Some(msg) = engine.0 {
+                log::warn!("检测到时钟主设备失效已转移，通过 asioMessage 发送 kAsioResetRequest 请求宿主优雅重建");
+                unsafe {
+                    msg(
+                        asio_message::RESET_REQUEST,
+                        0,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+
         // 这个函数可能从宿主的 bufferSwitch 处理里被调用,而那时主锁
         // 正被音频回调持有。所以只读原子量,绝不加锁。
         let rate = obj.sample_rate.load(Ordering::Relaxed);
@@ -1011,6 +1034,11 @@ unsafe extern "system" fn vt_create_buffers(
             // 宿主可能在自己的缓冲处理里回头调用 getSamplePosition,
             // 所以采样位置由回调直接累加到原子量上,不走引擎的锁。
             let host_callbacks = st.callbacks;
+            let engine_ref = st
+                .engine
+                .as_mut()
+                .ok_or_else(|| fail(ase::INVALID_MODE, "引擎未初始化"))?;
+
             let switch_callback: BufferSwitchCallback = Box::new(
                 move |_buffers: &mut pigasio_core::AsioBufferSet, index: usize| {
                     if let Some(f) = host_callbacks.buffer_switch {
@@ -1022,10 +1050,7 @@ unsafe extern "system" fn vt_create_buffers(
                 },
             );
 
-            let engine = st
-                .engine
-                .as_mut()
-                .ok_or_else(|| fail(ase::INVALID_MODE, "引擎未初始化"))?;
+            let engine = engine_ref;
 
             let input_limit = engine.input_channel_count();
             let output_limit = engine.output_channel_count();
